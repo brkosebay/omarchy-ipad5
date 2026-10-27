@@ -1,0 +1,7 @@
+0001-thermal-apple-expose-S8003-calibrated-SOC-and-TCC-se.patch
+0002-cpufreq-apple-add-opt-in-guarded-S8003-boost-and-clo.patch
+0003-cpufreq-apple-preserve-lower-cooled-clocks-on-emerge.patch
+0004-cpufreq-apple-test-thermal-fault-decisions-and-forbi.patch
+0005-dt-bindings-thermal-use-explicit-S8003-example-addre.patch
+0006-thermal-apple-synchronously-revert-A9-clocks-before-.patch
+0007-cpufreq-apple-keep-disabled-A9-tuning-stubs-in-kerne.patch

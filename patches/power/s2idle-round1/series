@@ -1,0 +1,6 @@
+0001-dt-bindings-mfd-apple-describe-the-D2365-event-inter.patch
+0002-arm64-dts-apple-describe-the-iPad-5-D2365-wake-event.patch
+0003-dt-bindings-backlight-apple-dwi-describe-the-S8000-b.patch
+0004-backlight-apple-dwi-replay-J71t-block-init-at-probe-.patch
+0005-nvme-PCI-apple-ans-pair-system-sleep-stop-with-full-.patch
+0006-input-apple_n1-quiesce-sleep-IRQs-and-bound-runtime-.patch

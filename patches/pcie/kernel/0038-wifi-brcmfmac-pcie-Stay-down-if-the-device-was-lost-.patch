@@ -1,0 +1,37 @@
+From 14113876c993344df47957bdbe6ad5bcc71208ae Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 15:35:15 +0000
+Subject: [PATCH 38/43] wifi: brcmfmac: pcie: Stay down if the device was lost
+ over suspend
+
+If the host bridge cut the device off because its link didn't come
+back from system sleep, any BAR access could stall the CPU. Fail the
+resume early; the bus stays down and firmware commands are refused.
+---
+ .../net/wireless/broadcom/brcm80211/brcmfmac/pcie.c    | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+index 55f4d7b970..e4f8216a51 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+@@ -2676,6 +2676,16 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
+ 	devinfo = bus->bus_priv.pcie->devinfo;
+ 	brcmf_dbg(PCIE, "Enter, dev=%p, bus=%p\n", dev, bus);
+ 
++	/*
++	 * The host bridge cut the device off because its link did not come
++	 * back. Any BAR access now could stall the CPU, so stay down; with the
++	 * bus down, firmware commands and transmits are refused early.
++	 */
++	if (pci_dev_is_disconnected(devinfo->pdev)) {
++		brcmf_err(bus, "device lost over suspend, staying down\n");
++		return -ENODEV;
++	}
++
+ 	/* Check if device is still up and running, if so we are ready */
+ 	if (brcmf_pcie_read_reg32(devinfo, devinfo->reginfo->intmask) != 0) {
+ 		brcmf_dbg(PCIE, "Try to wakeup device....\n");
+-- 
+2.56.0
+

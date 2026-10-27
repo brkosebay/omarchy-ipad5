@@ -1,0 +1,881 @@
+From 55afc374e8a589bf32062974acd2483a90a28109 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 01:10:12 +0200
+Subject: [PATCH] psci: Minimal EL3 PSCI for A7-A9, and a re-entry point from
+ Linux
+
+On A7-A9 m1n1 is entered at EL3 and stays resident: its image and the
+per-CPU EL3 stacks are memreserved, and VBAR_EL3 points at its vectors
+while Linux runs at EL1. Use that to give Linux PSCI 1.0 CPU_ON, CPU_OFF
+and AFFINITY_INFO (plus VERSION, FEATURES and MIGRATE_INFO_TYPE). The
+spin table has no cpu_die, so without this the kernel refuses kexec on
+an SMP system, can't offline CPUs, and a crash kernel inherits CPUs stuck
+in the old kernel.
+
+CPU_OFF does not power the core down. It cleans and invalidates its L1D,
+stops its timers, and waits in WFE at EL3 (MMU off) on a one-line
+mailbox. CPU_ON posts an entry point; the core leaves with a clean
+I-cache and TLB, SCTLR_EL1 at its reset value, DAIF masked and SP_EL3 on
+a static per-CPU stack. SYSTEM_OFF/SYSTEM_RESET, CPU_SUSPEND and
+SMCCC_VERSION return NOT_SUPPORTED, so callers fall back to their own
+methods and assume SMCCC 1.0.
+
+Opt-in with the payload variable psci=1, and only used when m1n1 itself
+was entered at EL3. kboot then parks the secondaries in the pen (a core
+that doesn't park is pruned), sets enable-method = "psci" on every CPU,
+adds /psci (method = "smc") and records the re-entry address and the
+original boot_args in /chosen.
+
+Re-entry: _reentry can be jumped to from a kexec'd trampoline (EL1, MMU
+off, x0 = boot_args copy). It drops this image's lines from the caches,
+flags the re-entry and restarts m1n1, which then skips the (stale)
+payload area and runs the proxy. smp_start_secondaries() takes cores
+back from the pen with CPU_ON, and the mailboxes and the psci=1 setting
+live in .data so they survive the .bss clear.
+---
+ Makefile       |   1 +
+ src/kboot.c    |  56 +++++++++++-
+ src/main.c     |   8 +-
+ src/payload.c  |   3 +
+ src/psci.c     | 229 +++++++++++++++++++++++++++++++++++++++++++++++++
+ src/psci.h     |  78 +++++++++++++++++
+ src/psci_asm.S | 170 ++++++++++++++++++++++++++++++++++++
+ src/smp.c      |  73 ++++++++++++++++
+ src/smp.h      |   1 +
+ src/start.S    |   6 +-
+ src/startup.c  |   6 +-
+ 11 files changed, 626 insertions(+), 5 deletions(-)
+ create mode 100644 src/psci.c
+ create mode 100644 src/psci.h
+ create mode 100644 src/psci_asm.S
+
+diff --git a/Makefile b/Makefile
+index 4c02f7b..bc556a3 100644
+--- a/Makefile
++++ b/Makefile
+@@ -164,6 +164,7 @@ OBJECTS := \
+ 	pcie.o \
+ 	pmgr.o \
+ 	proxy.o \
++	psci.o psci_asm.o \
+ 	ringbuffer.o \
+ 	rtkit.o \
+ 	sart.o \
+diff --git a/src/kboot.c b/src/kboot.c
+index 9240ce2..b52e326 100644
+--- a/src/kboot.c
++++ b/src/kboot.c
+@@ -20,6 +20,7 @@
+ #include "memory.h"
+ #include "pcie.h"
+ #include "pmgr.h"
++#include "psci.h"
+ #include "sep.h"
+ #include "sio.h"
+ #include "smc.h"
+@@ -585,6 +586,53 @@ static int dt_set_smbios(void)
+     return 0;
+ }
+ 
++/*
++ * With psci=1 and m1n1 owning EL3 (A7-A9), CPUs boot through m1n1's PSCI
++ * (see psci.c) instead of the spin table, so the kernel can offline them
++ * for kexec and CPU hotplug. Also tells Linux how to re-enter m1n1.
++ */
++static int dt_set_psci(void)
++{
++    static const char compat[] = "arm,psci-1.0\0arm,psci-0.2";
++    int node;
++
++    if (!psci_active()) {
++        printf("PSCI: off (needs psci=1 and m1n1 entered at EL3)\n");
++        return 0;
++    }
++
++    int cpus = fdt_path_offset(dt, "/cpus");
++    if (cpus < 0)
++        bail("FDT: /cpus node not found in devtree\n");
++
++    fdt_for_each_subnode(node, dt, cpus)
++    {
++        if (strncmp(fdt_get_name(dt, node, NULL), "cpu@", 4))
++            continue;
++        if (fdt_setprop_string(dt, node, "enable-method", "psci"))
++            bail("FDT: couldn't set enable-method\n");
++    }
++
++    node = fdt_path_offset(dt, "/psci");
++    if (node < 0)
++        node = fdt_add_subnode(dt, 0, "psci");
++    if (node < 0)
++        bail("FDT: couldn't add /psci\n");
++    if (fdt_setprop(dt, node, "compatible", compat, sizeof(compat)) ||
++        fdt_setprop_string(dt, node, "method", "smc"))
++        bail("FDT: couldn't fill /psci\n");
++
++    node = fdt_path_offset(dt, "/chosen");
++    if (node < 0)
++        bail("FDT: /chosen node not found in devtree\n");
++    if (fdt_setprop_u64(dt, node, "linux-a9,m1n1-reentry", (u64)_reentry) ||
++        fdt_setprop(dt, node, "linux-a9,m1n1-boot-args", &cur_boot_args, sizeof(cur_boot_args)))
++        bail("FDT: couldn't set the m1n1 re-entry properties\n");
++
++    printf("PSCI: on, enable-method = \"psci\", m1n1 re-entry at %p\n", _reentry);
++    return 0;
++}
++
+ static int dt_set_cpus(void)
+ {
+     int ret = 0;
+@@ -598,6 +646,10 @@ static int dt_set_cpus(void)
+     if (!pruned_phandles)
+         bail("FDT: out of memory\n");
+ 
++    /* Secondaries wait in the PSCI pen; one that can't get there is pruned below */
++    if (psci_active())
++        printf("PSCI: parked %d secondary CPU(s)\n", smp_park_secondaries_psci());
++
+     /* Prune CPU nodes */
+     int node, cpu = 0;
+     for (node = fdt_first_subnode(dt, cpus); node >= 0;) {
+@@ -629,7 +681,7 @@ static int dt_set_cpus(void)
+         } else {
+             printf("FDT: Reserving stack for CPU %d 0x%lx\n", cpu, (uint64_t)secondary_stacks[cpu]);
+             fdt_add_mem_rsv(dt, (uint64_t)secondary_stacks[cpu], SECONDARY_STACK_SIZE);
+-            if (has_el3()) {
++            if (has_el3() && secondary_stacks_el3[cpu]) {
+                 printf("FDT: Reserving EL3 stack for CPU %d 0x%lx\n", cpu,
+                        (uint64_t)secondary_stacks_el3[cpu]);
+                 fdt_add_mem_rsv(dt, (uint64_t)secondary_stacks_el3[cpu], SECONDARY_STACK_SIZE);
+@@ -3018,6 +3070,8 @@ int kboot_prepare_dt(void *fdt)
+         return -1;
+     if (dt_set_cpus())
+         return -1;
++    if (dt_set_psci())
++        return -1;
+     if (dt_set_mac_addresses())
+         return -1;
+     if (dt_set_wifi())
+diff --git a/src/main.c b/src/main.c
+index d4e828c..3f32380 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -21,6 +21,7 @@
+ #include "pcie.h"
+ #include "pmgr.h"
+ #include "sep.h"
++#include "psci.h"
+ #include "smp.h"
+ #include "string.h"
+ #include "tps6598x.h"
+@@ -117,9 +118,12 @@ void run_actions(void)
+ #endif
+ #endif
+ 
+-    printf("Checking for payloads...\n");
++    if (psci_reentered())
++        printf("Re-entered from Linux: whatever follows m1n1 is stale, not loading payloads\n");
++    else
++        printf("Checking for payloads...\n");
+ 
+-    if (payload_run() == 0) {
++    if (!psci_reentered() && payload_run() == 0) {
+         printf("Valid payload found\n");
+         return;
+     }
+diff --git a/src/payload.c b/src/payload.c
+index 5b1547f..4ffc9e2 100644
+--- a/src/payload.c
++++ b/src/payload.c
+@@ -12,6 +12,7 @@
+ #include "heapblock.h"
+ #include "kboot.h"
+ #include "mitigations.h"
++#include "psci.h"
+ #include "smp.h"
+ #include "utils.h"
+ 
+@@ -205,6 +206,8 @@ static bool check_var(u8 **p)
+         mitigations_configure(val);
+     } else if (IS_VAR("tso=")) {
+         enable_tso = val[0] == '1';
++    } else if (IS_VAR("psci=")) {
++        psci_configure(val);
+     } else {
+         printf("Unknown variable %s\n", *p);
+     }
+diff --git a/src/psci.c b/src/psci.c
+new file mode 100644
+index 0000000..2b8ca0d
+--- /dev/null
++++ b/src/psci.c
+@@ -0,0 +1,229 @@
++/* SPDX-License-Identifier: MIT */
++
++#include "psci.h"
++#include "smp.h"
++#include "types.h"
++#include "utils.h"
++
++struct psci_cpu {
++    volatile u64 state;
++    volatile u64 entry;
++    volatile u64 context;
++    u64 pad[PSCI_CPU_SIZE / 8 - 3];
++};
++
++_Static_assert(sizeof(struct psci_cpu) == PSCI_CPU_SIZE, "psci_cpu layout");
++
++/*
++ * Mailboxes, one cache line each, only ever accessed at EL3 with the MMU off.
++ * They live in .data rather than .bss so that a parked CPU's state survives
++ * m1n1 being re-entered from Linux (which clears .bss).
++ */
++struct psci_cpu psci_cpus[PSCI_MAX_CPUS]
++    __attribute__((section(".data"), aligned(PSCI_CPU_SIZE)));
++
++/* Written with the MMU off only (_reentry sets reentry_flag, the first member) */
++struct {
++    u64 reentry_flag;
++    u64 boot_el3;
++} psci_persist __attribute__((section(".data"), aligned(PSCI_CPU_SIZE)));
++
++/* psci=1 from the payload, kept across a re-entry */
++static u32 psci_mode __attribute__((section(".data")));
++
++/* EL3 stacks a CPU gets when it leaves the pen */
++static u8 psci_stacks[PSCI_MAX_CPUS][PSCI_STACK_SIZE] __attribute__((aligned(16)));
++
++static bool psci_have_el3;
++static bool reentered;
++
++/* EL3 side */
++
++static inline void psci_line_sync(volatile void *p)
++{
++    __asm__ volatile("dc civac, %0\n\tdsb sy" ::"r"(p) : "memory");
++}
++
++static int psci_mpidr_index(u64 mpidr)
++{
++    mpidr &= 0xff00ffffffUL;
++
++    /* A7-A9: one cluster, Aff0 is the core */
++    if (mpidr >= PSCI_MAX_CPUS)
++        return -1;
++
++    return mpidr;
++}
++
++static s64 psci_cpu_off(void)
++{
++    int idx = psci_mpidr_index(mrs(MPIDR_EL1));
++
++    if (idx < 0)
++        return PSCI_RET_DENIED;
++
++    psci_pen(&psci_cpus[idx], (u64)&psci_stacks[idx][PSCI_STACK_SIZE]);
++}
++
++static s64 psci_cpu_on(u64 mpidr, u64 entry, u64 context)
++{
++    int idx = psci_mpidr_index(mpidr);
++
++    if (idx < 0 || !entry)
++        return PSCI_RET_INVALID_PARAMS;
++
++    struct psci_cpu *c = &psci_cpus[idx];
++
++    psci_line_sync(c);
++    switch (c->state) {
++        case PSCI_AFF_OFF:
++            break;
++        case PSCI_AFF_ON_PENDING:
++            return PSCI_RET_ON_PENDING;
++        default:
++            /* Running, or never seen by us (still in m1n1 or never started) */
++            return PSCI_RET_ALREADY_ON;
++    }
++
++    /* State before entry: the pen sets ON as soon as it sees the entry */
++    c->context = context;
++    c->state = PSCI_AFF_ON_PENDING;
++    psci_line_sync(c);
++    c->entry = entry;
++    psci_line_sync(c);
++    sysop("sev");
++
++    return PSCI_RET_SUCCESS;
++}
++
++static s64 psci_affinity(u64 mpidr, u64 level)
++{
++    int idx = psci_mpidr_index(mpidr);
++
++    if (idx < 0 || level)
++        return PSCI_RET_INVALID_PARAMS;
++
++    psci_line_sync(&psci_cpus[idx]);
++    return psci_cpus[idx].state;
++}
++
++static s64 psci_features(u32 fid)
++{
++    switch (fid) {
++        case PSCI_0_2_FN_PSCI_VERSION:
++        case PSCI_0_2_FN_CPU_OFF:
++        case PSCI_0_2_FN_CPU_ON:
++        case PSCI_0_2_FN64_CPU_ON:
++        case PSCI_0_2_FN_AFFINITY_INFO:
++        case PSCI_0_2_FN64_AFFINITY_INFO:
++        case PSCI_0_2_FN_MIGRATE_INFO_TYPE:
++        case PSCI_1_0_FN_PSCI_FEATURES:
++            return PSCI_RET_SUCCESS;
++        default:
++            /*
++             * Includes SMCCC_VERSION (so callers assume SMCCC 1.0 and make
++             * no other SMCs), CPU_SUSPEND, SYSTEM_OFF and SYSTEM_RESET.
++             */
++            return PSCI_RET_NOT_SUPPORTED;
++    }
++}
++
++u64 psci_handle(u64 fid, u64 a1, u64 a2, u64 a3)
++{
++    u32 fn = fid;
++
++    /* SMC32 calls carry 32-bit arguments */
++    if (!(fn & 0x40000000)) {
++        a1 = (u32)a1;
++        a2 = (u32)a2;
++        a3 = (u32)a3;
++    }
++
++    switch (fn) {
++        case PSCI_0_2_FN_PSCI_VERSION:
++            return 0x10000; /* 1.0 */
++        case PSCI_0_2_FN_CPU_OFF:
++            return psci_cpu_off();
++        case PSCI_0_2_FN_CPU_ON:
++        case PSCI_0_2_FN64_CPU_ON:
++            return psci_cpu_on(a1, a2, a3);
++        case PSCI_0_2_FN_AFFINITY_INFO:
++        case PSCI_0_2_FN64_AFFINITY_INFO:
++            return psci_affinity(a1, a2);
++        case PSCI_0_2_FN_MIGRATE_INFO_TYPE:
++            return 2; /* no trusted OS, nothing to migrate */
++        case PSCI_1_0_FN_PSCI_FEATURES:
++            return psci_features(a1);
++        default:
++            /* SYSTEM_RESET/SYSTEM_OFF too: the caller falls back to its own */
++            return PSCI_RET_NOT_SUPPORTED;
++    }
++}
++
++/* EL1 side */
++
++void psci_note_boot_el(u64 el)
++{
++    /* MMU still off: these .data accesses are uncached, like the writers' */
++    if (psci_persist.reentry_flag) {
++        reentered = true;
++        psci_persist.reentry_flag = 0;
++    }
++    if (el == 3)
++        psci_persist.boot_el3 = 1;
++
++    psci_have_el3 = psci_persist.boot_el3 && has_el3();
++}
++
++void psci_configure(const char *val)
++{
++    psci_mode = val[0] == '1';
++}
++
++bool psci_active(void)
++{
++    return psci_mode && psci_have_el3;
++}
++
++bool psci_reentered(void)
++{
++    return reentered;
++}
++
++int psci_affinity_info(u64 mpidr)
++{
++    return psci_smc(PSCI_0_2_FN64_AFFINITY_INFO, mpidr, 0, 0);
++}
++
++static void psci_self_off(void)
++{
++    /* Only returns on failure; the core then stays in m1n1's loop */
++    psci_smc(PSCI_0_2_FN_CPU_OFF, 0, 0, 0);
++}
++
++int psci_park_cpu(int cpu, u64 mpidr)
++{
++    if (psci_affinity_info(mpidr) == PSCI_AFF_OFF)
++        return 0;
++
++    smp_call0(cpu, psci_self_off);
++
++    for (int i = 0; i < 100; i++) {
++        if (psci_affinity_info(mpidr) == PSCI_AFF_OFF)
++            return 0;
++        udelay(1000);
++    }
++
++    return -1;
++}
++
++int psci_unpark_cpu(int index, u64 mpidr, void *stack_top)
++{
++    if (psci_affinity_info(mpidr) != PSCI_AFF_OFF)
++        return -1;
++
++    s64 ret = psci_smc(PSCI_0_2_FN64_CPU_ON, mpidr, (u64)psci_secondary_entry,
++                       (u64)stack_top | (u64)index);
++
++    return ret == PSCI_RET_SUCCESS ? 0 : -1;
++}
+diff --git a/src/psci.h b/src/psci.h
+new file mode 100644
+index 0000000..6769ebe
+--- /dev/null
++++ b/src/psci.h
+@@ -0,0 +1,78 @@
++/* SPDX-License-Identifier: MIT */
++
++#ifndef PSCI_H
++#define PSCI_H
++
++#ifndef __ASSEMBLER__
++#include "types.h"
++#endif
++
++/*
++ * Minimal PSCI 1.0 for SoCs where m1n1 owns EL3 (A7-A9 entered at EL3).
++ * Only CPU_ON/CPU_OFF/AFFINITY_INFO and the discovery calls are implemented.
++ * A CPU that calls CPU_OFF is not powered down: it waits at EL3, MMU and
++ * caches off, until CPU_ON hands it a new EL1 entry point. That is what the
++ * kernel needs to offline CPUs for kexec and CPU hotplug.
++ */
++
++#define PSCI_0_2_FN_PSCI_VERSION      0x84000000
++#define PSCI_0_2_FN_CPU_SUSPEND       0x84000001
++#define PSCI_0_2_FN_CPU_OFF           0x84000002
++#define PSCI_0_2_FN_CPU_ON            0x84000003
++#define PSCI_0_2_FN_AFFINITY_INFO     0x84000004
++#define PSCI_0_2_FN_MIGRATE_INFO_TYPE 0x84000006
++#define PSCI_0_2_FN_SYSTEM_OFF        0x84000008
++#define PSCI_0_2_FN_SYSTEM_RESET      0x84000009
++#define PSCI_1_0_FN_PSCI_FEATURES     0x8400000a
++#define PSCI_0_2_FN64_CPU_ON          0xc4000003
++#define PSCI_0_2_FN64_AFFINITY_INFO   0xc4000004
++
++#define PSCI_RET_SUCCESS            0
++#define PSCI_RET_NOT_SUPPORTED      -1
++#define PSCI_RET_INVALID_PARAMS     -2
++#define PSCI_RET_DENIED             -3
++#define PSCI_RET_ALREADY_ON         -4
++#define PSCI_RET_ON_PENDING         -5
++#define PSCI_RET_INTERNAL_FAILURE   -6
++
++#define PSCI_AFF_ON         0
++#define PSCI_AFF_OFF        1
++#define PSCI_AFF_ON_PENDING 2
++
++#define PSCI_MAX_CPUS   4
++#define PSCI_STACK_SIZE 0x4000
++
++/* Layout shared with psci_asm.S */
++#define PSCI_CPU_STATE   0x00
++#define PSCI_CPU_ENTRY   0x08
++#define PSCI_CPU_CONTEXT 0x10
++#define PSCI_CPU_SIZE    0x80
++
++#ifndef __ASSEMBLER__
++
++/* Payload variable psci=1 */
++void psci_configure(const char *val);
++/* m1n1 entered at EL3 and psci=1 given: the kernel may use PSCI */
++bool psci_active(void);
++/* Called once from _start_c with the EL m1n1 was entered at */
++void psci_note_boot_el(u64 el);
++/* Set when m1n1 was re-entered from Linux (see psci_asm.S _reentry) */
++bool psci_reentered(void);
++
++/* EL1 side: SMC into our own EL3 */
++s64 psci_smc(u64 fid, u64 a1, u64 a2, u64 a3);
++int psci_affinity_info(u64 mpidr);
++/* Park a secondary that is spinning in smp_secondary_entry() at EL3 */
++int psci_park_cpu(int cpu, u64 mpidr);
++/* Bring a parked CPU back into m1n1 (re-entry); returns 0 if it was parked */
++int psci_unpark_cpu(int index, u64 mpidr, void *stack_top);
++
++/* EL3 side */
++u64 psci_handle(u64 fid, u64 a1, u64 a2, u64 a3);
++void psci_pen(void *cpu, u64 stack_top) __attribute__((noreturn));
++void psci_secondary_entry(void);
++void _reentry(void);
++
++#endif
++
++#endif
+diff --git a/src/psci_asm.S b/src/psci_asm.S
+new file mode 100644
+index 0000000..14f842f
+--- /dev/null
++++ b/src/psci_asm.S
+@@ -0,0 +1,170 @@
++/* SPDX-License-Identifier: MIT */
++
++#include "psci.h"
++
++#define DCSW_OP_DCCISW 0x1 // memory.h
++
++.extern _v_sp0_sync
++.extern _start
++.extern _cpu_reset_c
++.extern psci_handle
++.extern psci_persist
++
++.text
++
++/*
++ * Lower-EL synchronous exceptions. At EL3, an SMCCC call (smc #0 from EL1)
++ * goes to the PSCI dispatcher; everything else, and every exception taken
++ * at EL1/EL2, takes the usual path.
++ */
++.globl _v_lower_sync
++.type _v_lower_sync, @function
++_v_lower_sync:
++    stp x16, x17, [sp, #-16]!
++    mrs x16, CurrentEL
++    cmp x16, #0xc
++    b.ne 1f
++    mrs x16, esr_el3
++    lsr x17, x16, #26
++    cmp x17, #0x17 // EC: SMC from AArch64
++    b.ne 1f
++    tst x16, #0xffff // imm16 == 0: SMCCC
++    b.ne 1f
++    ldp x16, x17, [sp], #16
++    b psci_smc_entry
++1:
++    ldp x16, x17, [sp], #16
++    b _v_sp0_sync
++
++/*
++ * SMCCC 1.0: x0-x17 may be clobbered, x18-x30 and SP_EL1 belong to the
++ * caller. x0-x3 go straight to psci_handle(). ELR/SPSR are saved in case
++ * anything below takes an exception at EL3.
++ */
++.type psci_smc_entry, @function
++psci_smc_entry:
++    stp x29, x30, [sp, #-16]!
++    mrs x29, elr_el3
++    mrs x30, spsr_el3
++    stp x29, x30, [sp, #-16]!
++    str x18, [sp, #-16]!
++    bl psci_handle
++    ldr x18, [sp], #16
++    ldp x29, x30, [sp], #16
++    msr elr_el3, x29
++    msr spsr_el3, x30
++    ldp x29, x30, [sp], #16
++    eret
++
++/*
++ * psci_pen(struct psci_cpu *me, u64 stack_top): CPU_OFF. Never returns.
++ *
++ * The core is not powered down. It writes its L1D back, marks itself OFF and
++ * waits in WFE at EL3 (MMU off, so every access here is non-cacheable) for
++ * CPU_ON to post an entry point. It then enters EL1 there with the MMU off,
++ * a clean I-cache and TLB, and x0 = context id, like a core coming out of
++ * reset. SP_EL3 is reset to this core's own static stack.
++ */
++.globl psci_pen
++.type psci_pen, @function
++psci_pen:
++    mov x19, x0
++    mov x20, x1
++
++    // A pending timer interrupt must not keep waking WFE.
++    msr cntp_ctl_el0, xzr
++    msr cntv_ctl_el0, xzr
++    isb
++
++    // Clean and invalidate this core's L1D (L2 is shared and coherent).
++    mov x0, #DCSW_OP_DCCISW
++    bl dcsw_op_level1
++    dsb sy
++
++    str xzr, [x19, #PSCI_CPU_ENTRY]
++    mov x1, #PSCI_AFF_OFF
++    str x1, [x19, #PSCI_CPU_STATE]
++    dc civac, x19
++    dsb sy
++    sev
++
++1:
++    wfe
++    dc civac, x19
++    dsb sy
++    ldr x2, [x19, #PSCI_CPU_ENTRY]
++    cbz x2, 1b
++
++    ldr x0, [x19, #PSCI_CPU_CONTEXT]
++    str xzr, [x19, #PSCI_CPU_ENTRY]
++    mov x1, #PSCI_AFF_ON
++    str x1, [x19, #PSCI_CPU_STATE]
++    dc civac, x19
++    dsb sy
++
++    // Nothing of the previous kernel's EL1 context may survive.
++    ic iallu
++    tlbi alle1
++    dsb sy
++    mov x1, #0x0800 // SCTLR_EL1: RES1 bits only, MMU and caches off
++    movk x1, #0x30d0, lsl #16
++    msr sctlr_el1, x1
++    mov x1, #0x3c5 // EL1h, DAIF masked
++    msr spsr_el3, x1
++    msr elr_el3, x2
++    mov sp, x20
++    isb
++    eret
++
++/* EL1 side: s64 psci_smc(u64 fid, u64 a1, u64 a2, u64 a3) */
++.globl psci_smc
++.type psci_smc, @function
++psci_smc:
++    smc #0
++    ret
++
++/*
++ * CPU_ON target when m1n1 takes a parked core back after a re-entry.
++ * x0 = EL1 stack top | m1n1 CPU index (stack tops are 16 KiB aligned).
++ */
++.globl psci_secondary_entry
++.type psci_secondary_entry, @function
++psci_secondary_entry:
++    and x1, x0, #0xf
++    bic x0, x0, #0xf
++    msr tpidr_el1, x1
++    mov sp, x0
++    bl _cpu_reset_c
++    b .
++
++/*
++ * Re-entry from Linux (a kexec'd trampoline, see docs/boot/warm-reboot.md):
++ * EL1, MMU and caches off, x0 = a copy of the original boot_args.
++ * Linux may hold clean lines of this image in its linear map, so drop them
++ * before m1n1 writes its .bss uncached and then reads it with caches on.
++ */
++.globl _reentry
++.type _reentry, @function
++_reentry:
++    mov x19, x0
++    adrp x1, _base
++    adrp x2, _end
++1:
++    dc civac, x1
++    add x1, x1, #64
++    cmp x1, x2
++    b.lo 1b
++    dsb sy
++    ic iallu
++    dsb sy
++    isb
++
++    adrp x1, psci_persist // .reentry_flag
++    add x1, x1, :lo12:psci_persist
++    mov x2, #1
++    str x2, [x1]
++    dc civac, x1
++    dsb sy
++
++    mov x0, x19
++    b _start
+diff --git a/src/smp.c b/src/smp.c
+index 83eadff..7f5b336 100644
+--- a/src/smp.c
++++ b/src/smp.c
+@@ -8,6 +8,7 @@
+ #include "malloc.h"
+ #include "memory.h"
+ #include "pmgr.h"
++#include "psci.h"
+ #include "soc.h"
+ #include "string.h"
+ #include "types.h"
+@@ -227,6 +228,74 @@ static void smp_stop_cpu(int index, int die, int cluster, int core, u64 impl, u6
+     }
+ }
+ 
++/*
++ * After a re-entry from Linux, a secondary that Linux offlined waits in the
++ * PSCI pen at EL3 rather than in smp_secondary_entry(). It can't be reset
++ * through the PMGR (it is running), so hand it an EL1 entry with CPU_ON.
++ */
++static bool smp_reclaim_cpu(int index, u64 mpidr)
++{
++    int i;
++
++    if (index >= MAX_CPUS || spin_table[index].flag)
++        return false;
++
++    if (psci_affinity_info(mpidr) != PSCI_AFF_OFF)
++        return false;
++
++    printf("Taking CPU %d back from the PSCI pen... ", index);
++
++    memset(&spin_table[index], 0, sizeof(struct spin_table));
++    target_cpu = index;
++    secondary_stacks[index] = memalign(0x4000, SECONDARY_STACK_SIZE);
++
++    /* The core starts with its MMU off */
++    dc_civac_range(&spin_table[index], sizeof(struct spin_table));
++    dc_civac_range(&target_cpu, sizeof(target_cpu));
++    dc_civac_range(&boot_cpu_idx, sizeof(boot_cpu_idx));
++    dc_civac_range(&boot_cpu_mpidr, sizeof(boot_cpu_mpidr));
++
++    if (psci_unpark_cpu(index, mpidr, secondary_stacks[index] + SECONDARY_STACK_SIZE) < 0) {
++        printf("Failed (CPU_ON)\n");
++        return true;
++    }
++
++    for (i = 0; i < 100; i++) {
++        sysop("dmb ld");
++        if (spin_table[index].flag)
++            break;
++        udelay(1000);
++    }
++
++    printf("%s\n", i >= 100 ? "Failed!" : "  Back.");
++    return true;
++}
++
++/*
++ * Put every live secondary into the PSCI pen, for a kernel that boots them
++ * with enable-method = "psci". A CPU that doesn't make it is dropped (and
++ * then pruned from the DT by the caller).
++ */
++int smp_park_secondaries_psci(void)
++{
++    int parked = 0;
++
++    for (int i = 0; i < MAX_CPUS; i++) {
++        if (i == boot_cpu_idx || !smp_is_alive(i))
++            continue;
++
++        u64 mpidr = spin_table[i].mpidr;
++        if (psci_park_cpu(i, mpidr) < 0) {
++            printf("PSCI: CPU %d (MPIDR 0x%lx) did not park, dropping it\n", i, mpidr);
++            memset(&spin_table[i], 0, sizeof(struct spin_table));
++            continue;
++        }
++        parked++;
++    }
++
++    return parked;
++}
++
+ static u64 smp_get_iorvbar(int node, int cpu)
+ {
+     u64 cpu_impl_reg[2];
+@@ -405,6 +474,10 @@ void smp_start_secondaries(void)
+         u8 cluster = FIELD_GET(CPU_REG_CLUSTER, reg);
+         u8 die = FIELD_GET(CPU_REG_DIE, reg);
+ 
++        if (psci_active() && psci_reentered() &&
++            smp_reclaim_cpu(i, core | (cluster << 8) | (die << 16)))
++            continue;
++
+         smp_start_cpu(i, die, cluster, core, iorvbar, pmgr_reg + cpu_start_off);
+     }
+ }
+diff --git a/src/smp.h b/src/smp.h
+index 0296978..6c90557 100644
+--- a/src/smp.h
++++ b/src/smp.h
+@@ -18,6 +18,7 @@ void smp_secondary_prep_el3(void);
+ 
+ void smp_start_secondaries(void);
+ void smp_stop_secondaries(bool deep_sleep);
++int smp_park_secondaries_psci(void);
+ 
+ #define smp_call0(i, f)          smp_call4(i, f, 0, 0, 0, 0)
+ #define smp_call1(i, f, a)       smp_call4(i, f, a, 0, 0, 0)
+diff --git a/src/start.S b/src/start.S
+index aa11e18..a3f35ae 100644
+--- a/src/start.S
++++ b/src/start.S
+@@ -11,6 +11,7 @@
+ .extern _v_sp0_irq
+ .extern _v_sp0_fiq
+ .extern _v_sp0_serr
++.extern _v_lower_sync
+ .extern _reset_stack
+ .extern _cpu_reset_c
+ .extern wdt_reboot
+@@ -41,7 +42,7 @@ _vectors_start:
+     .align 7
+     b _v_sp0_serr
+     .align 7
+-    b _v_sp0_sync
++    b _v_lower_sync
+     .align 7
+     b _v_sp0_irq
+     .align 7
+@@ -103,6 +104,8 @@ _start:
+ 
+     mov x0, x19
+     mov x1, x20
++    mrs x2, CurrentEL
++    lsr x2, x2, #2
+     bl _start_c
+     b .
+ 
+@@ -115,6 +118,7 @@ start_el3:
+     msr tpidr_el3, xzr
+     adrp x6, _stack_bot
+     adr x7, _start_c
++    mov x2, #3 // _start_c: entered at EL3
+     b el3_eret_to_el1
+ 
+ .globl exc_unk
+diff --git a/src/startup.c b/src/startup.c
+index 61afe16..167fae8 100644
+--- a/src/startup.c
++++ b/src/startup.c
+@@ -5,6 +5,7 @@
+ #include "dockchannel_uart.h"
+ #include "exception.h"
+ #include "firmware.h"
++#include "psci.h"
+ #include "smp.h"
+ #include "string.h"
+ #include "types.h"
+@@ -159,12 +160,15 @@ void dump_boot_args(struct boot_args *ba)
+ }
+ 
+ extern void get_device_info(void);
+-void _start_c(void *boot_args, void *base)
++void _start_c(void *boot_args, void *base, u64 boot_el)
+ {
+     UNUSED(base);
+     u32 cpu_id = 0;
+ 
+     memset64(_bss_start, 0, _bss_end - _bss_start);
++    psci_note_boot_el(boot_el);
++    if (psci_reentered())
++        boot_cpu_idx = -1; // .data keeps the last run's value; find it again
+     boot_args_addr = (u64)boot_args;
+     memcpy(&cur_boot_args, boot_args, sizeof(cur_boot_args));
+ 
+-- 
+2.49.0
+

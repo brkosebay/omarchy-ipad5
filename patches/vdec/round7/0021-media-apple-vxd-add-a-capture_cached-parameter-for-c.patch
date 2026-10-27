@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 13:52:44 +0000
+Subject: [PATCH 21/21] media: apple: vxd: add a capture_cached parameter for
+ cacheable CAPTURE buffers
+
+The VXD node is not DMA-coherent, so the CAPTURE buffers dma-contig
+allocates are mapped uncached for the CPU.  Hardware decode itself never
+touches them on the CPU, but every consumer that reads a decoded picture
+does: FFmpeg's V4L2 Request API hwaccel downloads frames for mpv's
+v4l2request-copy mode, GStreamer's videoconvert reads NV12 for waylandsink
+and Chromium converts NV12 to ARGB on the CPU when the display stack cannot import
+it, which is every case on this iPad today.
+
+capture_cached=1 (0644, default off) makes the CAPTURE queue of contexts
+opened afterwards allocate MMAP buffers non-coherent: queue_init sets
+allow_cache_hints and drops DMA_ATTR_NO_KERNEL_MAPPING (the only attribute
+dma_alloc_noncontiguous() accepts is DMA_ATTR_ALLOC_SINGLE_PAGES), and the
+REQBUFS/CREATE_BUFS wrappers request V4L2_MEMORY_FLAG_NON_COHERENT on that
+queue.  vb2 then cleans each buffer at QBUF and invalidates it at DQBUF;
+userspace reads a picture only after DQBUF.  Without an IOMMU the buffers
+stay physically contiguous, so the GART mapping is unchanged.  With the
+parameter off the queues are set up exactly as before.
+
+The device test compares the copy paths with 0 and 1 and checks that the
+pictures stay bit-exact.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ drivers/media/platform/apple/vxd/apple-vxd-v4l2.c | 60 +++++++++++++++++++++--
+ 1 file changed, 56 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-v4l2.c b/drivers/media/platform/apple/vxd/apple-vxd-v4l2.c
+index 622fb1f96788a94faf2e5d57546b2b0aad571124..12ff4848f324cdddef90ff03daf908ca78a4f07b 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-v4l2.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-v4l2.c
+@@ -28,6 +28,21 @@
+ /* Smallest bitstream buffer handed to userspace. */
+ #define APPLE_VXD_MIN_BITSTREAM_SIZE	SZ_1M
+ 
++/*
++ * The VXD is not DMA-coherent, so coherent dma-contig buffers are mapped
++ * uncached for the CPU.  Every consumer that reads decoded pictures on the
++ * CPU (FFmpeg's hwframe download, GStreamer's videoconvert, Chromium's
++ * NV12->ARGB converter) then reads uncached memory.  capture_cached=1
++ * makes the CAPTURE queues of contexts opened afterwards allocate MMAP
++ * buffers non-coherent (cacheable): vb2 cleans them at QBUF and
++ * invalidates them at DQBUF, and userspace only reads a picture after
++ * DQBUF.  They stay physically contiguous, so the GART path is unchanged.
++ */
++static bool apple_vxd_capture_cached;
++module_param_named(capture_cached, apple_vxd_capture_cached, bool, 0644);
++MODULE_PARM_DESC(capture_cached,
++		 "cacheable MMAP CAPTURE buffers for contexts opened afterwards (vb2 syncs at QBUF/DQBUF)");
++
+ static struct apple_vxd_ctx *file_to_vxd_ctx(struct file *file)
+ {
+ 	return container_of(file_to_v4l2_fh(file), struct apple_vxd_ctx, fh);
+@@ -445,6 +460,34 @@ static void apple_vxd_step_handler(struct file *file, const char *what)
+ 	vxd_step_io(vxd->dev, "handler: %s", what);
+ }
+ 
++/*
++ * Only a cached CAPTURE queue has allow_cache_hints set (queue_init); ask
++ * vb2 for non-coherent memory on it whatever the application passed.
++ */
++static bool apple_vxd_cached_queue(struct file *file, u32 type, u32 memory)
++{
++	struct vb2_queue *vq = v4l2_m2m_get_vq(file_to_vxd_ctx(file)->fh.m2m_ctx,
++					       type);
++
++	return vq->allow_cache_hints && memory == V4L2_MEMORY_MMAP;
++}
++
++static int apple_vxd_reqbufs(struct file *file, void *priv,
++			     struct v4l2_requestbuffers *rb)
++{
++	if (apple_vxd_cached_queue(file, rb->type, rb->memory))
++		rb->flags |= V4L2_MEMORY_FLAG_NON_COHERENT;
++	return v4l2_m2m_ioctl_reqbufs(file, priv, rb);
++}
++
++static int apple_vxd_create_bufs(struct file *file, void *priv,
++				 struct v4l2_create_buffers *create)
++{
++	if (apple_vxd_cached_queue(file, create->format.type, create->memory))
++		create->flags |= V4L2_MEMORY_FLAG_NON_COHERENT;
++	return v4l2_m2m_ioctl_create_bufs(file, priv, create);
++}
++
+ static int apple_vxd_enum_framesizes(struct file *file, void *priv,
+ 				     struct v4l2_frmsizeenum *fsize)
+ {
+@@ -531,12 +574,12 @@ static const struct v4l2_ioctl_ops apple_vxd_ioctl_ops = {
+ 	.vidioc_enum_fmt_vid_out = apple_vxd_enum_output_fmt,
+ 	.vidioc_enum_fmt_vid_cap = apple_vxd_enum_capture_fmt,
+ 
+-	.vidioc_reqbufs = v4l2_m2m_ioctl_reqbufs,
++	.vidioc_reqbufs = apple_vxd_reqbufs,
+ 	.vidioc_querybuf = v4l2_m2m_ioctl_querybuf,
+ 	.vidioc_qbuf = v4l2_m2m_ioctl_qbuf,
+ 	.vidioc_dqbuf = v4l2_m2m_ioctl_dqbuf,
+ 	.vidioc_prepare_buf = v4l2_m2m_ioctl_prepare_buf,
+-	.vidioc_create_bufs = v4l2_m2m_ioctl_create_bufs,
++	.vidioc_create_bufs = apple_vxd_create_bufs,
+ 	.vidioc_expbuf = v4l2_m2m_ioctl_expbuf,
+ 
+ 	.vidioc_subscribe_event = v4l2_ctrl_subscribe_event,
+@@ -939,8 +982,17 @@ static int apple_vxd_queue_init(void *priv, struct vb2_queue *src_vq,
+ 
+ 	dst_vq->bidirectional = true;
+ 	dst_vq->mem_ops = &vb2_dma_contig_memops;
+-	dst_vq->dma_attrs = DMA_ATTR_ALLOC_SINGLE_PAGES |
+-			    DMA_ATTR_NO_KERNEL_MAPPING;
++	if (READ_ONCE(apple_vxd_capture_cached)) {
++		/*
++		 * dma_alloc_noncontiguous() takes no other attribute; a
++		 * non-coherent buffer has no kernel mapping until vb2 asks.
++		 */
++		dst_vq->dma_attrs = DMA_ATTR_ALLOC_SINGLE_PAGES;
++		dst_vq->allow_cache_hints = 1;
++	} else {
++		dst_vq->dma_attrs = DMA_ATTR_ALLOC_SINGLE_PAGES |
++				    DMA_ATTR_NO_KERNEL_MAPPING;
++	}
+ 	dst_vq->type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+ 	dst_vq->io_modes = VB2_MMAP | VB2_DMABUF;
+ 	dst_vq->drv_priv = ctx;

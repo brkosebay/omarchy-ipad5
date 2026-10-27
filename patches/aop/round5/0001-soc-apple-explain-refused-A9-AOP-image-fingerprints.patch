@@ -1,0 +1,352 @@
+From ee698666756bc9f21555068b9476d6fcea83081b Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 17:15:55 +0000
+Subject: [PATCH] soc: apple: explain refused A9 AOP image fingerprints
+
+The first running-attach capture has no UUID header or readable version text
+at the expected region offsets, but the existing dump suppresses malformed
+tag tables and does not show reference bytes. Preserve enough evidence to
+distinguish an identity mismatch from a different mapped/runtime layout.
+
+Add root-only read-only fingerprint debugfs output backed entirely by frozen
+Phase A copies: the first 0x100 bytes, UUID/build/table windows, pinned file
+counterparts, mismatch counts and offsets, raw little-endian tag words with
+their tail, bounded printable text, loader expectations and remap registers.
+Gate the extra prefix/remap snapshot on debug=1 and the existing wrapper
+preconditions. Never follow a remap address or access hardware from debugfs.
+
+Keep the Round 4 identity, tag, ext reservation and one-shot handshake policy
+unchanged. Document the evidence limits and why a matching build string alone
+cannot establish safe attach to a different image or runtime layout.
+
+Host ASan/UBSan diagnostics/policy tests and W=1 AOP object compilation pass.
+No device access was performed.
+---
+ Documentation/driver-api/apple-a9-aop.rst |  32 +++++
+ drivers/soc/apple/a9-aop-diagnostics.h    |  64 +++++++++
+ drivers/soc/apple/apple-a9-aop-active.c   | 165 +++++++++++++++++++++-
+ 3 files changed, 260 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/soc/apple/a9-aop-diagnostics.h
+
+diff --git a/Documentation/driver-api/apple-a9-aop.rst b/Documentation/driver-api/apple-a9-aop.rst
+index b1d7072158..77a28d64fe 100644
+--- a/Documentation/driver-api/apple-a9-aop.rst
++++ b/Documentation/driver-api/apple-a9-aop.rst
+@@ -160,3 +160,35 @@ Offline verification establishes parsing, bounds and policy only. The
+ firmware's reaction to the speculative reply and EPMAP proving first-AP
+ ownership remain inferences from the takeover design, not device-verified
+ behavior. No device measurement is supplied by this change.
++
++Frozen fingerprint diagnostics (Round 5)
++======================================
++
++With debug=1, the read-only root-only file
++``/sys/kernel/debug/apple-a9-aop-active/fingerprint`` explains Phase A even
++after ``refused-running-foreign-image``. It reports:
++
++* First 0x100 region bytes and their pinned-file counterparts, as hex/ASCII.
++* The 0x40-byte UUID header at +0x20, with actual/expected words and decoded
++  magic, version, table offset and table length.
++* All 64 build-window bytes at +0x47440 as hex and bounded printable text,
++  including embedded NULs. This window includes bytes after the build string;
++  a matching text substring does not prove the entire window matches.
++* All 0x1df tag-table bytes at +0x389b8, including raw little-endian words and
++  the final three bytes even if the first TLV is malformed. Expected raw
++  bytes are the UNPATCHED reference template; the expected loader values
++  (including variable EC0p and entropy tags) are stated separately.
++* A first mismatch and byte count for every window, reference-load/pinning
++  status, and the saved wrapper remap configuration at +08/+10/+18/+20/
++  +28/+30/+38 alongside the cold-loader expectation.
++
++Every value comes from the original bounded Phase A snapshot. Reading the
++file only formats RAM copies: no fresh MMIO, FIFO reads, mailbox TX, retries
++or guessed physical mappings. Extra prefix/remap reads occur only with
++debug=1, after the existing powered/running/empty/fault-free checks. Remap
++values are evidence only and are never followed to a different address.
++
++The acceptance rules, fixed offsets and one-shot attach policy are unchanged.
++A different build string cannot authorize attachment. Support for another
++image or a relocated runtime layout needs its own verified image/layout,
++tag and ext-buffer contract plus the same reservation and handshake proofs.
+diff --git a/drivers/soc/apple/a9-aop-diagnostics.h b/drivers/soc/apple/a9-aop-diagnostics.h
+new file mode 100644
+index 0000000000..1fbe14030f
+--- /dev/null
++++ b/drivers/soc/apple/a9-aop-diagnostics.h
+@@ -0,0 +1,64 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Bounded snapshot diagnostics; no decisions, MMIO or protocol operations. */
++#ifndef _A9_AOP_DIAGNOSTICS_H
++#define _A9_AOP_DIAGNOSTICS_H
++
++#include "a9-aop-takeover.h"
++
++#define A9_DIAG_PREFIX_SIZE	0x100
++#define A9_DIAG_UUID_OFFSET	0x20
++#define A9_DIAG_UUID_SIZE		0x40
++
++struct a9_diag_diff {
++	size_t count;
++	size_t first; /* size means equal */
++};
++
++static inline struct a9_diag_diff a9_diag_compare(const u8 *actual,
++						  const u8 *expected, size_t size)
++{
++	struct a9_diag_diff diff = { .first = size };
++	size_t i;
++
++	for (i = 0; i < size; i++) {
++		if (actual[i] == expected[i])
++			continue;
++		if (!diff.count)
++			diff.first = i;
++		diff.count++;
++	}
++	return diff;
++}
++
++static inline char a9_diag_printable(u8 c)
++{
++	return c >= 0x20 && c <= 0x7e ? c : '.';
++}
++
++struct a9_diag_tag {
++	u32 name, size;
++	const u8 *data;
++};
++
++/* Diagnostic walk only. Even a refused, arbitrary table must be safe to show. */
++static inline int a9_diag_next_tag(const u8 *table, size_t size, size_t *cursor,
++				   struct a9_diag_tag *tag)
++{
++	size_t at = *cursor;
++	u32 length;
++
++	if (at == size)
++		return 0;
++	if (at > size || size - at < 8)
++		return -EMSGSIZE;
++	length = get_unaligned_le32(table + at + 4);
++	if (length > size - at - 8)
++		return -EMSGSIZE;
++	tag->name = get_unaligned_le32(table + at);
++	tag->size = length;
++	tag->data = table + at + 8;
++	*cursor = at + 8 + length;
++	return 1;
++}
++
++#endif
+diff --git a/drivers/soc/apple/apple-a9-aop-active.c b/drivers/soc/apple/apple-a9-aop-active.c
+index 6964fa9d56..08b68c6130 100644
+--- a/drivers/soc/apple/apple-a9-aop-active.c
++++ b/drivers/soc/apple/apple-a9-aop-active.c
+@@ -49,6 +49,7 @@
+ #include "a9-aop-iio.h"
+ #include "a9-aop.h"
+ #include "a9-aop-takeover.h"
++#include "a9-aop-diagnostics.h"
+ 
+ /* Shares the observer's parameter namespace: apple_a9_aop.active=1. */
+ #undef MODULE_PARAM_PREFIX
+@@ -257,6 +258,15 @@ struct a9_aop {
+ 	bool running_attach;
+ 	struct a9_attach takeover;
+ 	struct a9_attach_fingerprint fingerprint;
++	/* Frozen Phase A evidence; debugfs never re-reads refused hardware. */
++	struct {
++		u8 prefix[A9_DIAG_PREFIX_SIZE];
++		u8 expected_prefix[A9_DIAG_PREFIX_SIZE];
++		struct a9_attach_fingerprint expected;
++		u32 remap[7];
++		bool captured, reference_pinned;
++		int reference_errno;
++	} diagnostics;
+ 	bool fingerprint_read, image_verified, tags_verified, ext_reserved, ext_verified;
+ 	u32 snapshot[6];
+ 	bool hello, epmap_done;
+@@ -1191,8 +1201,23 @@ static void a9_aop_read_regs(void *data)
+ 	    (regs->values[3] & AOP_MBOX_EMPTY) &&
+ 	    !((regs->values[2] | regs->values[3]) & AOP_MBOX_FAULTS)) {
+ 		struct a9_attach_fingerprint *fp = &regs->aop->fingerprint;
++		static const u32 remap_offsets[] = {
++			AOP_REMAP_PA_LO, AOP_REMAP_PA_HI,
++			AOP_REMAP_IOP_LO, AOP_REMAP_IOP_HI, AOP_REMAP_SIZE,
++			AOP_REMAP_RESERVED, AOP_REMAP_ENABLE,
++		};
+ 
+-		memcpy_fromio(fp->head, regs->aop->region, sizeof(fp->head));
++		if (apple_a9_aop_debug()) {
++			memcpy_fromio(regs->aop->diagnostics.prefix, regs->aop->region,
++				      A9_DIAG_PREFIX_SIZE);
++			memcpy(fp->head, regs->aop->diagnostics.prefix, sizeof(fp->head));
++			for (i = 0; i < ARRAY_SIZE(remap_offsets); i++)
++				regs->aop->diagnostics.remap[i] =
++					aop_rd(regs->aop, remap_offsets[i]);
++			regs->aop->diagnostics.captured = true;
++		} else {
++			memcpy_fromio(fp->head, regs->aop->region, sizeof(fp->head));
++		}
+ 		memcpy_fromio(fp->build, regs->aop->region + A9_ATTACH_BUILD_OFFSET,
+ 			      sizeof(fp->build));
+ 		memcpy_fromio(fp->table, regs->aop->region + A9_ATTACH_TABLE_OFFSET,
+@@ -1540,6 +1565,18 @@ static bool a9_aop_attach_preflight(struct a9_aop *aop)
+ 	if (!ret && !a9_aop_pinned_firmware(fw, false))
+ 		ret = -EILSEQ;
+ 	mutex_lock(&aop->lock);
++	aop->diagnostics.reference_errno = ret;
++	if (!ret && apple_a9_aop_debug()) {
++		struct a9_attach_fingerprint *expected = &aop->diagnostics.expected;
++
++		memcpy(aop->diagnostics.expected_prefix, fw->data, A9_DIAG_PREFIX_SIZE);
++		memcpy(expected->head, fw->data, sizeof(expected->head));
++		memcpy(expected->build, fw->data + A9_ATTACH_BUILD_OFFSET,
++		       sizeof(expected->build));
++		memcpy(expected->table, fw->data + A9_ATTACH_TABLE_OFFSET,
++		       sizeof(expected->table));
++		aop->diagnostics.reference_pinned = true;
++	}
+ 	if (ret || a9_aop_dead(aop))
+ 		goto out;
+ 	/* Recheck domains and wrapper after the filesystem wait, before region IO. */
+@@ -1987,6 +2024,130 @@ static int a9_aop_rings_show(struct seq_file *s, void *unused)
+ }
+ DEFINE_SHOW_ATTRIBUTE(a9_aop_rings);
+ 
++/* All diagnostic readers below use frozen RAM copies, including on refusal. */
++static void a9_aop_fingerprint_window(struct seq_file *s, const char *name,
++				      u32 offset, const u8 *actual,
++				      const u8 *expected, size_t size, bool pinned)
++{
++	struct a9_diag_diff diff;
++	size_t i;
++
++	seq_printf(s, "window=%s region_offset=0x%x bytes=0x%zx\n", name, offset, size);
++	if (pinned) {
++		diff = a9_diag_compare(actual, expected, size);
++		seq_printf(s, "comparison=%s mismatched_bytes=%zu",
++			   diff.count ? "different" : "equal", diff.count);
++		if (diff.count)
++			seq_printf(s, " first_mismatch=0x%zx actual=0x%02x expected=0x%02x",
++				   offset + diff.first, actual[diff.first], expected[diff.first]);
++		seq_putc(s, '\n');
++	}
++	seq_hex_dump(s, "actual ", DUMP_PREFIX_OFFSET, 16, 1, actual, size, true);
++	if (pinned)
++		seq_hex_dump(s, "expected ", DUMP_PREFIX_OFFSET, 16, 1, expected, size, true);
++	if (strcmp(name, "build-string"))
++		return;
++	/* Exactly 64 bytes, including embedded NULs; never treat RAM as a C string. */
++	seq_puts(s, "actual_printable=|");
++	for (i = 0; i < size; i++)
++		seq_putc(s, a9_diag_printable(actual[i]));
++	seq_puts(s, "|\n");
++	if (pinned) {
++		seq_puts(s, "expected_printable=|");
++		for (i = 0; i < size; i++)
++			seq_putc(s, a9_diag_printable(expected[i]));
++		seq_puts(s, "|\n");
++	}
++}
++
++static void a9_aop_fingerprint_tags(struct seq_file *s, struct a9_aop *aop)
++{
++	const u8 *actual = aop->fingerprint.table;
++	const u8 *expected = aop->diagnostics.expected.table;
++	struct a9_diag_tag tag;
++	size_t at, cursor = 0;
++	int ret;
++
++	seq_puts(s, "tag_words: expected_unpatched is the pinned file template; loader values differ legitimately\n");
++	for (at = 0; at + 4 <= A9_ATTACH_TABLE_SIZE; at += 4) {
++		seq_printf(s, "+%06zx actual_le32=0x%08x", A9_ATTACH_TABLE_OFFSET + at,
++			   get_unaligned_le32(actual + at));
++		if (aop->diagnostics.reference_pinned)
++			seq_printf(s, " expected_unpatched_le32=0x%08x",
++				   get_unaligned_le32(expected + at));
++		seq_putc(s, '\n');
++	}
++	seq_printf(s, "+%06zx tail_actual=%*phN", A9_ATTACH_TABLE_OFFSET + at,
++		   (int)(A9_ATTACH_TABLE_SIZE - at), actual + at);
++	if (aop->diagnostics.reference_pinned)
++		seq_printf(s, " tail_expected_unpatched=%*phN",
++			   (int)(A9_ATTACH_TABLE_SIZE - at), expected + at);
++	seq_putc(s, '\n');
++	/* Raw words are always shown, even when the first TLV is malformed. */
++	while ((ret = a9_diag_next_tag(actual, A9_ATTACH_TABLE_SIZE, &cursor, &tag)) > 0)
++		seq_printf(s, "actual_tag +%06zx name=%c%c%c%c len=%u data=%*phN\n",
++			   A9_ATTACH_TABLE_OFFSET + cursor - 8 - tag.size,
++			   a9_diag_printable(tag.name >> 24),
++			   a9_diag_printable(tag.name >> 16),
++			   a9_diag_printable(tag.name >> 8), a9_diag_printable(tag.name),
++			   tag.size, (int)min_t(u32, tag.size, 64), tag.data);
++	if (ret)
++		seq_printf(s, "actual_tag_walk=malformed offset=0x%zx errno=%d (raw words retained)\n",
++			   A9_ATTACH_TABLE_OFFSET + cursor, ret);
++	seq_printf(s, "expected_loader AOPt=%u WrAd=0x%llx McRA=0x4000 nCal=0 SOC_=0x%x SOCR=%u ED0p=0 RTTO=0 DEVf=0\n",
++		   aop->aop_target, (unsigned long long)aop->wrapper_pa,
++		   aop->chip_id, aop->chip_revision);
++	seq_puts(s, "expected_loader EC0p=nonzero,16K-aligned,48-bit,intact-ext-in-reserved-memory; STKG/PRNG/NONC/ECID=loader-specific; other values=file defaults\n");
++}
++
++static int a9_aop_fingerprint_show(struct seq_file *s, void *unused)
++{
++	struct a9_aop *aop = s->private;
++	const struct a9_attach_fingerprint *expected = &aop->diagnostics.expected;
++	const struct a9_attach_fingerprint *actual = &aop->fingerprint;
++	bool pinned;
++
++	mutex_lock(&aop->lock);
++	pinned = aop->diagnostics.reference_pinned;
++	seq_puts(s, "format=1 source=phase-A-frozen-snapshot hardware_reads=none hardware_writes=none\n");
++	seq_printf(s, "reference=%s size=%u sha256=af5d51a368ceb89dc5c359e7c84e54cb6082e308956be742c17622eb4a6047c8 pinned=%d errno=%d\n",
++		   AOP_MAIN_FW, A9_ATTACH_MAIN_SIZE, pinned, aop->diagnostics.reference_errno);
++	seq_printf(s, "region pa=0x%llx size=0x%llx snapshot_available=%d\n",
++		   (unsigned long long)aop->region_pa, (unsigned long long)aop->region_size,
++		   aop->diagnostics.captured);
++	if (!aop->diagnostics.captured) {
++		seq_puts(s, "no running/empty Phase A snapshot; no diagnostic MMIO attempted by this read\n");
++		goto out;
++	}
++	seq_printf(s, "remap actual +08=%08x +10=%08x +18=%08x +20=%08x +28=%08x +30=%08x +38=%08x\n",
++		   aop->diagnostics.remap[0], aop->diagnostics.remap[1],
++		   aop->diagnostics.remap[2], aop->diagnostics.remap[3],
++		   aop->diagnostics.remap[4], aop->diagnostics.remap[5], aop->diagnostics.remap[6]);
++	seq_printf(s, "remap expected_cold_loader +08=%08x +10=%08x +18=00000000 +20=00000000 +28=%08x +30=00000000 +38=00000001 (diagnostic only; no following remap PA)\n",
++		   lower_32_bits(aop->region_pa), upper_32_bits(aop->region_pa),
++		   (u32)aop->region_size & ~0xfffU);
++	a9_aop_fingerprint_window(s, "region-prefix", 0, aop->diagnostics.prefix,
++				  aop->diagnostics.expected_prefix, A9_DIAG_PREFIX_SIZE, pinned);
++	a9_aop_fingerprint_window(s, "uuid-header", A9_DIAG_UUID_OFFSET,
++				  actual->head + A9_DIAG_UUID_OFFSET,
++				  expected->head + A9_DIAG_UUID_OFFSET, A9_DIAG_UUID_SIZE, pinned);
++	seq_printf(s, "uuid actual magic=0x%08x version=%u table_offset=0x%x table_size=0x%x\n",
++		   get_unaligned_le32(actual->head + 0x20),
++		   get_unaligned_le32(actual->head + 0x24),
++		   get_unaligned_le32(actual->head + 0x48),
++		   get_unaligned_le32(actual->head + 0x4c));
++	seq_puts(s, "uuid expected magic=0x64697575 version=5 table_offset=0x389b8 table_size=0x1df\n");
++	a9_aop_fingerprint_window(s, "build-string", A9_ATTACH_BUILD_OFFSET,
++				  actual->build, expected->build, A9_ATTACH_BUILD_SIZE, pinned);
++	a9_aop_fingerprint_window(s, "tag-table-unpatched-template", A9_ATTACH_TABLE_OFFSET,
++				  actual->table, expected->table, A9_ATTACH_TABLE_SIZE, pinned);
++	a9_aop_fingerprint_tags(s, aop);
++out:
++	mutex_unlock(&aop->lock);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(a9_aop_fingerprint);
++
+ static int a9_aop_patchbay_show(struct seq_file *s, void *unused)
+ {
+ 	struct a9_aop *aop = s->private;
+@@ -2200,6 +2361,8 @@ static int a9_aop_probe(struct platform_device *pdev)
+ 					    &a9_aop_rings_fops);
+ 			debugfs_create_file("patchbay", 0400, aop->debugfs, aop,
+ 					    &a9_aop_patchbay_fops);
++			debugfs_create_file("fingerprint", 0400, aop->debugfs, aop,
++					    &a9_aop_fingerprint_fops);
+ 		}
+ 	}
+ 	platform_set_drvdata(pdev, aop);

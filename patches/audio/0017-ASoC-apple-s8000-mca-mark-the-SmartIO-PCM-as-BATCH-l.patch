@@ -1,0 +1,111 @@
+From 1a1a5dc2f5a4c04dfc9efa58d8984fbfc667b2b1 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 14:08:36 +0000
+Subject: [PATCH 17/17] ASoC: apple: s8000-mca: mark the SmartIO PCM as BATCH,
+ log stream errors
+
+SmartIO reports the DMA position per completed period (residue
+granularity "segment"). The generic dmaengine PCM would set
+SNDRV_PCM_INFO_BATCH for that, but it skips that logic when the driver
+supplies its own snd_pcm_hardware. So set it here. PipeWire/PulseAudio
+(ACP) read it to keep a period of headroom instead of trusting a
+sample-accurate pointer, and the core skips its jiffies pointer check.
+
+The first device run showed one error IRQ per stream (status 0x80000005:
+TX underflow plus low-water). Error causes are masked after the first
+one, so the counters cannot tell a start-up underflow from a recurring
+one. Record how long after trigger start the first error came, and the
+raw IRQ status at stop (masked causes still latch), and report both in
+debugfs s8000-mca-regs.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ sound/soc/apple/s8000-mca.c | 31 ++++++++++++++++++++++++++++++-
+ 1 file changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/sound/soc/apple/s8000-mca.c b/sound/soc/apple/s8000-mca.c
+index 31075b25df..48f9da532c 100644
+--- a/sound/soc/apple/s8000-mca.c
++++ b/sound/soc/apple/s8000-mca.c
+@@ -158,6 +158,11 @@ struct s8000_mca {
+ 	u32 mclk_cur;		/* last MCLK word written (0 = off) */
+ 	bool mclk_on;		/* MCLK clock enabled: word written */
+ 	bool route_on;		/* i2s-switch route applied */
++	/* last stream: tells a start-up underflow from recurring ones */
++	ktime_t start_time;
++	s64 first_err_us;	/* first error IRQ after start, -1 = none */
++	u32 first_err_status;
++	u32 stop_status;	/* raw IRQ_STATUS at stop; masked causes latch too */
+ 	bool mclk_forced;	/* debugfs s8000-mca-mclk */
+ 	struct mutex dbg_lock;	/* debugfs s8000-mca-mclk */
+ 	u32 route_ovr[16];	/* parsed "route" parameter */
+@@ -421,6 +426,9 @@ static int mca_trigger(struct snd_pcm_substream *substream, int cmd,
+ 	case SNDRV_PCM_TRIGGER_START:
+ 	case SNDRV_PCM_TRIGGER_RESUME:
+ 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
++		mca->start_time = ktime_get();
++		mca->first_err_us = -1;
++		mca->stop_status = 0;
+ 		mca_write(mca, MCA_IRQ_STATUS, MCA_IRQ_ALL);
+ 		if (mca->pio_off) {
+ 			mca->irq_mask &= ~MCA_IRQ_TX_LOW_WATER;
+@@ -433,6 +441,7 @@ static int mca_trigger(struct snd_pcm_substream *substream, int cmd,
+ 	case SNDRV_PCM_TRIGGER_SUSPEND:
+ 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+ 		/* an empty FIFO would keep TX low-water firing until prepare */
++		mca->stop_status = mca_read(mca, MCA_IRQ_STATUS);
+ 		mca->irq_mask |= MCA_IRQ_TX_LOW_WATER;
+ 		mca_write(mca, MCA_IRQ_MASK, mca->irq_mask);
+ 		mca_write(mca, MCA_TX_CFG, 0);
+@@ -645,9 +654,16 @@ static const struct snd_soc_component_driver mca_component_dma = {
+ };
+ 
+ /* SmartIO queues one command per period; it has 31 tags per endpoint. */
++/*
++ * SmartIO reports the position per completed period (residue granularity
++ * "segment"). The generic dmaengine PCM would flag that as BATCH, but it
++ * skips that logic when the driver supplies its own hardware limits, so
++ * set it here: PipeWire/PulseAudio need it to keep a period of headroom.
++ */
+ static const struct snd_pcm_hardware mca_dma_hw = {
+ 	.info = SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_MMAP |
+-		SNDRV_PCM_INFO_MMAP_VALID | SNDRV_PCM_INFO_BLOCK_TRANSFER,
++		SNDRV_PCM_INFO_MMAP_VALID | SNDRV_PCM_INFO_BLOCK_TRANSFER |
++		SNDRV_PCM_INFO_BATCH,
+ 	.formats = MCA_FORMATS,
+ 	.rates = MCA_RATES,
+ 	.rate_min = 8000,
+@@ -737,6 +753,11 @@ static irqreturn_t mca_irq(int irq, void *data)
+ 		 * them until the next prepare instead of storming.
+ 		 */
+ 		mca->err_count++;
++		if (mca->first_err_us < 0) {
++			mca->first_err_us = ktime_us_delta(ktime_get(),
++							   mca->start_time);
++			mca->first_err_status = raw;
++		}
+ 		mca->irq_mask |= status & MCA_IRQ_ERRORS;
+ 		mca_write(mca, MCA_IRQ_MASK, mca->irq_mask);
+ 		dev_dbg_ratelimited(mca->dev, "irq status %#x, masked\n", status);
+@@ -813,6 +834,13 @@ static int mca_regs_show(struct seq_file *s, void *unused)
+ 		   mca->mclk_cur, mca->mclk_on ? ", clock on" : "",
+ 		   mca->mclk_forced ? ", forced" : "",
+ 		   mca->route_on ? "applied" : "off");
++	if (mca->first_err_us >= 0)
++		seq_printf(s, "last stream: first error %lld us after start (status %#x), status at stop %#x\n",
++			   mca->first_err_us, mca->first_err_status,
++			   mca->stop_status);
++	else
++		seq_printf(s, "last stream: no error IRQ, status at stop %#x\n",
++			   mca->stop_status);
+ 
+ 	if (pm_runtime_get_if_active(mca->dev) <= 0) {
+ 		seq_puts(s, "runtime-suspended: registers not read\n");
+@@ -943,6 +971,7 @@ static int s8000_mca_probe(struct platform_device *pdev)
+ 		return dev_err_probe(dev, -EINVAL, "bad apple,pio-fifo-offset\n");
+ 
+ 	mca->irq_mask = MCA_IRQ_ALL;
++	mca->first_err_us = -1;
+ 	mca->irq = platform_get_irq(pdev, 0);
+ 	if (mca->irq < 0)
+ 		return mca->irq;

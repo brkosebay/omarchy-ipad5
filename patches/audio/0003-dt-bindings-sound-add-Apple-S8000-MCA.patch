@@ -1,0 +1,108 @@
+From 09b32848f501771fb31ccd6980fbac35d02c11b9 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 11:46:07 +0000
+Subject: [PATCH 03/17] dt-bindings: sound: add Apple S8000 MCA
+
+The A9 "mca-version 4" serializer, with its MCLK control word and the
+route it programs in the shared i2s-switch.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ .../bindings/sound/apple,s8000-mca.yaml       | 88 +++++++++++++++++++
+ 1 file changed, 88 insertions(+)
+ create mode 100644 Documentation/devicetree/bindings/sound/apple,s8000-mca.yaml
+
+diff --git a/Documentation/devicetree/bindings/sound/apple,s8000-mca.yaml b/Documentation/devicetree/bindings/sound/apple,s8000-mca.yaml
+new file mode 100644
+index 0000000000..2d0ae5b0fa
+--- /dev/null
++++ b/Documentation/devicetree/bindings/sound/apple,s8000-mca.yaml
+@@ -0,0 +1,88 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/sound/apple,s8000-mca.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Apple S8000 (A9) MCA I2S controller
++
++maintainers:
++  - linux-a9 <linux-a9@localhost>
++
++description:
++  The A9 "mca-version 4" serializer. Besides its register window it owns a
++  32-bit MCLK control word (exported as a clock) and programs a route in the
++  shared i2s-switch.
++
++allOf:
++  - $ref: dai-common.yaml#
++
++properties:
++  compatible:
++    const: apple,s8000-mca
++
++  reg:
++    items:
++      - description: MCA registers
++      - description: MCLK control word
++
++  reg-names:
++    items:
++      - const: mca
++      - const: mclk
++
++  interrupts:
++    maxItems: 1
++
++  power-domains:
++    maxItems: 1
++
++  dmas:
++    maxItems: 1
++
++  dma-names:
++    const: tx
++
++  '#sound-dai-cells':
++    const: 0
++
++  '#clock-cells':
++    const: 0
++
++  clock-output-names:
++    maxItems: 1
++
++  apple,mclk-control:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    description: Value written to the MCLK word to enable MCLK output.
++
++  apple,mclk-frequency:
++    $ref: /schemas/types.yaml#/definitions/uint32
++
++  apple,i2s-switch:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description: The i2s-switch syscon.
++
++  apple,i2s-switch-route:
++    $ref: /schemas/types.yaml#/definitions/uint32-matrix
++    items:
++      items:
++        - description: register byte offset
++        - description: value
++    description: i2s-switch registers to set while the port runs.
++
++  apple,pio-fifo-offset:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    description: Experimental CPU-writable TX FIFO register (no DMA).
++
++  apple,pio-burst:
++    $ref: /schemas/types.yaml#/definitions/uint32
++
++required:
++  - compatible
++  - reg
++  - reg-names
++  - interrupts
++  - '#sound-dai-cells'
++
++unevaluatedProperties: false

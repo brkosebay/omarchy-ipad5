@@ -1,0 +1,35 @@
+From f2104752fa9da550b3c659d391f7b88167a22131 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Tue, 27 Oct 2026 09:38:19 +0000
+Subject: [PATCH 3/4] power: supply: apple_j71t_charger: accept the camera
+ adapter as a source
+
+The CBTL1610 supplier now reports the identified Lightning camera adapter
+as POWER_SUPPLY_USB_TYPE_ACA, also while the iPad is the USB host. Treat
+it as an eligible source, like a verified host grant or an Apple brick,
+so the policy ramps to the supplier's budget (2100 mA after the power
+handshake). The DT ceiling (2400 mA) and the calibrated budget table
+already include 2100 mA.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ drivers/power/supply/apple_j71t_charger.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/power/supply/apple_j71t_charger.c b/drivers/power/supply/apple_j71t_charger.c
+index ce93beb939..923ad579b4 100644
+--- a/drivers/power/supply/apple_j71t_charger.c
++++ b/drivers/power/supply/apple_j71t_charger.c
+@@ -200,8 +200,10 @@ static int j71t_source_eligible(struct j71t_charger *charger)
+ 						      POWER_SUPPLY_PROP_USB_TYPE, &value);
+ 	if (ret)
+ 		return -EAGAIN;
++	/* ACA: the identified camera adapter, a source while the iPad is the host. */
+ 	return value.intval == POWER_SUPPLY_USB_TYPE_SDP ||
+-	       value.intval == POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID;
++	       value.intval == POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID ||
++	       value.intval == POWER_SUPPLY_USB_TYPE_ACA;
+ }
+ 
+ /* Link PM/reset is not source removal; only ONLINE=0 revokes the owner. */

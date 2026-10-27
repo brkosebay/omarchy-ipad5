@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=USB Drives
+Comment=Browse and eject connected USB drives
+Exec=nautilus computer:///
+Icon=drive-removable-media-usb
+Terminal=false
+Categories=System;FileManager;

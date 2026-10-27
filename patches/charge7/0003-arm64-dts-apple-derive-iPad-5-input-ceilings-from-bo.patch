@@ -1,0 +1,48 @@
+From a8aa6fea363394f3d21f2eef7525998884b4cf3f Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Tue, 27 Oct 2026 15:31:46 +0000
+Subject: [PATCH 3/3] arm64: dts: apple: derive iPad 5 input ceilings from
+ board ADTs
+
+All four iPad 5 ADTs specify usb-input-limit-max = 0x960 mA. Describe the
+2400 mA ceiling in the common node and remove the J71t development unit's
+probe-time owner override. This does not enable charger drivers on the
+other three boards, whose full peripheral wiring remains separate work.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ arch/arm64/boot/dts/apple/s8003-j71t-periph.dtsi | 2 --
+ arch/arm64/boot/dts/apple/s800x-ipad5.dtsi       | 7 +++++++
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/apple/s8003-j71t-periph.dtsi b/arch/arm64/boot/dts/apple/s8003-j71t-periph.dtsi
+index 67d47c2893..fb1a899a52 100644
+--- a/arch/arm64/boot/dts/apple/s8003-j71t-periph.dtsi
++++ b/arch/arm64/boot/dts/apple/s8003-j71t-periph.dtsi
+@@ -94,8 +94,6 @@ charger@180 {
+ 		reg = <0x180>, <0xa00>;
+ 		reg-names = "status", "control";
+ 		power-supplies = <&periph_tristar>;
+-		apple,usb-input-limit-max-microamp = <2400000>;
+-		apple,owner-input-limit-microamp = <2400000>;
+ 	};
+ };
+ 
+diff --git a/arch/arm64/boot/dts/apple/s800x-ipad5.dtsi b/arch/arm64/boot/dts/apple/s800x-ipad5.dtsi
+index 4dba784427..4364f90e62 100644
+--- a/arch/arm64/boot/dts/apple/s800x-ipad5.dtsi
++++ b/arch/arm64/boot/dts/apple/s800x-ipad5.dtsi
+@@ -70,6 +70,13 @@ pmic@3c {
+ 		#address-cells = <1>;
+ 		#size-cells = <1>;
+ 
++		/* ADT j71s/j71t/j72s/j72t: usb-input-limit-max = 0x960 mA. */
++		charger@180 {
++			reg = <0x180 0x1e>, <0xa00 0x0d>;
++			reg-names = "status", "control";
++			apple,usb-input-limit-max-microamp = <2400000>;
++		};
++
+ 		rtc@500 {
+ 			compatible = "apple,angel-pmic-rtc", "apple,antigua-pmic-rtc";
+ 			reg = <0x500 0x10>;

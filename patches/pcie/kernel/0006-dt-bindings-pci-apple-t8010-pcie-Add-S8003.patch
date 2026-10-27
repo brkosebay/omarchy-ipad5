@@ -1,0 +1,129 @@
+From 1e1bbcd11874a27e851860ceb474778ebbc648d7 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 10:07:07 +0000
+Subject: [PATCH 06/43] dt-bindings: pci: apple,t8010-pcie: Add S8003
+
+The A9 (TSMC, S8003) root complex has the T8010 register layout,
+including the "phy-ip" PHY block. Differences are described by
+properties:
+
+- the A9 PMGR has per-link power domains (pcie_link0..3), so allow
+  up to seven power domains,
+- apple,lane-cfg carries the ADT apcie "lane-cfg" (1 on iPad 5, 0 on
+  iPad 7),
+- root ports may carry max-link-speed (the S3E link on A9 is Gen2)
+  and apple,nvme-mode,
+- CLKREQ# is only required on T8010; on S8003 it stays a peripheral
+  function.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ .../bindings/pci/apple,t8010-pcie.yaml        | 50 ++++++++++++++++---
+ 1 file changed, 44 insertions(+), 6 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/pci/apple,t8010-pcie.yaml b/Documentation/devicetree/bindings/pci/apple,t8010-pcie.yaml
+index e296acafb3..2b6db0909d 100644
+--- a/Documentation/devicetree/bindings/pci/apple,t8010-pcie.yaml
++++ b/Documentation/devicetree/bindings/pci/apple,t8010-pcie.yaml
+@@ -4,14 +4,14 @@
+ $id: http://devicetree.org/schemas/pci/apple,t8010-pcie.yaml#
+ $schema: http://devicetree.org/meta-schemas/core.yaml#
+ 
+-title: Apple T8010 PCIe host controller
++title: Apple S8003 and T8010 PCIe host controller
+ 
+ maintainers:
+   - Paul Praschl <maintainer@example.invalid>
+ 
+ description: |
+-  Apple A10/T8010 devices use the H9P PCIe root complex for internal
+-  storage and Wi-Fi. It exposes one ECAM window shared by up to four root
++  Apple A9/S8003 (TSMC) and A10/T8010 devices use the H8P/H9P PCIe root
++  complex for internal storage and Wi-Fi. It exposes one ECAM window shared by up to four root
+   ports, controller-specific PHY and port register windows, and a local MSI
+   block.
+ 
+@@ -31,7 +31,9 @@ allOf:
+ 
+ properties:
+   compatible:
+-    const: apple,t8010-pcie
++    enum:
++      - apple,s8003-pcie
++      - apple,t8010-pcie
+ 
+   reg:
+     maxItems: 9
+@@ -72,13 +74,28 @@ properties:
+       - const: ref
+ 
+   power-domains:
+-    maxItems: 3
++    minItems: 3
++    maxItems: 7
+ 
+   power-domain-names:
++    minItems: 3
+     items:
+       - const: core
+       - const: aux
+       - const: ref
++      - const: link0
++      - const: link1
++      - const: link2
++      - const: link3
++
++  apple,lane-cfg:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    maximum: 15
++    default: 0
++    description:
++      Lane configuration of the root complex, the "lane-cfg" property of the
++      Apple device tree apcie node. Programmed into the common control
++      register together with the PHY init request.
+ 
+   devpwr-gpios:
+     description:
+@@ -124,10 +141,21 @@ patternProperties:
+       clkreq-gpios:
+         maxItems: 1
+ 
++      max-link-speed:
++        description:
++          Target link speed of the root port. Defaults to 3 (8 GT/s) for
++          port 0 on T8010, 2 (5 GT/s) for port 0 on S8003 and 1 otherwise.
++
++      apple,nvme-mode:
++        type: boolean
++        description:
++          The port carries the ANS NVMe endpoint (ADT "nvme-mode"); S8003
++          then switches the root complex into NVMe mode before powering the
++          port.
++
+     required:
+       - reg
+       - reset-gpios
+-      - clkreq-gpios
+ 
+     additionalProperties: true
+ 
+@@ -150,6 +178,16 @@ required:
+   - apple,nvme-hmb
+   - '#interrupt-cells'
+ 
++if:
++  properties:
++    compatible:
++      const: apple,t8010-pcie
++then:
++  patternProperties:
++    '^pci@[0-3],0$':
++      required:
++        - clkreq-gpios
++
+ unevaluatedProperties: false
+ 
+ examples:
+-- 
+2.56.0
+

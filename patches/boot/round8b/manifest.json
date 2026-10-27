@@ -1,0 +1,11 @@
+{
+  "base": "18eecae4429f02e4fba870b23a6da7e4f19fb84f",
+  "head": "24ef187b3091aaeb17455fe2ba3bfcd9f935b603",
+  "branch": "a9/boot",
+  "incremental_after": "patches/boot/round8",
+  "patches": {
+    "0001-nvme-apple-ans-validate-health-queues-and-reserve-re.patch": "057cb8cc6233279380d8148c6057a1a75be361938c6bdcbac574636cfac9ca0e"
+  },
+  "device_access": false,
+  "hardware_tested": false
+}

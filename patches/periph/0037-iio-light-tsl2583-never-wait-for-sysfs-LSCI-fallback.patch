@@ -1,0 +1,27 @@
+From 459fa90228442f72b3dddfd07e3a4f8c40784560 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 10:29:14 +0000
+Subject: [PATCH 37/55] iio: light: tsl2583: never wait for sysfs LSCI fallback
+
+J71t device test 1 stalled the boot probe for over 62 seconds when the
+private LSCI file was absent. request_firmware_direct sets
+FW_OPT_NOFALLBACK_SYSFS even with forced fallback enabled. Keep the
+calibration mandatory and fail promptly; retain NVMEM preference.
+---
+ drivers/iio/light/tsl2583.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/iio/light/tsl2583.c b/drivers/iio/light/tsl2583.c
+index 599885335a..a0daf2a04c 100644
+--- a/drivers/iio/light/tsl2583.c
++++ b/drivers/iio/light/tsl2583.c
+@@ -296,7 +296,8 @@ static int apple_als_load_calibration(struct tsl2583_chip *chip)
+ 
+ 	if (!device_property_present(dev, "nvmem-cells") &&
+ 	    !device_property_read_string(dev, "firmware-name", &fw_name)) {
+-		ret = request_firmware(&fw, fw_name, dev);
++		/* Missing calibration must not wait for a userspace helper. */
++		ret = request_firmware_direct(&fw, fw_name, dev);
+ 		if (ret)
+ 			return dev_err_probe(dev, ret, "failed to load LSCI file\n");
+ 		len = fw->size;

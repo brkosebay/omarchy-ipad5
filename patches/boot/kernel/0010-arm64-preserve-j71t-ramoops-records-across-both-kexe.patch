@@ -1,0 +1,158 @@
+From df0ad2dae531842630819db6264ded93935d7d89 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 11:00:43 +0000
+Subject: [PATCH] arm64: preserve j71t ramoops records across both kexec hops
+
+---
+ arch/arm64/mm/init.c         | 73 ++++++++++++++++++++++++++++++++++++
+ drivers/of/of_reserved_mem.c | 10 +++++
+ fs/pstore/ram.c              |  7 ++++
+ 3 files changed, 90 insertions(+)
+
+diff --git a/arch/arm64/mm/init.c b/arch/arm64/mm/init.c
+index fbf215ecc7..a7b1c6b510 100644
+--- a/arch/arm64/mm/init.c
++++ b/arch/arm64/mm/init.c
+@@ -22,6 +22,7 @@
+ #include <linux/sort.h>
+ #include <linux/of.h>
+ #include <linux/of_fdt.h>
++#include <linux/libfdt.h>
+ #include <linux/dma-direct.h>
+ #include <linux/dma-map-ops.h>
+ #include <linux/efi.h>
+@@ -193,6 +194,77 @@ static int __init early_mem(char *p)
+ }
+ early_param("mem", early_mem);
+ 
++/*
++ * Allocate once, before paging/CMA/crashkernel, and publish the reservation in
++ * the FDT used by both kexec loaders. Never choose a fresh address in kdump:
++ * that kernel must use the first kernel's region outside its usable RAM.
++ */
++static void __init apple_j71t_reserve_pstore(void)
++{
++	void *fdt = initial_boot_params, *copy;
++	phys_addr_t base;
++	fdt64_t reg[2];
++	char name[40];
++	int root, parent, node, size, ret;
++
++	if (!IS_BUILTIN(CONFIG_PSTORE_RAM) || !fdt ||
++	    fdt_node_check_compatible(fdt, 0, "apple,j71t"))
++		return;
++	if (fdt_node_offset_by_compatible(fdt, -1, "ramoops") >= 0)
++		return;
++	if (is_kdump_kernel()) {
++		pr_warn("j71t pstore: no inherited region in capture kernel\n");
++		return;
++	}
++	parent = fdt_path_offset(fdt, "/reserved-memory");
++	if (parent < 0 || fdt_address_cells(fdt, parent) != 2 ||
++	    fdt_size_cells(fdt, parent) != 2)
++		return;
++
++	/* Existing firmware, kernel and initrd reservations are already known. */
++	base = memblock_phys_alloc(SZ_2M, SZ_2M);
++	if (!base)
++		return;
++	size = fdt_totalsize(fdt) + SZ_4K;
++	copy = memblock_alloc(size, SMP_CACHE_BYTES);
++	if (!copy)
++		goto free_region;
++	ret = fdt_open_into(fdt, copy, size);
++	if (ret)
++		goto free_copy;
++	parent = fdt_path_offset(copy, "/reserved-memory");
++	snprintf(name, sizeof(name), "ramoops@%llx", (u64)base);
++	node = fdt_add_subnode(copy, parent, name);
++	if (node < 0)
++		goto free_copy;
++	reg[0] = cpu_to_fdt64(base);
++	reg[1] = cpu_to_fdt64(SZ_2M);
++	if (fdt_setprop(copy, node, "compatible", "ramoops", sizeof("ramoops")) ||
++	    fdt_setprop(copy, node, "reg", reg, sizeof(reg)) ||
++	    fdt_setprop(copy, node, "no-map", NULL, 0) ||
++	    fdt_setprop_u32(copy, node, "record-size", SZ_1M) ||
++	    fdt_setprop_u32(copy, node, "console-size", SZ_1M) ||
++	    fdt_setprop_u32(copy, node, "max-reason", 2) ||
++	    fdt_add_mem_rsv(copy, base, SZ_2M))
++		goto free_copy;
++	/* No cached linear alias of ramoops' write-combined persistent mapping. */
++	if (memblock_mark_nomap(base, SZ_2M))
++		goto free_copy;
++	root = early_init_dt_verify(copy, __pa(copy));
++	if (!root) {
++		memblock_clear_nomap(base, SZ_2M);
++		goto free_copy;
++	}
++	pr_info("j71t pstore: reserved 2 MiB at %pa, carried in kexec FDT\n", &base);
++	return;
++
++free_copy:
++	memblock_free(copy, size);
++free_region:
++	memblock_phys_free(base, SZ_2M);
++	pr_warn("j71t pstore: reservation failed\n");
++}
++
+ void __init arm64_memblock_init(void)
+ {
+ 	s64 linear_region_size = PAGE_END - _PAGE_OFFSET(vabits_actual);
+@@ -298,6 +370,7 @@ void __init arm64_memblock_init(void)
+ 	}
+ 
+ 	early_init_fdt_scan_reserved_mem();
++	apple_j71t_reserve_pstore();
+ }
+ 
+ void __init bootmem_init(void)
+diff --git a/drivers/of/of_reserved_mem.c b/drivers/of/of_reserved_mem.c
+index 8c9d6395d6..76cf3e5a44 100644
+--- a/drivers/of/of_reserved_mem.c
++++ b/drivers/of/of_reserved_mem.c
+@@ -275,6 +275,16 @@ void __init fdt_scan_reserved_mem_late(void)
+ 		return;
+ 	}
+ 
++	/* Early architecture fixups may have added static reservations. */
++	total_reserved_mem_cnt = reserved_mem_count;
++	fdt_for_each_subnode(child, fdt, node) {
++		int len;
++
++		if (of_fdt_device_is_available(fdt, child) &&
++		    fdt_getprop(fdt, child, "reg", &len) && len)
++			total_reserved_mem_cnt++;
++	}
++
+ 	/* Attempt dynamic allocation of a new reserved_mem array */
+ 	if (alloc_reserved_mem_array())
+ 		return;
+diff --git a/fs/pstore/ram.c b/fs/pstore/ram.c
+index 2eb0d4fa21..ebd6a89157 100644
+--- a/fs/pstore/ram.c
++++ b/fs/pstore/ram.c
+@@ -9,6 +9,7 @@
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
+ #include <linux/kernel.h>
++#include <linux/crash_dump.h>
+ #include <linux/err.h>
+ #include <linux/module.h>
+ #include <linux/version.h>
+@@ -729,6 +730,12 @@ static int ramoops_probe(struct platform_device *pdev)
+ 	phys_addr_t paddr;
+ 	int err = -EINVAL;
+ 
++	/* Leave the original panic/console records intact across phoenix. */
++	if (is_kdump_kernel() && of_machine_is_compatible("apple,j71t")) {
++		pr_info("capture kernel: preserving j71t records for the full boot\n");
++		return -ENODEV;
++	}
++
+ 	/*
+ 	 * Only a single ramoops area allowed at a time, so fail extra
+ 	 * probes.
+-- 
+2.56.0
+

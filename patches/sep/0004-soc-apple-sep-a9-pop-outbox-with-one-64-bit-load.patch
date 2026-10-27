@@ -1,0 +1,76 @@
+From 29f1192ef2ed4bb69b56fe6dd93fd51fdafae50c Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Mon, 26 Oct 2026 16:07:37 +0000
+Subject: [PATCH] soc: apple: sep-a9: pop SEP messages with one 64-bit load
+
+AppleA7IOPV2's XNU receive primitive loads one 64-bit word from wrapper
++0x4038. Match that access width and address instead of assembling a message
+from 32-bit reads at +0x4034 and +0x4038. Keep the existing status gate:
+sep_drain() checks recv_sts bit 17 before every pop, so this load is never
+issued for an empty FIFO.
+---
+ drivers/soc/apple/sep-a9.c | 23 +++++++++++++++--------
+ 1 file changed, 15 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/soc/apple/sep-a9.c b/drivers/soc/apple/sep-a9.c
+index 9bd6609d80..e4eedb8eb6 100644
+--- a/drivers/soc/apple/sep-a9.c
++++ b/drivers/soc/apple/sep-a9.c
+@@ -34,6 +34,9 @@
+  * arm log the PMGR word and SEP +0x28/+0x44/+0xb88 read-only, for comparison
+  * with pongoOS peeks. debugfs wake-test runs XNU's endpoint-0 nap wake once
+  * (section 7).
++ *
++ * SEP->AP messages are popped with the matching single 64-bit load from
++ * +0x4038, but only after recv_sts bit 17 says that the FIFO is nonempty.
+  */
+ 
+ #include <linux/bitfield.h>
+@@ -69,15 +72,15 @@
+  * Mailbox register layout (pongoOS struct mailbox_registers32), except that
+  * the AP->SEP message is sent the way AppleA7IOPV2::postMailbox
+  * (0xfffffff005b4e4a8) does: one 64-bit store to +0x4010, not pongoOS's two
+- * 32-bit stores to +0x4010/+0x4014 (docs/sep/xart-handshake.md section 6).
++ * 32-bit stores to +0x4010/+0x4014. AppleA7IOPV2's receive primitive
++ * (0xfffffff005b4e498) uses one 64-bit load from +0x4038.
+  */
+ #define SEP_MBOX_DIS_INT	0x00
+ #define SEP_MBOX_EN_INT		0x04
+ #define SEP_MBOX_SND_STS	0x08
+ #define SEP_MBOX_SND		0x10	/* 64-bit, written with writeq() only */
+ #define SEP_MBOX_RECV_STS	0x20
+-#define SEP_MBOX_RECV0		0x34
+-#define SEP_MBOX_RECV1		0x38
++#define SEP_MBOX_RECV		0x38	/* 64-bit, read with readq() only */
+ 
+ /*
+  * Status bits, as in every Apple mailbox variant: bit 16 full, bit 17 empty.
+@@ -348,12 +351,14 @@ static const char *sep_fifo_state(u32 sts)
+ 	return sts & SEP_MBOX_STS_FULL ? "full" : "not empty";
+ }
+ 
+-static inline u64 sep_read_msg(struct sep_a9 *sep)
++/*
++ * Pop exactly one SEP->AP word. The caller must first observe recv_sts bit 17
++ * clear. noinline keeps this primitive visible for the packaged-vmlinux
++ * instruction audit: one 64-bit load from mbox + 0x38 and no access to +0x34.
++ */
++static noinline u64 sep_read_msg(struct sep_a9 *sep)
+ {
+-	u64 lo = readl(sep->mbox + SEP_MBOX_RECV0);
+-	u64 hi = readl(sep->mbox + SEP_MBOX_RECV1);
+-
+-	return lo | (hi << 32);
++	return readq(sep->mbox + SEP_MBOX_RECV);
+ }
+ 
+ static void sep_log_push(struct sep_a9 *sep, u64 msg)
+@@ -2110,6 +2115,8 @@ static int sep_probe(struct platform_device *pdev)
+ 		 sep->base);
+ 	dev_info(&pdev->dev, "tx: one 64-bit store per message to +0x%x (writeq)\n",
+ 		 SEP_MBOX_OFFSET + SEP_MBOX_SND);
++	dev_info(&pdev->dev, "rx: one 64-bit load per message from +0x%x (readq, nonempty only)\n",
++		 SEP_MBOX_OFFSET + SEP_MBOX_RECV);
+ 	return 0;
+ }
+ 

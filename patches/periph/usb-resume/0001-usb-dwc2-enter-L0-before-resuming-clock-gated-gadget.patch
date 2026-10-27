@@ -1,0 +1,31 @@
+From 078d2de49b48abb6ce1c1fbe78a6ec7a6d7f5cb3 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 23:09:57 +0000
+Subject: [PATCH 1/2] usb: dwc2: enter L0 before resuming clock-gated gadgets
+
+The resume callback can queue requests as soon as call_gadget releases
+the controller lock. Mark the controller active and clear bus_suspended
+first, otherwise dwc2_hsotg_ep_queue rejects those requests with
+-EAGAIN. This can cause ACM notification failures on the J71t USB gadget
+after a host suspend.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ drivers/usb/dwc2/gadget.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/usb/dwc2/gadget.c b/drivers/usb/dwc2/gadget.c
+index 102169b404..ccd9d775e5 100644
+--- a/drivers/usb/dwc2/gadget.c
++++ b/drivers/usb/dwc2/gadget.c
+@@ -5741,8 +5741,8 @@ void dwc2_gadget_exit_clock_gating(struct dwc2_hsotg *hsotg, int rem_wakeup)
+ 		dwc2_writel(hsotg, dctl, DCTL);
+ 	}
+ 
+-	/* Change to L0 state */
+-	call_gadget(hsotg, resume);
++	/* Resume callbacks may immediately queue endpoint requests. */
+ 	hsotg->lx_state = DWC2_L0;
+ 	hsotg->bus_suspended = false;
++	call_gadget(hsotg, resume);
+ }

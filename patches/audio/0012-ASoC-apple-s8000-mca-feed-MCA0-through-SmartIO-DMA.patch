@@ -1,0 +1,192 @@
+From eef262bea33ee4e59258b3d2787532490744edf0 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 12:29:29 +0000
+Subject: [PATCH 12/17] ASoC: apple: s8000-mca: feed MCA0 through SmartIO DMA
+
+Pass the SmartIO shim record of the MCA's DMA endpoint as the slave
+config's peripheral_config, as AppleAE2MCA sets it up on iOS: transfer
+width from the ADT dma-channels entry (0x21 16-bit, 0x22 32-bit), the
+shim timeout/FIFO/trigger words, and a FIFO depth of one millisecond of
+samples. Limit the DMA PCM to 16 periods (one firmware command each).
+
+nodma=1 keeps the timer PCM for clock and codec tests without SmartIO.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ .../bindings/sound/apple,s8000-mca.yaml       | 12 +++
+ sound/soc/apple/s8000-mca.c                   | 96 ++++++++++++++++---
+ 2 files changed, 94 insertions(+), 14 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/sound/apple,s8000-mca.yaml b/Documentation/devicetree/bindings/sound/apple,s8000-mca.yaml
+index 2d0ae5b0fa..bf0a2ef4e6 100644
+--- a/Documentation/devicetree/bindings/sound/apple,s8000-mca.yaml
++++ b/Documentation/devicetree/bindings/sound/apple,s8000-mca.yaml
+@@ -71,6 +71,18 @@ properties:
+         - description: value
+     description: i2s-switch registers to set while the port runs.
+ 
++  apple,sio-dma-config:
++    $ref: /schemas/types.yaml#/definitions/uint32-array
++    items:
++      - description: SmartIO transfer control for 16-bit samples
++      - description: SmartIO transfer control for 32-bit samples
++      - description: shim timeout
++      - description: shim FIFO size, bytes
++      - description: shim trigger level, bytes
++    description:
++      The SmartIO shim words of this MCA's DMA endpoint (Apple ADT
++      dma-channels).
++
+   apple,pio-fifo-offset:
+     $ref: /schemas/types.yaml#/definitions/uint32
+     description: Experimental CPU-writable TX FIFO register (no DMA).
+diff --git a/sound/soc/apple/s8000-mca.c b/sound/soc/apple/s8000-mca.c
+index 89d36a6b9b..b4d40d34c8 100644
+--- a/sound/soc/apple/s8000-mca.c
++++ b/sound/soc/apple/s8000-mca.c
+@@ -9,13 +9,13 @@
+  * MCLK) and the i2s-switch route (a syscon; route register values from DT).
+  *
+  * Data path: iOS feeds the MCA through SmartIO DMA (endpoint 0x28 for MCA0
+- * TX). With "dmas"/"dma-names = tx" the generic dmaengine PCM is used, which
+- * needs a cyclic-capable SIO DMA driver. Without it, a timer-driven PCM
+- * keeps the stream running and, if "apple,pio-fifo-offset" names a CPU
+- * writable FIFO port (unverified, see test plan), feeds it from the MCA's
+- * TX-low-water interrupt. Otherwise samples are discarded: the clocks, the
+- * codec and the speakers still run, which is what the first device test
+- * needs.
++ * TX). With "dmas"/"dma-names = tx" the generic dmaengine PCM runs on the
++ * apple-sio-dma driver; the SmartIO shim record (ADT dma-channels words) is
++ * passed as the slave config's peripheral_config. Without DMA (or with
++ * nodma=1), a timer-driven PCM keeps the stream running and, if
++ * "apple,pio-fifo-offset" names a CPU writable FIFO port (unverified, see
++ * test plan), feeds it from the MCA's TX-low-water interrupt. Otherwise
++ * samples are discarded: clocks, codec and speakers still run.
+  */
+ 
+ #include <linux/bitfield.h>
+@@ -34,6 +34,7 @@
+ #include <linux/regmap.h>
+ #include <linux/seq_file.h>
+ #include <linux/slab.h>
++#include <linux/soc/apple/sio.h>
+ #include <sound/dmaengine_pcm.h>
+ #include <sound/pcm.h>
+ #include <sound/pcm_params.h>
+@@ -88,6 +89,10 @@
+ #define MCA_RX_SLOTS_HI		0x8c
+ #define  MCA_XX_CFG_EN		BIT(0)
+ 
++static bool nodma;
++module_param(nodma, bool, 0444);
++MODULE_PARM_DESC(nodma, "ignore dmas, use the timer PCM (clock/codec tests)");
++
+ #define MCA_POLL_US		10
+ #define MCA_TIMEOUT_US		10000
+ 
+@@ -117,6 +122,9 @@ struct s8000_mca {
+ 	u32 fifo_tx;
+ 	bool use_dma;
+ 	struct snd_dmaengine_dai_dma_data dma_tx;
++	/* SmartIO shim words from DT: xfer 16-bit, xfer 32-bit, timeout, fifo, trigger */
++	u32 sio_dt[5];
++	struct apple_sio_dma_config sio_cfg;
+ 
+ 	/* computed in hw_params, written in prepare */
+ 	u32 sample, frame, tx_cfg, tx_fifo_cfg, tx_slots;
+@@ -574,10 +582,60 @@ static const struct snd_soc_component_driver mca_component_dma = {
+ 	.legacy_dai_naming = 1,
+ };
+ 
++/* SmartIO queues one command per period; it has 31 tags per endpoint. */
++static const struct snd_pcm_hardware mca_dma_hw = {
++	.info = SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_MMAP |
++		SNDRV_PCM_INFO_MMAP_VALID | SNDRV_PCM_INFO_BLOCK_TRANSFER,
++	.formats = MCA_FORMATS,
++	.rates = MCA_RATES,
++	.rate_min = 8000,
++	.rate_max = 48000,
++	.channels_min = 2,
++	.channels_max = 2,
++	.buffer_bytes_max = 128 * 1024,
++	.period_bytes_min = 512,
++	.period_bytes_max = 32 * 1024,
++	.periods_min = 2,
++	.periods_max = 16,
++};
++
++static int mca_prepare_slave_config(struct snd_pcm_substream *substream,
++				    struct snd_pcm_hw_params *params,
++				    struct dma_slave_config *sc)
++{
++	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
++	struct s8000_mca *mca = snd_soc_dai_get_drvdata(snd_soc_rtd_to_cpu(rtd, 0));
++	unsigned int bytes = params_physical_width(params) / 8;
++	unsigned int per_ms;
++	int ret;
++
++	ret = snd_dmaengine_pcm_prepare_slave_config(substream, params, sc);
++	if (ret)
++		return ret;
++
++	/*
++	 * AppleSmartIODMA shim record as AppleAE2MCA sets it up: transfer
++	 * width from the dma-channels entry (16 or 32 bit), and the FIFO
++	 * depth it requests: sample width * samples per ms, rounded to 4
++	 * (the DMA driver applies SmartIO's validFIFODepth clamp).
++	 */
++	per_ms = round_up(params_rate(params) * params_channels(params) / 1000, 4);
++	mca->sio_cfg = (struct apple_sio_dma_config) {
++		.xfer = bytes == 2 ? mca->sio_dt[0] : mca->sio_dt[1],
++		.timeout = mca->sio_dt[2],
++		.fifo = mca->sio_dt[3],
++		.trigger = mca->sio_dt[4],
++		.limit = bytes * per_ms,
++	};
++	sc->peripheral_config = &mca->sio_cfg;
++	sc->peripheral_size = sizeof(mca->sio_cfg);
++	return 0;
++}
++
+ static const struct snd_dmaengine_pcm_config mca_dma_config = {
+-	.prepare_slave_config = snd_dmaengine_pcm_prepare_slave_config,
+-	.pcm_hardware = &mca_pcm_hw,
+-	.prealloc_buffer_size = 512 * 1024,
++	.prepare_slave_config = mca_prepare_slave_config,
++	.pcm_hardware = &mca_dma_hw,
++	.prealloc_buffer_size = 128 * 1024,
+ };
+ 
+ /* --- IRQ ------------------------------------------------------------------ */
+@@ -721,9 +779,11 @@ static int s8000_mca_probe(struct platform_device *pdev)
+ 	pm_runtime_put(dev);
+ 
+ 	mca->fifo_tx = FIELD_GET(MCA_FIFO_SIZE_TX, fifo);
+-	dev_info(dev, "MCA version %u, FIFO tx %u rx %u%s\n", ver, mca->fifo_tx,
+-		 (u32)FIELD_GET(MCA_FIFO_SIZE_RX, fifo),
+-		 mca->pio_off ? ", PIO" : "");
++	mca->use_dma = of_property_present(np, "dmas") && !nodma;
++	dev_info(dev, "MCA version %u, FIFO tx %u rx %u, %s\n", ver,
++		 mca->fifo_tx, (u32)FIELD_GET(MCA_FIFO_SIZE_RX, fifo),
++		 mca->use_dma ? "SmartIO DMA" :
++		 mca->pio_off ? "PIO (experimental)" : "timer PCM, no data path");
+ 	if (ver != 4 || mca->fifo_tx != 0x40)
+ 		dev_warn(dev, "expected version 4 / FIFO 0x40 (iOS)\n");
+ 	if (mca->fifo_tx < 8)
+@@ -741,7 +801,15 @@ static int s8000_mca_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
+-	mca->use_dma = of_property_present(np, "dmas");
++	/* MCA0 TX in Apple's ADT dma-channels: 0x28 {0x21|0x22, 0, 0x300, 0x180} */
++	mca->sio_dt[0] = 0x21;
++	mca->sio_dt[1] = 0x22;
++	mca->sio_dt[2] = 0;
++	mca->sio_dt[3] = 0x300;
++	mca->sio_dt[4] = 0x180;
++	of_property_read_u32_array(np, "apple,sio-dma-config", mca->sio_dt,
++				   ARRAY_SIZE(mca->sio_dt));
++
+ 	ret = devm_snd_soc_register_component(dev, mca->use_dma ?
+ 					      &mca_component_dma :
+ 					      &mca_component_pio,

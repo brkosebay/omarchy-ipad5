@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Diagnostic only: no power-domains, reset, IRQ, SRAM or FIFO resource.
+ * Kconfig and apple_a9_aop.debug are both off by default.
+ */
+/ {
+	soc {
+		aop_observer: aop-observer@210800044 {
+			compatible = "apple,j71t-aop-observer";
+			reg = <0x2 0x10800044 0x0 0x4>,
+			      <0x2 0x10800b88 0x0 0x4>,
+			      <0x2 0x10804008 0x0 0x4>,
+			      <0x2 0x10804020 0x0 0x4>,
+			      <0x2 0x10804040 0x0 0x4>;
+			reg-names = "cpu-control", "cpu-running", "inbox-control",
+				    "outbox-control", "idle-status";
+			/* Observer phandles deliberately do not use power-domains. */
+			apple,observe-domains = <&ps_aop_gpio &ps_aop &ps_aop_busif
+						 &ps_aop_cpu &ps_aop_filter>;
+		};
+	};
+};

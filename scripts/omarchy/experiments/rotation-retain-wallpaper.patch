@@ -1,0 +1,11 @@
+diff --git a/shell/Ui/BackgroundMedia.qml b/shell/Ui/BackgroundMedia.qml
+--- a/shell/Ui/BackgroundMedia.qml
++++ b/shell/Ui/BackgroundMedia.qml
+@@ -41,6 +41,7 @@
+       source: !root.constrainDecode || root.decodeSize.width > 0 ? root.imageUrl : ""
+       fillMode: Image.PreserveAspectCrop
+       asynchronous: true
++      retainWhileLoading: true // linux-a9 rotation A/B: keep the previous image during decode
+       cache: root.cached
+       sourceSize.width: root.constrainDecode ? root.decodeSize.width : (root.version > 0 ? width : 0)
+       sourceSize.height: root.constrainDecode ? root.decodeSize.height : (root.version > 0 ? height : 0)

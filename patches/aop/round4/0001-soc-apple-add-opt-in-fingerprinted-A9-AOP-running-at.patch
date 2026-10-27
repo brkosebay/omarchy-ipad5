@@ -1,0 +1,1027 @@
+From 9c64a50e995553085830bbf98a761032c5dfc788 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 16:30:23 +0000
+Subject: [PATCH] soc: apple: add opt-in fingerprinted A9 AOP running attach
+
+An inherited AOP with an empty outbox previously stopped before any protocol
+exchange. Verify the running image windows and loader tags against pinned
+20H350 firmware, then require its intact external segment to be in a
+boot-time reservation Linux cannot recycle before allowing mailbox traffic.
+
+Require two consecutive seq/seq+1 ping acknowledgments within three bounded
+probes. Share the observer's immutable attach parameter, and require active=1
+as well before sending exactly one HELLO_REPLY. Adopt only after EPMAP and
+reuse normal endpoint, ring, calibration and IIO bring-up. Refuse all other
+responses without retries or inherited-state writes, warn loudly about zombie
+firmware and preserve that refusal at shutdown. Also accept seq+1 in the
+ordinary cold-path ping watchdog. Record proof flags and transaction phases.
+
+The firmware response and ownership interpretation remain unverified on the
+device. Offline ASan/UBSan policy/parser tests and W=1 AOP object builds pass.
+---
+ Documentation/driver-api/apple-a9-aop.rst |  60 +++-
+ drivers/soc/apple/Kconfig                 |   4 +-
+ drivers/soc/apple/a9-aop-afk.h            |   7 +
+ drivers/soc/apple/a9-aop-takeover.h       | 248 ++++++++++++++
+ drivers/soc/apple/a9-aop.h                |   3 +
+ drivers/soc/apple/apple-a9-aop-active.c   | 373 ++++++++++++++++++++--
+ drivers/soc/apple/apple-a9-aop.c          |   7 +-
+ 7 files changed, 675 insertions(+), 27 deletions(-)
+ create mode 100644 drivers/soc/apple/a9-aop-takeover.h
+
+diff --git a/Documentation/driver-api/apple-a9-aop.rst b/Documentation/driver-api/apple-a9-aop.rst
+index 225d6c6930..b1d7072158 100644
+--- a/Documentation/driver-api/apple-a9-aop.rst
++++ b/Documentation/driver-api/apple-a9-aop.rst
+@@ -74,7 +74,9 @@ Bring-up runs from a work item once the root filesystem provides
+ * All five PMGR domains must already be ON (checked with the observer API);
+   a domain is never forced on. Mailbox fault bits stop everything and are
+   never cleared.
+-* Running CPU with an empty outbox: refused (``refused-running-no-pending-hello``).
++* Running CPU with an empty outbox: the read-only fingerprint preflight and
++  bounded ping proof described below; the one-shot HELLO_REPLY additionally
++  requires ``apple_a9_aop.attach=1`` (default off).
+   Running CPU with pending words: the first word must be the device HELLO,
+   otherwise refused and the outbox is no longer read.
+ * Stopped CPU: the main image is copied to the AOP region (IOP link base
+@@ -87,8 +89,8 @@ Bring-up runs from a work item once the root filesystem provides
+   stream; the AOP is not reset).
+ * Per endpoint the driver waits for the device's AFK ``0x80`` (version 8),
+   answers ``0xa0``, allocates each ``0x89`` buffer with dma_alloc_coherent()
+-  (no IOMMU, 48-bit physical reply ``0xa1``), initialises the ``0x8a/0x8b/0x8c``
+-  rings, sends ``0xa3`` and reads the IOP->AP ring on ``0x85``.
++  (no IOMMU, 48-bit physical reply ``0xa1``), validates the AOP-initialised
++  ``0x8a/0x8b/0x8c`` rings, sends ``0xa3`` and reads the IOP->AP ring on ``0x85``.
+ * The ``accel`` ready report (service id ``0x10000007``) binds the stream.
+   The optional per-device ``apple/aop/accel-calibration.bin`` is sent in iOS
+   table order, then batch/raw/report intervals 100000/0/100000 us, each
+@@ -106,3 +108,55 @@ the first report, after a transport failure, and when stale.
+ On shutdown/kexec the stream is stopped (intervals 0) and every endpoint gets
+ AFK shutdown ``0xa4``; the rings live in memory the next kernel reuses. If an
+ endpoint does not acknowledge, do not kexec; cold boot instead.
++
++Running attach (Round 4)
++=======================
++
++The final opt-in command line is::
++
++  apple_a9_aop.debug=1 apple_a9_aop.active=1 apple_a9_aop.attach=1
++
++The observer owns the single immutable ``attach`` parameter and remains
++read-only. ``attach=1`` alone does not enable the active driver. With
++``active=1 attach=0``, Phases A/B run but no speculative HELLO_REPLY is sent.
++The stopped-CPU loader and pending-device-HELLO path keep their existing
++behavior. The running/empty path never writes CPU control, auto-boot, remap,
++masks, firmware region or tags; it never resets, clears faults or forces power.
++
++* Phase A (``attach-preflight``): snapshot includes CPU control and auto-boot.
++  SHA-256-pin both reference firmware files, compare region head/UUID
++  (0..0x60), build string (0x47440, 64 bytes), and the exact tag table shape
++  (0x389b8, 0x1df bytes). Validate loader tags including EC0p, WrAd, McRA,
++  nCal, SOC_ and SOCR. Compare all 0x90a0 ext bytes only after proving the
++  covering pages belong to the AOP region or a plain non-reusable reserved
++  memory carveout with no other driver/pool owner. Mapped RAM also requires
++  PageReserved on every covering page; use its normal WB mapping, never a
++  Device alias. No-map ranges use IO reads. There is no late reservation.
++  Unreserved EC0p is refused before mapping it, even if its bytes might
++  still match. All Phase A failures have zero mailbox traffic.
++* Phase B (``attach-ping``): at most three pings, each with a 300 ms deadline,
++  and two consecutive acknowledgments required. Accept seq or seq+1, also
++  in the cold-path watchdog. Probe sequences 1, 3, 5 avoid overlapping ack
++  windows. Any unexpected endpoint/type/sequence refuses immediately.
++* Phase C (``attach-hello``), only with both gates: send exactly
++  ``0x00200000000c000c`` once, wait at most 2 s for endpoint-zero EPMAP.
++  Silence or anything else is ``refused-running-handshake-owned``. A loud
++  zombie warning calls for a real power cycle, never a retry or kexec.
++  Shutdown preserves the refusal and does not claim the AOP was stopped;
++  the platform shutdown callback cannot veto a user-requested kexec.
++* On EPMAP, use ordinary EPMAP replies, AP power, STARTEP >= 0x20, AFK init,
++  GET_BUF/rings, ready report, calibration, 10 Hz rate, first report and IIO
++  registration. Unlike the older cold path, attach requires a nonempty
++  factory calibration file; absence or a failed command stops bring-up.
++
++Debugfs ``state`` reports the phases, proof flags, attempt/ack counts and
++whether the one HELLO_REPLY was sent and EPMAP accepted. ``transcript`` records
++the phase for every mailbox word. ``patchbay`` includes the read-only running
++head/build/tag snapshot. Failure strings distinguish foreign-image,
++no-loader-tags, tag-mismatch, stale-ext, unreserved-ext, unexpected-mgmt,
++no-ping-ack and handshake-owned.
++
++Offline verification establishes parsing, bounds and policy only. The
++firmware's reaction to the speculative reply and EPMAP proving first-AP
++ownership remain inferences from the takeover design, not device-verified
++behavior. No device measurement is supplied by this change.
+diff --git a/drivers/soc/apple/Kconfig b/drivers/soc/apple/Kconfig
+index d2bda5a3e4..8997f32d70 100644
+--- a/drivers/soc/apple/Kconfig
++++ b/drivers/soc/apple/Kconfig
+@@ -28,13 +28,15 @@ config APPLE_A9_AOP_IIO
+ config APPLE_A9_AOP_ACTIVE
+ 	bool "J71t AOP active driver (firmware boot, RTBuddy, SPU/AFK)"
+ 	depends on APPLE_A9_AOP_IIO && HAS_DMA
++	select CRYPTO_LIB_SHA256
+ 	default n
+ 	help
+ 	  Load and start the AOP firmware from /lib/firmware/apple/aop, run
+ 	  the RTBuddy management and SPU/AFK v8 transport, bind the accel
+ 	  service and register its IIO device. Experimental; inert unless the
+ 	  boot parameter apple_a9_aop.active=1 is given. Never resets the AOP;
+-	  refuses a running AOP without a pending HELLO.
++	  a running AOP needs fingerprinted, reserved ext memory and two ping
++	  acks. Also requires apple_a9_aop.attach=1 for a one-shot handshake.
+ 
+ config APPLE_MAILBOX
+ 	tristate "Apple SoC mailboxes"
+diff --git a/drivers/soc/apple/a9-aop-afk.h b/drivers/soc/apple/a9-aop-afk.h
+index cfc8ee17bd..8c3e2312fb 100644
+--- a/drivers/soc/apple/a9-aop-afk.h
++++ b/drivers/soc/apple/a9-aop-afk.h
+@@ -93,6 +93,13 @@ static inline u64 a9_mgmt_ping(u32 seq, u16 uptime)
+ 	return a9_mgmt_word(A9_MGMT_PING, ((u64)uptime << 32) | seq);
+ }
+ 
++/* RTBuddy sends seq, expects seq+1; tolerate firmware echoing seq too. */
++static inline bool a9_mgmt_ping_ack(u64 payload, u32 seq)
++{
++	return a9_mgmt_type(payload) == A9_MGMT_PING_ACK &&
++	       ((u32)payload == seq || (u32)payload == (u32)(seq + 1));
++}
++
+ static inline u64 a9_mgmt_ap_power(bool on)
+ {
+ 	return a9_mgmt_word(A9_MGMT_AP_POWER, on);
+diff --git a/drivers/soc/apple/a9-aop-takeover.h b/drivers/soc/apple/a9-aop-takeover.h
+new file mode 100644
+index 0000000000..a4f95cc66e
+--- /dev/null
++++ b/drivers/soc/apple/a9-aop-takeover.h
+@@ -0,0 +1,248 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Pure, host-tested running-AOP preflight and one-shot handshake policy. */
++#ifndef _A9_AOP_TAKEOVER_H
++#define _A9_AOP_TAKEOVER_H
++
++#include "a9-aop-afk.h"
++
++#define A9_ATTACH_MAIN_SIZE	342336
++#define A9_ATTACH_EXT_SIZE	37024
++#define A9_ATTACH_HEAD_SIZE	0x60
++#define A9_ATTACH_BUILD_OFFSET	0x47440
++#define A9_ATTACH_BUILD_SIZE	0x40
++#define A9_ATTACH_TABLE_OFFSET	0x389b8
++#define A9_ATTACH_TABLE_SIZE	0x1df
++#define A9_ATTACH_PAGE_SIZE	0x4000
++#define A9_ATTACH_PING_MS		300
++#define A9_ATTACH_PING_TRIES	3
++#define A9_ATTACH_HELLO_MS	2000
++#define A9_ATTACH_HELLO_REPLY	0x00200000000c000cULL
++
++struct a9_attach_fingerprint {
++	u8 head[A9_ATTACH_HEAD_SIZE];
++	u8 build[A9_ATTACH_BUILD_SIZE];
++	u8 table[A9_ATTACH_TABLE_SIZE];
++};
++
++enum a9_attach_result {
++	A9_ATTACH_OK,
++	A9_ATTACH_FOREIGN_IMAGE,
++	A9_ATTACH_NO_LOADER_TAGS,
++	A9_ATTACH_TAG_MISMATCH,
++	A9_ATTACH_STALE_EXT,
++	A9_ATTACH_UNRESERVED_EXT,
++	A9_ATTACH_UNEXPECTED_MGMT,
++	A9_ATTACH_NO_PING_ACK,
++	A9_ATTACH_DISABLED,
++	A9_ATTACH_HANDSHAKE_OWNED,
++};
++
++static inline const char *a9_attach_result_name(enum a9_attach_result result)
++{
++	switch (result) {
++	case A9_ATTACH_OK: return "verified";
++	case A9_ATTACH_FOREIGN_IMAGE: return "refused-running-foreign-image";
++	case A9_ATTACH_NO_LOADER_TAGS: return "refused-running-no-loader-tags";
++	case A9_ATTACH_TAG_MISMATCH: return "refused-running-tag-mismatch";
++	case A9_ATTACH_STALE_EXT: return "refused-running-stale-ext";
++	case A9_ATTACH_UNRESERVED_EXT: return "refused-running-unreserved-ext";
++	case A9_ATTACH_UNEXPECTED_MGMT: return "refused-running-unexpected-mgmt";
++	case A9_ATTACH_NO_PING_ACK: return "refused-running-no-ping-ack";
++	case A9_ATTACH_DISABLED: return "refused-running-no-pending-hello";
++	case A9_ATTACH_HANDSHAKE_OWNED: return "refused-running-handshake-owned";
++	}
++	return "invalid-attach-result";
++}
++
++/* Subtraction form avoids wraparound at either end of a physical range. */
++static inline bool a9_attach_contains(u64 base, u64 size, u64 pa, u64 length)
++{
++	return length && size && base <= A9_AOP_PA_MASK &&
++	       size - 1 <= A9_AOP_PA_MASK - base && pa >= base &&
++	       pa - base < size && length <= size - (pa - base);
++}
++
++static inline bool a9_attach_ext_matches(const u8 *live, size_t size,
++					 const u8 *reference, size_t reference_size)
++{
++	return size == A9_ATTACH_EXT_SIZE && reference_size == size &&
++	       !memcmp(live, reference, size);
++}
++
++/* @reference is the pinned, SHA-256-checked main image, never running RAM. */
++static inline enum a9_attach_result
++a9_attach_fingerprint(const struct a9_attach_fingerprint *live,
++		      const u8 *reference, size_t size, u64 wrapper,
++		      u32 target, u32 chip, u32 revision, u64 *ext_pa)
++{
++	size_t table, length, cursor = 0;
++	u32 tag, n;
++	u64 value;
++
++	*ext_pa = 0;
++	if (size != A9_ATTACH_MAIN_SIZE ||
++	    a9_fw_table(reference, size, &table, &length) ||
++	    table != A9_ATTACH_TABLE_OFFSET || length != A9_ATTACH_TABLE_SIZE ||
++	    memcmp(live->head, reference, sizeof(live->head)) ||
++	    memcmp(live->build, reference + A9_ATTACH_BUILD_OFFSET,
++		   sizeof(live->build)))
++		return A9_ATTACH_FOREIGN_IMAGE;
++	if (!memcmp(live->table, reference + table, length))
++		return A9_ATTACH_NO_LOADER_TAGS;
++
++	/*
++	 * Require the exact pinned table shape, including order and lengths.
++	 * This rejects truncated, missing and duplicate tags before reading data.
++	 * STKG is FOUR bytes in the artifact (the research table said eight).
++	 */
++	while (cursor < length) {
++		if (length - cursor < 8 ||
++		    memcmp(live->table + cursor, reference + table + cursor, 8))
++			return A9_ATTACH_TAG_MISMATCH;
++		tag = get_unaligned_le32(live->table + cursor);
++		n = get_unaligned_le32(live->table + cursor + 4);
++		if (n > length - cursor - 8)
++			return A9_ATTACH_TAG_MISMATCH;
++		cursor += 8;
++		/* Every integer read is preceded by the pinned tag-length check. */
++		switch (tag) {
++		case A9_FW_TAG('A', 'O', 'P', 't'):
++			value = target;
++			break;
++		case A9_FW_TAG('W', 'r', 'A', 'd'):
++			value = wrapper;
++			break;
++		case A9_FW_TAG('M', 'c', 'R', 'A'):
++			value = A9_ATTACH_PAGE_SIZE;
++			break;
++		case A9_FW_TAG('S', 'O', 'C', '_'):
++			value = chip;
++			break;
++		case A9_FW_TAG('S', 'O', 'C', 'R'):
++			value = revision;
++			break;
++		case A9_FW_TAG('n', 'C', 'a', 'l'):
++		case A9_FW_TAG('E', 'D', '0', 'p'):
++		case A9_FW_TAG('R', 'T', 'T', 'O'):
++		case A9_FW_TAG('D', 'E', 'V', 'f'):
++			value = 0;
++			break;
++		case A9_FW_TAG('E', 'C', '0', 'p'):
++			*ext_pa = get_unaligned_le64(live->table + cursor);
++			goto next;
++		case A9_FW_TAG('S', 'T', 'K', 'G'):
++		case A9_FW_TAG('P', 'R', 'N', 'G'):
++		case A9_FW_TAG('N', 'O', 'N', 'C'):
++		case A9_FW_TAG('E', 'C', 'I', 'D'):
++			goto next; /* loader entropy / per-device identity */
++		default:
++			if (memcmp(live->table + cursor, reference + table + cursor, n))
++				return A9_ATTACH_TAG_MISMATCH;
++			goto next;
++		}
++		if ((n == 1 && live->table[cursor] != value) ||
++		    (n == 4 && get_unaligned_le32(live->table + cursor) != value) ||
++		    (n == 8 && get_unaligned_le64(live->table + cursor) != value))
++			return A9_ATTACH_TAG_MISMATCH;
++next:
++		cursor += n;
++	}
++	if (!*ext_pa || (*ext_pa & (A9_ATTACH_PAGE_SIZE - 1)) ||
++	    *ext_pa > A9_AOP_PA_MASK ||
++	    A9_ATTACH_EXT_SIZE - 1 > A9_AOP_PA_MASK - *ext_pa)
++		return A9_ATTACH_TAG_MISMATCH;
++	return A9_ATTACH_OK;
++}
++
++enum a9_attach_stage {
++	A9_ATTACH_IDLE,
++	A9_ATTACH_PING,
++	A9_ATTACH_PING_OK,
++	A9_ATTACH_WAIT_EPMAP,
++	A9_ATTACH_ADOPTED,
++	A9_ATTACH_REFUSED,
++};
++
++struct a9_attach {
++	enum a9_attach_stage stage;
++	enum a9_attach_result result;
++	u32 seq;
++	unsigned int attempts, acks;
++	bool pending, hello_sent;
++};
++
++static inline void a9_attach_refuse(struct a9_attach *s, enum a9_attach_result r)
++{
++	s->result = r;
++	s->stage = A9_ATTACH_REFUSED;
++	s->pending = false;
++}
++
++/* One outstanding request; a duplicate ack cannot count as two exchanges. */
++static inline bool a9_attach_next_ping(struct a9_attach *s)
++{
++	if (s->stage != A9_ATTACH_PING || s->pending)
++		return false;
++	if (s->attempts >= A9_ATTACH_PING_TRIES) {
++		a9_attach_refuse(s, A9_ATTACH_NO_PING_ACK);
++		return false;
++	}
++	s->attempts++;
++	/* Disjoint {seq, seq+1} windows: a delayed duplicate cannot prove life. */
++	s->seq = 2 * s->attempts - 1;
++	s->pending = true;
++	return true;
++}
++
++static inline void a9_attach_ping_timeout(struct a9_attach *s)
++{
++	if (s->stage != A9_ATTACH_PING || !s->pending)
++		return;
++	s->pending = false;
++	s->acks = 0; /* two consecutive successful exchanges */
++	if (s->attempts == A9_ATTACH_PING_TRIES)
++		a9_attach_refuse(s, A9_ATTACH_NO_PING_ACK);
++}
++
++static inline void a9_attach_rx(struct a9_attach *s, u64 wire)
++{
++	u64 payload = a9_aop_payload(wire);
++
++	if (s->stage == A9_ATTACH_PING || s->stage == A9_ATTACH_PING_OK) {
++		if (a9_aop_endpoint(wire) || !s->pending ||
++		    !a9_mgmt_ping_ack(payload, s->seq)) {
++			a9_attach_refuse(s, A9_ATTACH_UNEXPECTED_MGMT);
++			return;
++		}
++		s->pending = false;
++		if (++s->acks == 2)
++			s->stage = A9_ATTACH_PING_OK;
++	} else if (s->stage == A9_ATTACH_WAIT_EPMAP) {
++		if (!a9_aop_endpoint(wire) && a9_mgmt_type(payload) == A9_MGMT_EPMAP)
++			s->stage = A9_ATTACH_ADOPTED;
++		else
++			a9_attach_refuse(s, A9_ATTACH_HANDSHAKE_OWNED);
++	}
++}
++
++/* True permits exactly ONE fixed HELLO_REPLY, only after the ping proof. */
++static inline bool a9_attach_hello(struct a9_attach *s, bool enabled)
++{
++	if (s->stage != A9_ATTACH_PING_OK || s->hello_sent)
++		return false;
++	if (!enabled) {
++		a9_attach_refuse(s, A9_ATTACH_DISABLED);
++		return false;
++	}
++	s->hello_sent = true;
++	s->stage = A9_ATTACH_WAIT_EPMAP;
++	return true;
++}
++
++static inline void a9_attach_hello_timeout(struct a9_attach *s)
++{
++	if (s->stage == A9_ATTACH_WAIT_EPMAP)
++		a9_attach_refuse(s, A9_ATTACH_HANDSHAKE_OWNED);
++}
++
++#endif
+diff --git a/drivers/soc/apple/a9-aop.h b/drivers/soc/apple/a9-aop.h
+index 274244cf30..0640b09ca7 100644
+--- a/drivers/soc/apple/a9-aop.h
++++ b/drivers/soc/apple/a9-aop.h
+@@ -7,4 +7,7 @@
+ /* Immutable apple_a9_aop.debug value, owned by the passive observer. */
+ bool apple_a9_aop_debug(void);
+ 
++/* Shared attach gate; the active driver additionally requires active=1. */
++bool apple_a9_aop_attach(void);
++
+ #endif
+diff --git a/drivers/soc/apple/apple-a9-aop-active.c b/drivers/soc/apple/apple-a9-aop-active.c
+index 68ed183edf..6964fa9d56 100644
+--- a/drivers/soc/apple/apple-a9-aop-active.c
++++ b/drivers/soc/apple/apple-a9-aop-active.c
+@@ -15,8 +15,10 @@
+  * EPMAP base and AFK words also differ. This file keeps its own small codec.
+  *
+  * Never resets the AOP, never clears mailbox faults and never forces a power
+- * domain on. A running AOP without a pending HELLO is refused.
++ * domain on. The opt-in running attach only writes mailbox words after a
++ * read-only fingerprint/reservation proof; it never uses the cold loader.
+  */
++#include <crypto/sha2.h>
+ #include <linux/bitfield.h>
+ #include <linux/debugfs.h>
+ #include <linux/delay.h>
+@@ -28,8 +30,10 @@
+ #include <linux/kfifo.h>
+ #include <linux/ktime.h>
+ #include <linux/module.h>
++#include <linux/mm.h>
+ #include <linux/mutex.h>
+ #include <linux/of.h>
++#include <linux/of_reserved_mem.h>
+ #include <linux/platform_device.h>
+ #include <linux/random.h>
+ #include <linux/seq_file.h>
+@@ -44,6 +48,7 @@
+ #include "a9-aop-afk.h"
+ #include "a9-aop-iio.h"
+ #include "a9-aop.h"
++#include "a9-aop-takeover.h"
+ 
+ /* Shares the observer's parameter namespace: apple_a9_aop.active=1. */
+ #undef MODULE_PARAM_PREFIX
+@@ -125,6 +130,9 @@ static const char * const domain_names[AOP_DOMAINS] = {
+ enum a9_aop_phase {
+ 	PHASE_IDLE,
+ 	PHASE_PROBE,
++	PHASE_ATTACH_PREFLIGHT,
++	PHASE_ATTACH_PING,
++	PHASE_ATTACH_HELLO,
+ 	PHASE_WAIT_FIRMWARE,
+ 	PHASE_WAIT_HELLO,
+ 	PHASE_WAIT_EPMAP,
+@@ -138,7 +146,8 @@ enum a9_aop_phase {
+ };
+ 
+ static const char * const phase_names[] = {
+-	"idle", "probe", "wait-firmware", "wait-hello", "wait-epmap",
++	"idle", "probe", "attach-preflight", "attach-ping", "attach-hello",
++	"wait-firmware", "wait-hello", "wait-epmap",
+ 	"wait-service", "configure", "wait-report", "streaming", "stopped",
+ 	"refused", "failed",
+ };
+@@ -198,6 +207,7 @@ struct a9_aop_trace {
+ 	u64 word;
+ 	char dir;
+ 	int status;
++	enum a9_aop_phase phase;
+ };
+ 
+ struct a9_aop {
+@@ -244,7 +254,11 @@ struct a9_aop {
+ 	const char *result;
+ 	int error;
+ 	bool cold;
+-	u32 snapshot[5];
++	bool running_attach;
++	struct a9_attach takeover;
++	struct a9_attach_fingerprint fingerprint;
++	bool fingerprint_read, image_verified, tags_verified, ext_reserved, ext_verified;
++	u32 snapshot[6];
+ 	bool hello, epmap_done;
+ 	u16 hello_min, hello_max;
+ 	unsigned int epmap_chunks;
+@@ -304,6 +318,7 @@ static void a9_aop_trace(struct a9_aop *aop, char dir, u64 word, int status)
+ 	t->word = word;
+ 	t->dir = dir;
+ 	t->status = status;
++	t->phase = READ_ONCE(aop->phase);
+ 	if (apple_a9_aop_debug())
+ 		dev_dbg(aop->dev, "%c %016llx %d\n", dir, word, status);
+ }
+@@ -349,6 +364,8 @@ static int a9_aop_send(struct a9_aop *aop, u8 ep, u64 payload)
+ 	ret = a9_aop_pack(ep, payload, &wire);
+ 	if (ret)
+ 		return ret;
++	if (READ_ONCE(aop->phase) == PHASE_REFUSED)
++		return -ESHUTDOWN;
+ 	spin_lock_irqsave(&aop->tx_lock, flags);
+ 	ret = readl_poll_timeout_atomic(aop->wrapper + AOP_INBOX_CONTROL, control,
+ 					!(control & AOP_MBOX_FULL) ||
+@@ -372,13 +389,15 @@ static unsigned int a9_aop_drain(struct a9_aop *aop)
+ {
+ 	unsigned long flags;
+ 	unsigned int count = 0;
++	unsigned int budget = aop->running_attach && !READ_ONCE(aop->hello) ?
++			      1 : AOP_DRAIN_BUDGET;
+ 	u32 control;
+ 	u64 wire;
+ 
+ 	if (READ_ONCE(aop->rx_halt))
+ 		return 0;
+ 	spin_lock_irqsave(&aop->rx_lock, flags);
+-	while (count < AOP_DRAIN_BUDGET) {
++	while (count < budget) {
+ 		control = aop_rd(aop, AOP_OUTBOX_CONTROL);
+ 		if (control & AOP_MBOX_FAULTS) {
+ 			aop->fault_control = control;
+@@ -554,7 +573,7 @@ static void a9_aop_mgmt(struct a9_aop *aop, u64 payload)
+ 		wake_up_all(&aop->wait);
+ 		return;
+ 	case A9_MGMT_PING_ACK:
+-		if ((u32)payload == aop->ping_seq) {
++		if (aop->ping_sent_ns && a9_mgmt_ping_ack(payload, aop->ping_seq)) {
+ 			aop->ping_ack_ns = ktime_get_boottime_ns();
+ 			aop->ping_acks++;
+ 		}
+@@ -575,7 +594,7 @@ static void a9_aop_ping_work(struct work_struct *work)
+ 					  ping_work);
+ 	u64 now = ktime_get_boottime_ns();
+ 
+-	if (READ_ONCE(aop->stopping))
++	if (READ_ONCE(aop->stopping) || READ_ONCE(aop->phase) == PHASE_REFUSED)
+ 		return;
+ 	mutex_lock(&aop->lock);
+ 	if (aop->phase != PHASE_FAILED && aop->ping_sent_ns &&
+@@ -924,6 +943,24 @@ static void a9_aop_dispatch(struct a9_aop *aop, u64 wire)
+ 	lockdep_assert_held(&aop->lock);
+ 	if (aop->phase == PHASE_REFUSED)
+ 		return;
++	if (aop->running_attach && !aop->hello) {
++		a9_attach_rx(&aop->takeover, wire);
++		if (aop->takeover.stage == A9_ATTACH_REFUSED) {
++			if (aop->takeover.result == A9_ATTACH_HANDSHAKE_OWNED)
++				dev_warn(aop->dev, "ZOMBIE AOP: two ping acks, no acceptable EPMAP; inherited rings may reference reused DRAM. Only a real power cycle clears it; do not kexec\n");
++			a9_aop_refuse(aop, a9_attach_result_name(aop->takeover.result));
++			return;
++		}
++		if (aop->takeover.stage != A9_ATTACH_ADOPTED) {
++			aop->ping_seq = aop->takeover.seq;
++			aop->ping_acks++;
++			aop->ping_ack_ns = ktime_get_boottime_ns();
++			return;
++		}
++		/* EPMAP, not our speculative HELLO_REPLY, proves adoption [I]. */
++		aop->hello = true;
++		aop->phase = PHASE_WAIT_EPMAP;
++	}
+ 	if (ep == 0) {
+ 		a9_aop_mgmt(aop, payload);
+ 		return;
+@@ -956,7 +993,10 @@ static void a9_aop_process(struct a9_aop *aop)
+ 	if (aop->fault_control && aop->phase != PHASE_FAILED &&
+ 	    aop->phase != PHASE_REFUSED) {
+ 		/* Faults are reported, never acknowledged or cleared. */
+-		a9_aop_fail(aop, "failed-mailbox-fault", -EIO);
++		if (aop->running_attach && !aop->hello)
++			a9_aop_refuse(aop, "refused-mailbox-fault");
++		else
++			a9_aop_fail(aop, "failed-mailbox-fault", -EIO);
+ 	}
+ 	while (kfifo_out_spinlocked(&aop->rxq, &wire, 1, &aop->rx_lock))
+ 		a9_aop_dispatch(aop, wire);
+@@ -1098,14 +1138,16 @@ static int a9_aop_send_calibration(struct a9_aop *aop)
+ 
+ 	ret = request_firmware_direct(&fw, AOP_CAL_FW, aop->dev);
+ 	if (ret) {
++		if (aop->running_attach)
++			return ret; /* an adopted image still needs factory calibration */
+ 		dev_warn(aop->dev, "no %s (%d): streaming without factory calibration\n",
+ 			 AOP_CAL_FW, ret);
+ 		return 0;
+ 	}
+ 	count = a9_cal_parse(fw->data, fw->size, entries, ARRAY_SIZE(entries));
+-	if (count < 0) {
++	if (count < 0 || (!count && aop->running_attach)) {
+ 		release_firmware(fw);
+-		return count;
++		return count ?: -ENODATA;
+ 	}
+ 	for (i = 0; i < count; i++) {
+ 		ret = a9_aop_property(aop, entries[i].key, entries[i].data,
+@@ -1129,7 +1171,8 @@ static int a9_aop_send_calibration(struct a9_aop *aop)
+ 
+ struct a9_aop_regs {
+ 	struct a9_aop *aop;
+-	u32 values[5];
++	u32 values[6];
++	bool fingerprint;
+ };
+ 
+ static void a9_aop_read_regs(void *data)
+@@ -1143,6 +1186,19 @@ static void a9_aop_read_regs(void *data)
+ 
+ 	for (i = 0; i < ARRAY_SIZE(offsets); i++)
+ 		regs->values[i] = aop_rd(regs->aop, offsets[i]);
++	regs->values[5] = readl(regs->aop->autoboot);
++	if (regs->fingerprint && (regs->values[1] & AOP_CPU_RUNNING) &&
++	    (regs->values[3] & AOP_MBOX_EMPTY) &&
++	    !((regs->values[2] | regs->values[3]) & AOP_MBOX_FAULTS)) {
++		struct a9_attach_fingerprint *fp = &regs->aop->fingerprint;
++
++		memcpy_fromio(fp->head, regs->aop->region, sizeof(fp->head));
++		memcpy_fromio(fp->build, regs->aop->region + A9_ATTACH_BUILD_OFFSET,
++			      sizeof(fp->build));
++		memcpy_fromio(fp->table, regs->aop->region + A9_ATTACH_TABLE_OFFSET,
++			      sizeof(fp->table));
++		regs->aop->fingerprint_read = true;
++	}
+ }
+ 
+ static int a9_aop_wait_firmware(struct a9_aop *aop, const char *name,
+@@ -1356,6 +1412,252 @@ static int a9_aop_cold_start(struct a9_aop *aop)
+ 	return ret;
+ }
+ 
++/* ---- running attach: no loader, mask, reset or power writes --------------- */
++
++static bool a9_aop_pinned_firmware(const struct firmware *fw, bool external)
++{
++	static const u8 main_sha[SHA256_DIGEST_SIZE] = {
++		0xaf, 0x5d, 0x51, 0xa3, 0x68, 0xce, 0xb8, 0x9d,
++		0xc5, 0xc3, 0x59, 0xe7, 0xc8, 0x4e, 0x54, 0xcb,
++		0x60, 0x82, 0xe3, 0x08, 0x95, 0x6b, 0xe7, 0x42,
++		0xc1, 0x76, 0x22, 0xeb, 0x4a, 0x60, 0x47, 0xc8,
++	};
++	static const u8 ext_sha[SHA256_DIGEST_SIZE] = {
++		0x25, 0x28, 0xd2, 0x68, 0x6e, 0xd1, 0x26, 0x2d,
++		0xe9, 0x91, 0x0c, 0x2d, 0x60, 0xe4, 0x5b, 0x68,
++		0x13, 0x7e, 0x50, 0xaa, 0x60, 0x1a, 0x0f, 0x8d,
++		0x54, 0xea, 0x7d, 0x13, 0x47, 0xb9, 0xde, 0x22,
++	};
++	u8 digest[SHA256_DIGEST_SIZE];
++
++	if (fw->size != (external ? A9_ATTACH_EXT_SIZE : A9_ATTACH_MAIN_SIZE))
++		return false;
++	sha256(fw->data, fw->size, digest);
++	return !memcmp(digest, external ? ext_sha : main_sha, sizeof(digest));
++}
++
++/*
++ * Accept only a boot-time carveout Linux cannot allocate: the AOP region or
++ * a plain, non-reusable /reserved-memory entry. Reject pools and entries
++ * with a driver/ops (which could hand the pages to another device later).
++ * Mapped RAM additionally needs PageReserved on EVERY covering page.
++ * Never attempt a late memblock reservation: the allocator is already live.
++ */
++static bool a9_aop_ext_reserved(struct a9_aop *aop, u64 pa, bool *io)
++{
++	struct device_node *root, *node;
++	struct reserved_mem *rmem;
++	u64 size = ALIGN(A9_ATTACH_EXT_SIZE, A9_ATTACH_PAGE_SIZE);
++	unsigned long pfn, end;
++	bool found = false;
++
++	*io = true;
++	if (a9_attach_contains(aop->region_pa, aop->region_size, pa, size))
++		return true;
++	root = of_find_node_by_path("/reserved-memory");
++	if (!root)
++		return false;
++	for_each_available_child_of_node(root, node) {
++		rmem = of_reserved_mem_lookup(node);
++		if (!rmem || rmem->ops || of_property_present(node, "compatible") ||
++		    of_property_present(node, "reusable") ||
++		    !a9_attach_contains(rmem->base, rmem->size, pa, size))
++			continue;
++		*io = of_property_present(node, "no-map");
++		found = true;
++		if (!*io) {
++			end = PHYS_PFN(PAGE_ALIGN(pa + size));
++			for (pfn = PHYS_PFN(pa); pfn < end; pfn++) {
++				if (!pfn_valid(pfn) || !PageReserved(pfn_to_page(pfn))) {
++					found = false;
++					break;
++				}
++			}
++		}
++		of_node_put(node);
++		break;
++	}
++	of_node_put(root);
++	return found;
++}
++
++/* Caller holds lock; Phase A does not consume FIFO words or send anything. */
++static enum a9_attach_result a9_aop_check_ext(struct a9_aop *aop,
++					      const struct firmware *ext, u64 pa)
++{
++	void __iomem *mapping;
++	void *ram;
++	u8 chunk[256];
++	size_t done, n;
++	bool io;
++	int mismatch = 0;
++
++	aop->ext_dma = pa;
++	aop->ext_size = ext->size;
++	aop->ext_reserved = a9_aop_ext_reserved(aop, pa, &io);
++	if (!aop->ext_reserved)
++		return A9_ATTACH_UNRESERVED_EXT; /* never map an arbitrary tag PA */
++	if (!io) {
++		/* Preserve the linear map's attributes: no Device alias of RAM. */
++		ram = memremap(pa, ext->size, MEMREMAP_WB);
++		if (!ram)
++			return A9_ATTACH_STALE_EXT;
++		mismatch = !a9_attach_ext_matches(ram, ext->size, ext->data, ext->size);
++		memunmap(ram);
++	} else {
++		if (a9_attach_contains(aop->region_pa, aop->region_size, pa, ext->size))
++			mapping = aop->region + (pa - aop->region_pa);
++		else
++			mapping = ioremap(pa, ext->size);
++		if (!mapping)
++			return A9_ATTACH_STALE_EXT;
++		for (done = 0; done < ext->size; done += n) {
++			n = min(ext->size - done, sizeof(chunk));
++			memcpy_fromio(chunk, mapping + done, n);
++			if (memcmp(chunk, ext->data + done, n)) {
++				mismatch = 1;
++				break;
++			}
++		}
++		if (!a9_attach_contains(aop->region_pa, aop->region_size, pa, ext->size))
++			iounmap(mapping);
++	}
++	aop->ext_verified = !mismatch;
++	return mismatch ? A9_ATTACH_STALE_EXT : A9_ATTACH_OK;
++}
++
++static bool a9_aop_attach_preflight(struct a9_aop *aop)
++{
++	struct apple_pmgr_observation states[AOP_DOMAINS] = {};
++	struct a9_aop_regs regs = { .aop = aop, .fingerprint = true };
++	const struct firmware *fw = NULL, *ext = NULL;
++	enum a9_attach_result result = A9_ATTACH_FOREIGN_IMAGE;
++	u64 pa;
++	int ret;
++
++	/* Firmware files may appear only after switch_root; all waits bounded. */
++	ret = a9_aop_wait_firmware(aop, AOP_MAIN_FW, &fw);
++	if (!ret && !a9_aop_pinned_firmware(fw, false))
++		ret = -EILSEQ;
++	mutex_lock(&aop->lock);
++	if (ret || a9_aop_dead(aop))
++		goto out;
++	/* Recheck domains and wrapper after the filesystem wait, before region IO. */
++	if (aop->region_size < A9_ATTACH_BUILD_OFFSET + A9_ATTACH_BUILD_SIZE) {
++		ret = -EINVAL;
++		goto out;
++	}
++	ret = apple_pmgr_observe(aop->domains, AOP_DOMAINS, states,
++				 a9_aop_read_regs, &regs);
++	if (ret) {
++		a9_aop_refuse(aop, "refused-domain-state");
++		goto out;
++	}
++	memcpy(aop->snapshot, regs.values, sizeof(aop->snapshot));
++	if ((regs.values[2] | regs.values[3]) & AOP_MBOX_FAULTS) {
++		a9_aop_refuse(aop, "refused-mailbox-fault");
++		goto out;
++	}
++	if (!(regs.values[1] & AOP_CPU_RUNNING) ||
++	    !(regs.values[3] & AOP_MBOX_EMPTY)) {
++		a9_aop_refuse(aop, "refused-running-unexpected-mgmt");
++		goto out;
++	}
++	aop->table = devm_kmemdup(aop->dev, aop->fingerprint.table,
++				  A9_ATTACH_TABLE_SIZE, GFP_KERNEL);
++	aop->table_size = aop->table ? A9_ATTACH_TABLE_SIZE : 0;
++	result = a9_attach_fingerprint(&aop->fingerprint, fw->data, fw->size,
++				       aop->wrapper_pa, aop->aop_target,
++				       aop->chip_id, aop->chip_revision, &pa);
++	aop->image_verified = result != A9_ATTACH_FOREIGN_IMAGE;
++	if (result != A9_ATTACH_OK)
++		goto out;
++	aop->tags_verified = true;
++	result = A9_ATTACH_STALE_EXT;
++	ret = request_firmware_direct(&ext, AOP_EXT_FW, aop->dev);
++	if (ret || !a9_aop_pinned_firmware(ext, true))
++		goto out;
++	result = a9_aop_check_ext(aop, ext, pa);
++out:
++	if (result != A9_ATTACH_OK) {
++		aop->takeover.result = result;
++		a9_aop_refuse(aop, a9_attach_result_name(result));
++	}
++	mutex_unlock(&aop->lock);
++	release_firmware(ext);
++	release_firmware(fw);
++	return result == A9_ATTACH_OK && !a9_aop_dead(aop);
++}
++
++/* IRQ and background poll stay off throughout B/C: exactly one reader. */
++static void a9_aop_attach_poll(struct a9_aop *aop, unsigned int ms,
++			       enum a9_attach_stage stage)
++{
++	u64 deadline = ktime_get_boottime_ns() + (u64)ms * NSEC_PER_MSEC;
++
++	while (!a9_aop_dead(aop) && ktime_get_boottime_ns() < deadline) {
++		a9_aop_inline_rx(aop);
++		if (aop->takeover.stage != stage ||
++		    (stage == A9_ATTACH_PING && !aop->takeover.pending))
++			return;
++		usleep_range(500, 1000);
++	}
++}
++
++static bool a9_aop_running_attach(struct a9_aop *aop)
++{
++	int ret;
++
++	if (!a9_aop_attach_preflight(aop))
++		return false;
++	mutex_lock(&aop->lock);
++	aop->phase = PHASE_ATTACH_PING;
++	aop->takeover.stage = A9_ATTACH_PING;
++	while (a9_attach_next_ping(&aop->takeover)) {
++		u64 now = ktime_get_boottime_ns();
++
++		aop->ping_seq = aop->takeover.seq;
++		aop->ping_sent_ns = now;
++		ret = a9_aop_send(aop, 0, a9_mgmt_ping(aop->ping_seq,
++						       (u16)div_u64(now, NSEC_PER_SEC)));
++		if (ret) {
++			a9_attach_refuse(&aop->takeover, A9_ATTACH_NO_PING_ACK);
++			break;
++		}
++		mutex_unlock(&aop->lock);
++		a9_aop_attach_poll(aop, A9_ATTACH_PING_MS, A9_ATTACH_PING);
++		mutex_lock(&aop->lock);
++		if (a9_aop_dead(aop))
++			goto out;
++		a9_attach_ping_timeout(&aop->takeover);
++	}
++	if (aop->takeover.stage == A9_ATTACH_PING)
++		a9_attach_refuse(&aop->takeover, A9_ATTACH_NO_PING_ACK);
++	if (!a9_attach_hello(&aop->takeover, apple_a9_aop_attach()))
++		goto refused;
++	aop->phase = PHASE_ATTACH_HELLO;
++	ret = a9_aop_send(aop, 0, A9_ATTACH_HELLO_REPLY);
++	if (ret) {
++		a9_attach_refuse(&aop->takeover, A9_ATTACH_HANDSHAKE_OWNED);
++		goto refused;
++	}
++	mutex_unlock(&aop->lock);
++	a9_aop_attach_poll(aop, A9_ATTACH_HELLO_MS, A9_ATTACH_WAIT_EPMAP);
++	mutex_lock(&aop->lock);
++	if (a9_aop_dead(aop))
++		goto out;
++	a9_attach_hello_timeout(&aop->takeover);
++	if (aop->takeover.stage == A9_ATTACH_ADOPTED)
++		goto out;
++refused:
++	if (aop->takeover.result == A9_ATTACH_HANDSHAKE_OWNED)
++		dev_warn(aop->dev, "ZOMBIE AOP: two ping acks, no EPMAP; only a real power cycle clears inherited state, never kexec\n");
++	a9_aop_refuse(aop, a9_attach_result_name(aop->takeover.result));
++out:
++	mutex_unlock(&aop->lock);
++	return aop->takeover.stage == A9_ATTACH_ADOPTED && !a9_aop_dead(aop);
++}
++
+ /* ---- bring-up ------------------------------------------------------------ */
+ 
+ static void a9_aop_boot_work(struct work_struct *work)
+@@ -1394,10 +1696,8 @@ static void a9_aop_boot_work(struct work_struct *work)
+ 	running = regs.values[1] & AOP_CPU_RUNNING;
+ 	empty = regs.values[3] & AOP_MBOX_EMPTY;
+ 	if (running && empty) {
+-		/* Owned by a previous AP; no takeover message exists. */
+-		a9_aop_refuse(aop, "refused-running-no-pending-hello");
+-		mutex_unlock(&aop->lock);
+-		return;
++		aop->running_attach = true;
++		aop->phase = PHASE_ATTACH_PREFLIGHT;
+ 	}
+ 	if (!running && !empty) {
+ 		a9_aop_refuse(aop, "refused-stopped-outbox-not-empty");
+@@ -1407,7 +1707,13 @@ static void a9_aop_boot_work(struct work_struct *work)
+ 	aop->cold = !running;
+ 	mutex_unlock(&aop->lock);
+ 
+-	if (aop->cold) {
++	if (aop->running_attach) {
++		if (!a9_aop_running_attach(aop))
++			return;
++		/* First EPMAP already went through the ordinary management handler. */
++		aop->irq_enabled = true;
++		enable_irq(aop->irq);
++	} else if (aop->cold) {
+ 		ret = a9_aop_cold_start(aop);
+ 		if (ret) {
+ 			mutex_lock(&aop->lock);
+@@ -1425,6 +1731,8 @@ static void a9_aop_boot_work(struct work_struct *work)
+ 	}
+ 	queue_delayed_work(aop->wq, &aop->poll_work, 0);
+ 
++	if (a9_aop_dead(aop))
++		return;
+ 	if (!a9_aop_wait(aop, READ_ONCE(aop->hello), AOP_HELLO_MS)) {
+ 		mutex_lock(&aop->lock);
+ 		a9_aop_fail(aop, "failed-no-hello", -ETIMEDOUT);
+@@ -1524,10 +1832,18 @@ static int a9_aop_state_show(struct seq_file *s, void *unused)
+ 	mutex_lock(&aop->lock);
+ 	seq_printf(s, "format=1 phase=%s result=%s errno=%d path=%s\n",
+ 		   phase_names[aop->phase], aop->result ?: "none", aop->error,
+-		   aop->phase <= PHASE_PROBE ? "undecided" : aop->cold ? "cold" : "warm");
+-	seq_printf(s, "snapshot cpu_control=0x%08x cpu_status=0x%08x inbox=0x%08x outbox=0x%08x idle=0x%08x\n",
++		   aop->phase <= PHASE_PROBE ? "undecided" :
++		   aop->running_attach ? "attach" : aop->cold ? "cold" : "warm");
++	seq_printf(s, "snapshot cpu_control=0x%08x cpu_status=0x%08x inbox=0x%08x outbox=0x%08x idle=0x%08x auto_boot=0x%08x\n",
+ 		   aop->snapshot[0], aop->snapshot[1], aop->snapshot[2],
+-		   aop->snapshot[3], aop->snapshot[4]);
++		   aop->snapshot[3], aop->snapshot[4], aop->snapshot[5]);
++	seq_printf(s, "attach enabled=%d stage=%u result=%s fingerprint_read=%d image_verified=%d tags_verified=%d ext_reserved=%d ext_verified=%d attempts=%u consecutive_acks=%u hello_reply_sent=%d adopted=%d\n",
++		   apple_a9_aop_attach(), aop->takeover.stage,
++		   a9_attach_result_name(aop->takeover.result),
++		   aop->fingerprint_read, aop->image_verified, aop->tags_verified,
++		   aop->ext_reserved, aop->ext_verified, aop->takeover.attempts,
++		   aop->takeover.acks, aop->takeover.hello_sent,
++		   aop->takeover.stage == A9_ATTACH_ADOPTED);
+ 	seq_printf(s, "region pa=0x%llx size=0x%llx aop_target=%u\n",
+ 		   (unsigned long long)aop->region_pa,
+ 		   (unsigned long long)aop->region_size, aop->aop_target);
+@@ -1611,15 +1927,15 @@ static int a9_aop_transcript_show(struct seq_file *s, void *unused)
+ 	total = aop->trace_total;
+ 	spin_unlock_irqrestore(&aop->rx_lock, flags);
+ 	first = total > AOP_TRACE ? total - AOP_TRACE : 0;
+-	seq_printf(s, "# total=%llu shown_from=%llu  dir ep payload status\n",
++	seq_printf(s, "# total=%llu shown_from=%llu  dir ep payload status phase\n",
+ 		   total, first);
+ 	for (i = first; i < total; i++) {
+ 		struct a9_aop_trace *t = &copy[i % AOP_TRACE];
+ 
+-		seq_printf(s, "%llu %llu.%09llu %c ep=0x%02x %014llx %d\n", i,
++		seq_printf(s, "%llu %llu.%09llu %c ep=0x%02x %014llx %d phase=%s\n", i,
+ 			   t->ns / NSEC_PER_SEC, t->ns % NSEC_PER_SEC, t->dir,
+ 			   a9_aop_endpoint(t->word), a9_aop_payload(t->word),
+-			   t->status);
++			   t->status, phase_names[t->phase]);
+ 	}
+ 	kfree(copy);
+ 	return 0;
+@@ -1677,8 +1993,17 @@ static int a9_aop_patchbay_show(struct seq_file *s, void *unused)
+ 	size_t cursor = 0;
+ 	u32 tag, size;
+ 
++	mutex_lock(&aop->lock);
++	if (aop->fingerprint_read) {
++		seq_puts(s, "running snapshot (read-only, not patched by Linux)\n");
++		seq_hex_dump(s, "head ", DUMP_PREFIX_OFFSET, 16, 1,
++			     aop->fingerprint.head, sizeof(aop->fingerprint.head), false);
++		seq_hex_dump(s, "build@47440 ", DUMP_PREFIX_OFFSET, 16, 1,
++			     aop->fingerprint.build, sizeof(aop->fingerprint.build), false);
++	}
+ 	if (!aop->table) {
+ 		seq_puts(s, "not loaded by this driver\n");
++		mutex_unlock(&aop->lock);
+ 		return 0;
+ 	}
+ 	while (cursor + 8 <= aop->table_size) {
+@@ -1692,6 +2017,7 @@ static int a9_aop_patchbay_show(struct seq_file *s, void *unused)
+ 			   aop->table + cursor + 8);
+ 		cursor += 8 + size;
+ 	}
++	mutex_unlock(&aop->lock);
+ 	return 0;
+ }
+ DEFINE_SHOW_ATTRIBUTE(a9_aop_patchbay);
+@@ -1730,8 +2056,11 @@ static void a9_aop_shutdown(struct platform_device *pdev)
+ 	cancel_delayed_work_sync(&aop->poll_work);
+ 	cancel_delayed_work_sync(&aop->ping_work);
+ 	flush_workqueue(aop->wq);
+-	if (!aop->hello)
++	if (!aop->hello) {
++		if (aop->running_attach)
++			dev_warn(aop->dev, "inherited AOP was not adopted or stopped; kexec is unsafe, use a real power cycle\n");
+ 		return;
++	}
+ 
+ 	/*
+ 	 * The rings live in memory the next (kexec) kernel will reuse: stop
+diff --git a/drivers/soc/apple/apple-a9-aop.c b/drivers/soc/apple/apple-a9-aop.c
+index dd9559587c..2a13c5bb9d 100644
+--- a/drivers/soc/apple/apple-a9-aop.c
++++ b/drivers/soc/apple/apple-a9-aop.c
+@@ -22,7 +22,7 @@ module_param(debug, bool, 0400);
+ MODULE_PARM_DESC(debug, "Enable read-only J71t AOP debugfs (default off)");
+ static bool attach;
+ module_param(attach, bool, 0400);
+-MODULE_PARM_DESC(attach, "Enable attach preflight only; hardware attach is blocked (default off)");
++MODULE_PARM_DESC(attach, "Allow running-AOP handshake with active=1; observer stays read-only (default off)");
+ 
+ /* Lets the active driver gate its debugfs on the same immutable parameter. */
+ bool apple_a9_aop_debug(void)
+@@ -30,6 +30,11 @@ bool apple_a9_aop_debug(void)
+ 	return debug;
+ }
+ 
++bool apple_a9_aop_attach(void)
++{
++	return attach;
++}
++
+ static const char * const reg_names[AOP_REGS] = {
+ 	"cpu_control", "cpu_running", "inbox_control", "outbox_control", "idle_status",
+ };

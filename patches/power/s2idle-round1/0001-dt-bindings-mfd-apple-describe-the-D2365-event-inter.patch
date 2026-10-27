@@ -1,0 +1,38 @@
+From 99306a6aa35844f1d3695bbbe5dea8d6ba856fe7 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 01:53:38 +0000
+Subject: [PATCH 1/4] dt-bindings: mfd: apple: describe the D2365 event
+ interrupt domain
+
+Describe the D2365 parent event interrupt, one-cell child event domain
+and wake capability. Event consumers still require a PMIC irqchip; no
+event register or alarm programming is introduced.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ .../devicetree/bindings/mfd/apple,pmic.yaml          | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/mfd/apple,pmic.yaml b/Documentation/devicetree/bindings/mfd/apple,pmic.yaml
+index c999985f6f513f838d02a1195fa972896b41616b..63483026e9d7f80f031b4e6e0d09fb5a1a341eb4 100644
+--- a/Documentation/devicetree/bindings/mfd/apple,pmic.yaml
++++ b/Documentation/devicetree/bindings/mfd/apple,pmic.yaml
+@@ -54,6 +54,18 @@ properties:
+   "#size-cells":
+     const: 1
+ 
++  interrupts:
++    description: D2365 active-low event output to the AP GPIO controller.
++    maxItems: 1
++
++  interrupt-controller: true
++
++  "#interrupt-cells":
++    description: D2365 event number within the PMIC interrupt domain.
++    const: 1
++
++  wakeup-source: true
++
+   gpio:
+     $ref: /schemas/gpio/apple,d2365-pmic-gpio.yaml
+ 

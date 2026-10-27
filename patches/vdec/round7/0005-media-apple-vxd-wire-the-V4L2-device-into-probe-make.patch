@@ -1,0 +1,827 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 18:35:12 +0000
+Subject: [PATCH 05/21] media: apple: vxd: wire the V4L2 device into probe, make
+ remove safe, and complete the boot sequence
+
+Round 1 (device run 1, docs/periph/vdec-device-run-1.md) showed two
+failures with static causes:
+
+- No /dev/video* appeared although probe returned 0: the round-1
+  restructure shipped apple-vxd-core.c without the apple_vxd_v4l2_init()
+  call, so the m2m/media/video devices were compiled in but never
+  registered.  Probe now registers them again, with a per-step log line
+  naming the node.
+
+- The unbind/bind firmware-boot attempt panicked: remove()
+  unconditionally ran the V4L2 teardown on a never-initialized state and
+  dereferenced the NULL m2m_dev.  remove() now cancels the watchdog
+  first, drops debugfs before touching hardware state, and skips the
+  V4L2 teardown unless the V4L2 device was registered; every step
+  announces itself with dev_emerg + printk flush (vxd_step) so the last
+  line before a panic names it in netconsole or the panic log.
+
+Boot sequence now matches AppleD5500 exactly (LoadFirmwareAndStartCore
+order), including the two pipe loops round 1 skipped: the
+InitializeCoreConfig prologue (entropy-pipe feature flag, clock
+save-and-set to 0x1010113, per-pixel-pipe 0x460=i/0x4020=0x20000 with
+the pipe status reads) and the clock save/quiesce/restore dance between
+the second known state v1 and known state v2.  The firmware buffer is
+now GART-mapped before the MTX boot: round 1 programmed 0x6a00 with the
+low 32 bits of its DMA address while every GART slot still held the
+dummy page PTE, so the fetch address was unbacked.
+
+New knobs: a debugfs /sys/kernel/debug/apple-vxd/boot write trigger
+(runs the R1 recipe in place - no more unbind/bind), an
+apple_vxd.va_offset module parameter (hex; shifts both the GART slot
+and the 0x6a00 fetch address to test aperture-base candidates without a
+rebuild), and a read-only PMGR pwrstate observer (the shared PMGR syscon
+pattern) logging the ps_vdec target/actual/history fields at boot.
+
+coreId decode (device run 1): 0x630 = 0x03030811 - the unsupported gate
+reads its high u16 (0x0303, > 6, passes) and the pipe counts come from
+its low byte (0x11: one entropy, one pixel pipe); coreRev 0x640 =
+0x70b00 is only ever printed by AppleD5500.  The test plan expectation
+"0x0007xxxx" was wrong; the ADT vxd-version 7 most plausibly matches
+coreRev[23:16] = 0x7 (unconfirmed against another SoC).
+
+Validated offline only: LLVM=1 arm64 object builds, full kernel
+Image.gz + dtbs link, checkpatch --strict.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ drivers/media/platform/apple/vxd/apple-vxd-core.c | 133 ++++++++++++++++--
+ drivers/media/platform/apple/vxd/apple-vxd-fw.c   | 162 ++++++++++++++++++----
+ drivers/media/platform/apple/vxd/apple-vxd-gart.c |  19 ++-
+ drivers/media/platform/apple/vxd/apple-vxd-mbox.c |  29 ++++
+ drivers/media/platform/apple/vxd/apple-vxd-v4l2.c |   6 +
+ drivers/media/platform/apple/vxd/apple-vxd.h      |  13 +-
+ 6 files changed, 318 insertions(+), 44 deletions(-)
+
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-core.c b/drivers/media/platform/apple/vxd/apple-vxd-core.c
+index 3f5d04eccc9c49322180feaea5b14377f91552ba..026a301d70aca31b1715d0bc607fa72ac4b8a64f 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-core.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-core.c
+@@ -8,14 +8,25 @@
+  * request the level IRQ (157) without arming it, and read the core id/rev
+  * and feature registers.  Nothing is written except through the firmware
+  * boot path (R1), which stays behind the apple_vxd.boot_firmware module
+- * parameter until the rung has been proven on the device.
++ * parameter (or the debugfs "boot" trigger) until the rung has been
++ * proven on the device.
++ *
++ * Round 2: the V4L2 m2m device is wired into probe again (the round-1
++ * restructure dropped the call, so no /dev/video* ever appeared), remove()
++ * is ordered and init-aware (the round-1 unbind crash was
++ * v4l2_m2m_unregister_media_controller() on a never-initialized NULL
++ * m2m_dev), and every boot/remove step announces itself with dev_emerg +
++ * printk flush so a panic names the step in netconsole or the panic log.
+  */
+ 
+ #include <linux/clk.h>
+ #include <linux/interrupt.h>
++#include <linux/mfd/syscon.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/pm_runtime.h>
++#include <linux/printk.h>
++#include <linux/regmap.h>
+ #include <linux/slab.h>
+ 
+ #include "apple-vxd.h"
+@@ -25,10 +36,34 @@ module_param_named(boot_firmware, apple_vxd_boot_firmware_param, bool, 0644);
+ MODULE_PARM_DESC(boot_firmware,
+ 		 "boot the resident DEVA image on the MTX at probe (R1)");
+ 
++/*
++ * Device-space offset added to the low 32 bits of every DMA address when
++ * both programming the GART and handing addresses to the block (e.g. the
++ * 0x6a00 firmware fetch address).  Default 0 assumes the GART identity
++ * window starts at device VA 0; a nonzero base can be tried here without
++ * code changes if the ready poll times out (test plan T4).
++ */
++static uint apple_vxd_va_offset;
++module_param_named(va_offset, apple_vxd_va_offset, uint, 0644);
++MODULE_PARM_DESC(va_offset,
++		 "extra device-VA base offset (hex) applied to GART programming");
++
+ static bool apple_vxd_debug;
+ module_param_named(debug, apple_vxd_debug, bool, 0444);
+ MODULE_PARM_DESC(debug, "log register details beyond probe summary");
+ 
++/*
++ * Crash reporting for the bring-up rounds: announce the next step BEFORE
++ * doing it and flush the console, so the last line on the screen or in
++ * netconsole (or the pstore panic record) names the step that faulted.
++ * Round 1's rebind panic left nothing behind; this removes the ambiguity.
++ */
++void vxd_step(const struct device *dev, const char *what)
++{
++	dev_emerg(dev, "STEP %s\n", what);
++	pr_flush(100, false);
++}
++
+ /*
+  * IRQ handling is deferred to R2: the line is level-triggered through the
+  * AIC and only deasserts once the TO_HOST ring is drained, which needs the
+@@ -62,12 +97,56 @@ void apple_vxd_watchdog(struct work_struct *work)
+ 	apple_vxd_job_finish(NULL, VB2_BUF_STATE_ERROR);
+ }
+ 
++/*
++ * Read-only PMGR pwrstate observation (the shared PMGR pattern: share the
++ * provider's syscon without writing).  Logs the target/actual/power
++ * history fields of the genpd backing this device so a boot that touches
++ * a half-powered block is identifiable from the log.
++ */
++static void apple_vxd_log_pwrstate(struct apple_vxd_dev *vxd, const char *when)
++{
++	struct device_node *domain, *parent;
++	struct regmap *pmgr;
++	u32 offset, raw = 0;
++	int ret;
++
++	domain = of_parse_phandle(vxd->dev->of_node, "power-domains", 0);
++	if (!domain)
++		return;
++	ret = of_property_read_u32(domain, "reg", &offset);
++	parent = of_get_parent(domain);
++	if (ret || !parent ||
++	    !of_property_read_bool(parent, "syscon") ||
++	    !of_device_is_compatible(parent, "apple,pmgr")) {
++		of_node_put(domain);
++		of_node_put(parent);
++		return;
++	}
++	of_node_put(parent);
++
++	pmgr = syscon_node_to_regmap(parent);
++	of_node_put(domain);
++	if (IS_ERR(pmgr))
++		return;
++
++	ret = regmap_read(pmgr, offset, &raw);
++	if (ret)
++		return;
++
++	dev_dbg(vxd->dev,
++		"POWER %s PMGR ps_vdec@%x=%08x target=%x actual=%x auto=%u clkgate_hist=%u pwrgate_hist=%u parent_off=%u\n",
++		when, offset, raw, raw & 0xf, (raw >> 4) & 0xf,
++		(raw >> 28) & 1, (raw >> 9) & 1, (raw >> 8) & 1,
++		(raw >> 11) & 1);
++}
++
+ /* R0: power on, read identity and feature registers.  Read-only. */
+ static int apple_vxd_probe_hw(struct apple_vxd_dev *vxd)
+ {
+ 	u32 memcfg, id, rev;
+ 	int ret;
+ 
++	vxd_step(vxd->dev, "power the vdec domain + read core identity");
+ 	ret = pm_runtime_resume_and_get(vxd->dev);
+ 	if (ret) {
+ 		dev_err_probe(vxd->dev, ret, "failed to power the vdec domain\n");
+@@ -81,7 +160,12 @@ static int apple_vxd_probe_hw(struct apple_vxd_dev *vxd)
+ 
+ 	/*
+ 	 * AppleD5500::GetCoreRev rejects MSVDX cores whose coreId high half
+-	 * is <= 6 ("MSVDX is unsupported"); our A9 reports version 7 [E].
++	 * is <= 6 ("MSVDX is unsupported").  Note the register semantics:
++	 * the gate value is the high u16 of 0x630 (on this A9: 0x0303 = 771,
++	 * well above 6), while the ADT's "vxd-version 7" most plausibly
++	 * matches the 0x7 nibble of coreRev 0x70b00.  AppleD5500 itself
++	 * never parses coreRev further; feature gating in iOS uses the ADT
++	 * vxd-version property.  (j71t device run 1, 2026-10-23.)
+ 	 */
+ 	if ((id >> VXD_CORE_ID_MAJOR_SH) <= 6) {
+ 		dev_err(vxd->dev, "MSVDX is unsupported (coreId %#x)\n", id);
+@@ -106,12 +190,14 @@ static int apple_vxd_probe_hw(struct apple_vxd_dev *vxd)
+ 	vxd->pipe_status = vxd_read(vxd, VXD_REG_PIPE_STATUS);
+ 
+ 	dev_info(vxd->dev,
+-		 "coreId %#x coreRev %#x, entropy pipes %u, pixel pipes %u, mtx mem %u KiB, mmu40 %u, tiling-ctx %u, pipe status %#x\n",
+-			 id, rev, vxd->num_entropy_pipes, vxd->num_pixel_pipes,
+-			 vxd->mtx_mem_size, vxd->mmu_40bit,
+-			 vxd->mmu_tiling_ctx, vxd->pipe_status);
++		 "coreId %#x (id gate %#x), coreRev %#x, entropy pipes %u, pixel pipes %u, mtx mem %u KiB, mmu40 %u, tiling-ctx %u, pipe status %#x\n",
++		 id, id >> VXD_CORE_ID_MAJOR_SH, rev,
++		 vxd->num_entropy_pipes, vxd->num_pixel_pipes,
++		 vxd->mtx_mem_size, vxd->mmu_40bit,
++		 vxd->mmu_tiling_ctx, vxd->pipe_status);
+ 
+ 	if (apple_vxd_debug) {
++		apple_vxd_log_pwrstate(vxd, "probe");
+ 		dev_dbg(vxd->dev, "regs after power-up:\n");
+ 		dev_dbg(vxd->dev, "  0x0400 cmd ctrl:      %#x\n",
+ 			vxd_read(vxd, VXD_REG_CMD_CTRL));
+@@ -232,6 +318,7 @@ static int apple_vxd_probe(struct platform_device *pdev)
+ 
+ 	vxd->dev = &pdev->dev;
+ 	vxd->variant = variant;
++	vxd->va_offset = apple_vxd_va_offset;
+ 	platform_set_drvdata(pdev, vxd);
+ 
+ 	mutex_init(&vxd->vdev_lock);
+@@ -239,6 +326,7 @@ static int apple_vxd_probe(struct platform_device *pdev)
+ 	spin_lock_init(&vxd->job_lock);
+ 	INIT_DELAYED_WORK(&vxd->watchdog_work, apple_vxd_watchdog);
+ 
++	vxd_step(&pdev->dev, "probe: map MMIO");
+ 	vxd->regs = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR(vxd->regs))
+ 		return dev_err_probe(&pdev->dev, PTR_ERR(vxd->regs),
+@@ -266,6 +354,7 @@ static int apple_vxd_probe(struct platform_device *pdev)
+ 		return ret;
+ 	}
+ 
++	vxd_step(&pdev->dev, "probe: enable runtime PM");
+ 	pm_runtime_set_autosuspend_delay(&pdev->dev, 100);
+ 	pm_runtime_use_autosuspend(&pdev->dev);
+ 	pm_runtime_enable(&pdev->dev);
+@@ -278,6 +367,15 @@ static int apple_vxd_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		goto err_disable_runtime_pm;
+ 
++	/* Debugfs (dumps + the boot trigger) first so a later step can be
++	 * re-run or inspected no matter how far probe got.
++	 */
++	apple_vxd_mbox_init(vxd);
++
++	ret = apple_vxd_v4l2_init(vxd);
++	if (ret)
++		goto err_gart_fini;
++
+ 	if (apple_vxd_boot_firmware_param) {
+ 		ret = apple_vxd_boot_firmware(vxd);
+ 		if (ret)
+@@ -286,8 +384,6 @@ static int apple_vxd_probe(struct platform_device *pdev)
+ 				 ret);
+ 	}
+ 
+-	apple_vxd_mbox_init(vxd);
+-
+ 	return 0;
+ 
+ err_gart_fini:
+@@ -302,10 +398,29 @@ static void apple_vxd_remove(struct platform_device *pdev)
+ {
+ 	struct apple_vxd_dev *vxd = platform_get_drvdata(pdev);
+ 
++	/*
++	 * Round 1's unbind panic was remove() cleaning up a V4L2 state
++	 * that had never been initialized (m2m_dev == NULL).  Order and
++	 * guard every step now.
++	 */
++	vxd_step(&pdev->dev, "remove: cancel watchdog");
++	cancel_delayed_work_sync(&vxd->watchdog_work);
++
++	vxd_step(&pdev->dev, "remove: drop debugfs");
+ 	apple_vxd_mbox_fini(vxd);
++
++	if (vxd->v4l2_ready) {
++		vxd_step(&pdev->dev, "remove: unregister V4L2 device");
++		apple_vxd_v4l2_cleanup(vxd);
++	}
++
++	vxd_step(&pdev->dev, "remove: free firmware buffer");
+ 	apple_vxd_fw_cleanup(vxd);
++
++	vxd_step(&pdev->dev, "remove: free GART");
+ 	apple_vxd_gart_fini(vxd);
+-	cancel_delayed_work_sync(&vxd->watchdog_work);
++
++	vxd_step(&pdev->dev, "remove: disable runtime PM");
+ 	pm_runtime_dont_use_autosuspend(&pdev->dev);
+ 	pm_runtime_disable(&pdev->dev);
+ }
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-fw.c b/drivers/media/platform/apple/vxd/apple-vxd-fw.c
+index 6bf6b03c38d7fe3f276c2b81112da52735924bff..32603f836287a52a77d2c9df64bbd4f32857603b 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-fw.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-fw.c
+@@ -9,16 +9,20 @@
+  * bf5167652e81540471aaca141943fd33d71c3990c137f145471305f5f5ade83b).
+  *
+  * Everything below is transcribed from the kext with the annotation tooling
+- * (tools/ds-video/); the two "known state" variants, ProcessorInitialise,
+- * BootFirmware, PostBootInit and the firmware-ready poll follow
+- * AppleD5500/CPVDECCore exactly, including write order:
++ * (tools/ds-video/) and follows AppleD5500/CPVDECCore's exact call and
++ * write order:
+  *
+  *   PrepareCore:
+- *     known state v1 (x2 attempts), pipe discovery, fw buffer allocation
++ *     known state v1, core discovery (InitializeCoreConfig), firmware
++ *     buffer allocation (dma + GART map + copy)
+  *   LoadFirmwareAndStartCore:
+- *     known state v1, power quiesce, known state v2 + ProcessorInitialise +
+- *     MTX boot block, 0x418 = 0x100000, post-boot-init registers
+- *   wait for 0x2014 == 0xa5a5a5a5, read 0x2024 / 0x2018
++ *     known state v1 (again), the clock save/quiesce/restore dance,
++ *     known state v2, ProcessorInitialise (MMU + comms rings), the MTX
++ *     boot block, 0x418 = 0x100000, post-boot-init registers
++ *   poll 0x2014 for 0xa5a5a5a5, then read 0x2024 / 0x2018
++ *
++ * Every step announces itself with dev_emerg + console flush (vxd_step)
++ * so the last line before a crash names it.
+  */
+ #include <crypto/sha2.h>
+ #include <linux/dma-mapping.h>
+@@ -37,8 +41,8 @@ static const u8 apple_vxd_deva_sha256[SHA256_DIGEST_SIZE] = {
+ };
+ 
+ /*
+- * PollMSVDX [E]: poll until (val & mask) == match, 1 ms steps, iterating
+- * until a millisecond timeout.
++ * PollMSVDX [E]: poll until (val & mask) == match, 1 ms steps, until the
++ * millisecond timeout.
+  */
+ static int vxd_poll_msvdx(struct apple_vxd_dev *vxd, u32 off, u32 mask,
+ 			  u32 match, unsigned long timeout_ms)
+@@ -70,19 +74,22 @@ static void vxd_set_clocks(struct apple_vxd_dev *vxd, u32 val)
+ }
+ 
+ /*
+- * Known state v1 [E] - called by both PrepareCore and
+- * LoadFirmwareAndStartCore; two attempts, then the epilogue writes.
+- * Every attempt: clocks on, pipe resets, CMD_CTRL pulse 0xffff0000/0/1
+- * with a busy-clear poll, then the MTX clock select poll.
++ * Known state v1 [E] (CPVDECCore fffffff006297f94) - called by both
++ * PrepareCore and LoadFirmwareAndStartCore; two attempts, then the
++ * epilogue writes.  Every attempt: clocks on, pipe resets, CMD_CTRL
++ * pulse 0xffff0000/0/1 with a busy-clear poll, then the MTX clock select
++ * poll.
+  */
+-static int vxd_known_state_v1(struct apple_vxd_dev *vxd)
++static int vxd_known_state_v1(struct apple_vxd_dev *vxd, const char *which)
+ {
+ 	unsigned int attempt, pipe;
+ 	int ret;
+ 
+ 	for (attempt = 0; attempt < 2; attempt++) {
++		vxd_step(vxd->dev, "known state v1: clocks");
+ 		vxd_set_clocks(vxd, VXD_CLK_ENABLE_ALL);
+ 
++		vxd_step(vxd->dev, "known state v1: pipe resets");
+ 		for (pipe = 1; pipe <= vxd->num_pixel_pipes; pipe++) {
+ 			vxd_write(vxd, VXD_REG_CMD_KICK, pipe);
+ 			vxd_write(vxd, VXD_REG_PIPE_CTRL, 0xffffffff);
+@@ -93,6 +100,7 @@ static int vxd_known_state_v1(struct apple_vxd_dev *vxd)
+ 			vxd_write(vxd, VXD_REG_PIPE_SET_0, 0xffffffff);
+ 		}
+ 
++		vxd_step(vxd->dev, "known state v1: CMD_CTRL pulse");
+ 		vxd_write(vxd, VXD_REG_CMD_CTRL, VXD_CMD_CTRL_RESET);
+ 		vxd_read(vxd, VXD_REG_CMD_CTRL);	/* APB flush read [E] */
+ 		vxd_write(vxd, VXD_REG_CMD_CTRL, 0);
+@@ -100,16 +108,22 @@ static int vxd_known_state_v1(struct apple_vxd_dev *vxd)
+ 
+ 		ret = vxd_poll_msvdx(vxd, VXD_REG_CMD_CTRL, 1, 0, 100);
+ 		if (ret) {
+-			dev_dbg(vxd->dev, "0x400 busy poll attempt %u failed: %d\n",
+-				attempt, ret);
++			dev_err(vxd->dev,
++				"known state v1 (%s): 0x400 busy poll attempt %u failed: %d\n",
++				which, attempt, ret);
+ 			return ret;
+ 		}
+ 
++		vxd_step(vxd->dev, "known state v1: MTX clock select");
+ 		vxd_write(vxd, VXD_REG_MTX_MAN_CLK_ENABLE, VXD_MTX_CLK_SEL);
+ 		ret = vxd_poll_msvdx(vxd, VXD_REG_MTX_MAN_CLK_ENABLE,
+ 				     VXD_MTX_CLK_SEL, 0, 100);
+-		if (ret)
++		if (ret) {
++			dev_err(vxd->dev,
++				"known state v1 (%s): 0x1008 poll attempt %u failed: %d\n",
++				which, attempt, ret);
+ 			return ret;
++		}
+ 	}
+ 
+ 	/* Epilogue [E]. */
+@@ -119,9 +133,9 @@ static int vxd_known_state_v1(struct apple_vxd_dev *vxd)
+ }
+ 
+ /*
+- * Known state v2 [E] - immediately before ProcessorInitialise in the
+- * boot; same reset value, but the MTX clock poll runs on the first attempt
+- * only and the epilogue differs.
++ * Known state v2 [E] (fffffff0062980fc) - immediately before
++ * ProcessorInitialise; same reset value, but the MTX clock poll runs on
++ * the first attempt only and the epilogue differs.
+  */
+ static int vxd_known_state_v2(struct apple_vxd_dev *vxd)
+ {
+@@ -141,6 +155,7 @@ static int vxd_known_state_v2(struct apple_vxd_dev *vxd)
+ 			vxd_write(vxd, VXD_REG_PIPE_SET_0, 0xffffffff);
+ 		}
+ 
++		vxd_step(vxd->dev, "known state v2: CMD_CTRL pulse");
+ 		vxd_write(vxd, VXD_REG_CMD_CTRL, VXD_CMD_CTRL_RESET);
+ 		vxd_read(vxd, VXD_REG_CMD_CTRL);	/* APB flush read [E] */
+ 		vxd_write(vxd, VXD_REG_CMD_CTRL, 0);
+@@ -160,6 +175,54 @@ static int vxd_known_state_v2(struct apple_vxd_dev *vxd)
+ 	return 0;
+ }
+ 
++/*
++ * Core discovery [E] (InitializeCoreConfig fffffff006299330, head only):
++ * the entropy-pipe feature flag, a clock save-and-set to the firmware
++ * value, and the per-pixel-pipe config write with the pipe status reads.
++ * The kext's per-pipe register recompute (a few hundred lines of bitfield
++ * algebra on the statuses) is still TODO; the boot works with the
++ * constructor defaults until the R2 dumps say otherwise.
++ */
++static void vxd_discover_core(struct apple_vxd_dev *vxd)
++{
++	u32 saved, pipe, status = 0, maxa = 0;
++
++	vxd->cfg_flags = ((vxd->num_entropy_pipes != 0) << 21);
++
++	/* save 0x440, set the firmware clock value [E] */
++	saved = vxd_read(vxd, VXD_REG_CR_PVDEC_MAN_CLK_ENABLE);
++	vxd_set_clocks(vxd, VXD_CLK_ENABLE_FW);
++
++	for (pipe = 1; pipe <= vxd->num_pixel_pipes; pipe++) {
++		vxd_write(vxd, VXD_REG_CMD_KICK, pipe);
++		vxd_write(vxd, VXD_REG_PIPE_CTRL, 0x20000);
++		status |= vxd_read(vxd, VXD_REG_PIPE_STATUS);
++		maxa = max(maxa, vxd_read(vxd, VXD_REG_PIPE_STATUS_2) & 0x3);
++	}
++	vxd->pipe_status_cfg = status;
++	vxd->pipe_status_2_max = maxa;
++}
++
++/*
++ * The quiesce dance [E] (sub_fffffff0062995cc, between the second known
++ * state v1 and the boot): save 0x440, set the firmware value, touch the
++ * pixel pipes with 0x20000, then restore the saved value.
++ */
++static void vxd_quiesce_clocks(struct apple_vxd_dev *vxd)
++{
++	u32 saved, pipe;
++
++	saved = vxd_read(vxd, VXD_REG_CR_PVDEC_MAN_CLK_ENABLE);
++	vxd_set_clocks(vxd, VXD_CLK_ENABLE_FW);
++
++	for (pipe = 1; pipe <= vxd->num_pixel_pipes; pipe++) {
++		vxd_write(vxd, VXD_REG_CMD_KICK, pipe);
++		vxd_write(vxd, VXD_REG_PIPE_CTRL, 0x20000);
++	}
++
++	vxd_set_clocks(vxd, saved);
++}
++
+ /*
+  * ProcessorInitialise [E]: message ring setup and MMU programming.  The
+  * 0x202c flags take the !core[0xc0] branch (0x1000000); the 0x1003000
+@@ -170,6 +233,7 @@ static void vxd_processor_initialise(struct apple_vxd_dev *vxd)
+ 	/* This core always programs its GART before MTX boot: there is no
+ 	 * DART and no other address path [E].
+ 	 */
++	vxd_step(vxd->dev, "ProcessorInitialise: MMU programming");
+ 	vxd_read(vxd, VXD_REG_MTX_MMU_CFG0);
+ 	vxd_write(vxd, VXD_REG_MTX_MMU_0, 0);
+ 	vxd_write(vxd, VXD_REG_MTX_MMU_DIR_ADR,
+@@ -177,6 +241,7 @@ static void vxd_processor_initialise(struct apple_vxd_dev *vxd)
+ 	vxd_write(vxd, VXD_REG_MTX_MMU_MODE,
+ 		  vxd->mmu_40bit ? VXD_MTX_MMU_MODE_40BIT : 0);
+ 
++	vxd_step(vxd->dev, "ProcessorInitialise: comms rings");
+ 	vxd_write(vxd, VXD_REG_FW_READY_MAGIC, 0);
+ 	vxd_write(vxd, VXD_REG_COMMS_MSG_COUNT, 200);
+ 	vxd_write(vxd, VXD_REG_COMMS_200C, 0);
+@@ -193,6 +258,7 @@ static void vxd_processor_initialise(struct apple_vxd_dev *vxd)
+ /* MTX boot block programming [E] (BootFirmware). */
+ static void vxd_boot_mtx(struct apple_vxd_dev *vxd, u32 fw_words)
+ {
++	vxd_step(vxd->dev, "MTX boot: clocks + pipe config");
+ 	vxd_write(vxd, VXD_REG_CMD_KICK, 1);
+ 	vxd_set_clocks(vxd, VXD_CLK_ENABLE_FW);
+ 
+@@ -204,6 +270,7 @@ static void vxd_boot_mtx(struct apple_vxd_dev *vxd, u32 fw_words)
+ 	vxd_write(vxd, VXD_REG_PIPE_4004, 0);
+ 
+ 	/* Boot block; BOOT_5 first (MTX clock enable; order is [E]). */
++	vxd_step(vxd->dev, "MTX boot: boot block writes");
+ 	vxd_write(vxd, VXD_REG_MTX_BOOT_5, VXD_MTX_BOOT_5_ENABLE);
+ 	vxd_write(vxd, VXD_REG_MTX_BOOT_3, 0);
+ 	vxd_write(vxd, VXD_REG_MTX_BOOT_FW_ADR, vxd->fw_dev_va);
+@@ -262,10 +329,16 @@ int apple_vxd_boot_firmware(struct apple_vxd_dev *vxd)
+ 		return ret;
+ 	}
+ 
++	vxd_step(vxd->dev, "boot: power domain + PMGR pwrstate");
++	apple_vxd_log_pwrstate(vxd, "boot");
++
+ 	/*
+ 	 * AllocateFirmwareBuffer [E]: a 4-byte-aligned coherent buffer of
+-	 * blob_size; the firmware must fit under 0x10000 MTX words.
++	 * blob_size, GART-mapped (the MTX fetches through its own MMU -
++	 * with the round-1 dummy-PTE slots this fetch address was
++	 * unbacked), and the firmware must fit under 0x10000 MTX words.
+ 	 */
++	vxd_step(vxd->dev, "boot: request DEVA firmware + sha256");
+ 	ret = request_firmware(&fw, APPLE_VXD_FW_NAME, vxd->dev);
+ 	if (ret) {
+ 		dev_err(vxd->dev,
+@@ -294,6 +367,7 @@ int apple_vxd_boot_firmware(struct apple_vxd_dev *vxd)
+ 		dev_info(vxd->dev, "DEVA firmware: REL_812.0_14_Deva (sha256 verified)\n");
+ 	}
+ 
++	vxd_step(vxd->dev, "boot: allocate + GART-map firmware buffer");
+ 	vxd->fw_size = PAGE_ALIGN(fw->size);
+ 	vxd->fw_vaddr = dma_alloc_coherent(vxd->dev, vxd->fw_size,
+ 					   &vxd->fw_dma, GFP_KERNEL);
+@@ -301,33 +375,61 @@ int apple_vxd_boot_firmware(struct apple_vxd_dev *vxd)
+ 		ret = -ENOMEM;
+ 		goto out_release;
+ 	}
+-	/* Identity GART: device address = low 32 bits of the DMA address. */
+-	vxd->fw_dev_va = (u32)vxd->fw_dma;
++
++	/*
++	 * Device VA = low 32 bits of the DMA address (identity GART), plus
++	 * the va_offset module parameter applied to both the GART slot and
++	 * the 0x6a00 fetch address, so a wrong aperture base can be tested
++	 * without a rebuild (test plan T4).
++	 */
++	vxd->fw_dev_va = (u32)vxd->fw_dma + vxd->va_offset;
++	ret = apple_vxd_gart_map_at(vxd, vxd->fw_dma, vxd->fw_size,
++				    vxd->fw_dev_va, &vxd->fw_map);
++	if (ret) {
++		dev_err(vxd->dev,
++			"failed to GART-map the firmware buffer (va %#x): %d\n",
++			vxd->fw_dev_va, ret);
++		goto out_fwbuf;
++	}
+ 
+ 	memcpy(vxd->fw_vaddr, fw->data, fw->size);
+ 	release_firmware(fw);
+ 
++	/* PrepareCore [E], in the kext's order. */
++	ret = vxd_known_state_v1(vxd, "PrepareCore");
++	if (ret)
++		goto out_unmap;
++
++	vxd_step(vxd->dev, "boot: core discovery");
++	vxd_discover_core(vxd);
++
+ 	/* LoadFirmwareAndStartCore [E], in the kext's order. */
+-	ret = vxd_known_state_v1(vxd);
++	ret = vxd_known_state_v1(vxd, "LoadFirmwareAndStartCore");
+ 	if (ret)
+-		goto out_fw;
++		goto out_unmap;
++
++	vxd_step(vxd->dev, "boot: clock save/quiesce/restore");
++	vxd_quiesce_clocks(vxd);
+ 
+ 	ret = vxd_known_state_v2(vxd);
+ 	if (ret)
+-		goto out_fw;
++		goto out_unmap;
+ 
+ 	vxd_processor_initialise(vxd);
+ 	vxd_boot_mtx(vxd, fw_words);
++
++	vxd_step(vxd->dev, "boot: post-boot-init registers");
+ 	vxd_write(vxd, VXD_REG_CMD_DESC_STATUS, 0x100000);
+ 	vxd_post_boot_init(vxd);
+ 
++	vxd_step(vxd->dev, "boot: firmware ready poll (1 s)");
+ 	ret = vxd_poll_msvdx(vxd, VXD_REG_FW_READY_MAGIC, 0xffffffff,
+ 			     VXD_FW_READY_MAGIC, 1000);
+ 	if (ret) {
+ 		dev_err(vxd->dev,
+ 			"firmware ready indication - Poll returns %d (0 = no error): firmware did not come up\n",
+ 			ret);
+-		goto out_fw;
++		goto out_unmap;
+ 	}
+ 
+ 	vxd->fw_build_1 = vxd_read(vxd, VXD_REG_FW_BUILD_2);
+@@ -335,6 +437,7 @@ int apple_vxd_boot_firmware(struct apple_vxd_dev *vxd)
+ 	vxd->fw_loaded = true;
+ 	vxd->hw_ready = true;
+ 
++	vxd_step(vxd->dev, "boot: firmware alive, reading build halves");
+ 	dev_info(vxd->dev,
+ 		 "DEVA firmware ready: build halves %#04x.%#04x / %#04x.%#04x\n",
+ 		 vxd->fw_build_1 >> 16, vxd->fw_build_1 & 0xffff,
+@@ -342,7 +445,9 @@ int apple_vxd_boot_firmware(struct apple_vxd_dev *vxd)
+ 	mutex_unlock(&vxd->power_lock);
+ 	return 0;
+ 
+-out_fw:
++out_unmap:
++	apple_vxd_gart_unmap(vxd, &vxd->fw_map);
++out_fwbuf:
+ 	dma_free_coherent(vxd->dev, vxd->fw_size, vxd->fw_vaddr, vxd->fw_dma);
+ 	vxd->fw_vaddr = NULL;
+ out_release:
+@@ -360,6 +465,7 @@ void apple_vxd_fw_cleanup(struct apple_vxd_dev *vxd)
+ 	mutex_lock(&vxd->power_lock);
+ 	was_loaded = vxd->fw_loaded;
+ 	if (vxd->fw_vaddr) {
++		apple_vxd_gart_unmap(vxd, &vxd->fw_map);
+ 		dma_free_coherent(vxd->dev, vxd->fw_size, vxd->fw_vaddr,
+ 				  vxd->fw_dma);
+ 		vxd->fw_vaddr = NULL;
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-gart.c b/drivers/media/platform/apple/vxd/apple-vxd-gart.c
+index 209aaf91abfdac00089be4e1af8d1c894fe35216..adb364e701997cf2ee621c71f8d7ee35785524e6 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-gart.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-gart.c
+@@ -101,8 +101,9 @@ void apple_vxd_gart_fini(struct apple_vxd_dev *vxd)
+ 	memset(gart, 0, sizeof(*gart));
+ }
+ 
+-int apple_vxd_gart_map(struct apple_vxd_dev *vxd, dma_addr_t dma, size_t size,
+-		       struct apple_vxd_mapping *map)
++int apple_vxd_gart_map_at(struct apple_vxd_dev *vxd, dma_addr_t dma,
++			  size_t size, u32 va_base,
++			  struct apple_vxd_mapping *map)
+ {
+ 	struct apple_vxd_gart *gart = &vxd->gart;
+ 	u32 dir_idx, ent_idx, npages, i;
+@@ -118,7 +119,7 @@ int apple_vxd_gart_map(struct apple_vxd_dev *vxd, dma_addr_t dma, size_t size,
+ 
+ 	mutex_lock(&gart->lock);
+ 	for (i = 0; i < npages; i++) {
+-		u32 va = (u32)(dma + (dma_addr_t)i * PAGE_SIZE);
++		u32 va = va_base + i * PAGE_SIZE;
+ 
+ 		dir_idx = va >> 22;		/* 4 MiB per page table */
+ 		ent_idx = (va >> 12) & (VXD_GART_PT_ENTRIES - 1);
+@@ -126,20 +127,26 @@ int apple_vxd_gart_map(struct apple_vxd_dev *vxd, dma_addr_t dma, size_t size,
+ 		if (dir_idx >= gart->num_pts) {
+ 			/* Device aperture beyond the mapped window. */
+ 			dev_err(vxd->dev,
+-				"GART: DMA %pad+0x%zx maps outside the %u page-table window\n",
+-				&dma, size, gart->num_pts);
++				"GART: VA %#x (DMA %pad+0x%zx) maps outside the %u page-table window\n",
++				va, &dma, size, gart->num_pts);
+ 			ret = -ENOSPC;
+ 			goto out;
+ 		}
+ 		gart->pts[dir_idx * VXD_GART_PT_ENTRIES + ent_idx] =
+ 			VXD_GART_PTE(dma + (dma_addr_t)i * PAGE_SIZE);
+ 	}
+-	map->va = (u32)dma;
++	map->va = va_base;
+ out:
+ 	mutex_unlock(&gart->lock);
+ 	return ret;
+ }
+ 
++int apple_vxd_gart_map(struct apple_vxd_dev *vxd, dma_addr_t dma, size_t size,
++		       struct apple_vxd_mapping *map)
++{
++	return apple_vxd_gart_map_at(vxd, dma, size, (u32)dma, map);
++}
++
+ void apple_vxd_gart_unmap(struct apple_vxd_dev *vxd, struct apple_vxd_mapping *map)
+ {
+ 	struct apple_vxd_gart *gart = &vxd->gart;
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-mbox.c b/drivers/media/platform/apple/vxd/apple-vxd-mbox.c
+index 0bfae57e7350824a1f8a3b24d34065c6d6c68d7f..3cbe7f890ebac4690a0032ddf5797541f9e95656 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-mbox.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-mbox.c
+@@ -19,6 +19,7 @@
+  * rd > wr, otherwise rd - wr + capacity, with the capacity coming from the
+  * core object.  Our capacity constant is [U] until the first dump.
+  */
++#include <linux/fs.h>
+ #include <linux/debugfs.h>
+ #include <linux/module.h>
+ #include <linux/seq_file.h>
+@@ -59,6 +60,33 @@ int apple_vxd_submit(struct apple_vxd_ctx *ctx, struct apple_vxd_run *run)
+ 	return -EAGAIN;
+ }
+ 
++/*
++ * Debugfs boot trigger: write anything to trigger apple_vxd_boot_firmware
++ * (the R1 recipe) without an unbind/bind cycle.  Returns 0 (bytes written)
++ * on success or the negative error, so the failure is visible at the
++ * shell: `echo 1 > /sys/kernel/debug/apple-vxd/boot`.
++ */
++static ssize_t apple_vxd_boot_trigger_write(struct file *file,
++					    const char __user *ubuf,
++					    size_t count, loff_t *ppos)
++{
++	struct apple_vxd_dev *vxd = file->private_data;
++	int ret;
++
++	ret = apple_vxd_boot_firmware(vxd);
++	if (ret)
++		return ret;
++
++	return count;
++}
++
++static const struct file_operations apple_vxd_boot_trigger_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = apple_vxd_boot_trigger_write,
++	.llseek = default_llseek,
++};
++
+ static int apple_vxd_mbox_dump_show(struct seq_file *m, void *v)
+ {
+ 	struct apple_vxd_dev *vxd = m->private;
+@@ -143,6 +171,7 @@ int apple_vxd_mbox_init(struct apple_vxd_dev *vxd)
+ 	vxd->debugfs_dir = dir;
+ 	debugfs_create_file("mbox", 0444, dir, vxd, &apple_vxd_mbox_dump_fops);
+ 	debugfs_create_file("regs", 0444, dir, vxd, &apple_vxd_regs_dump_fops);
++	debugfs_create_file("boot", 0200, dir, vxd, &apple_vxd_boot_trigger_fops);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-v4l2.c b/drivers/media/platform/apple/vxd/apple-vxd-v4l2.c
+index 910be026c5237eaa7053850b823ae8c43467a9ed..2e8a09ca86c38fd25d3725dfb31ceafe2f546651 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-v4l2.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-v4l2.c
+@@ -774,6 +774,9 @@ int apple_vxd_v4l2_init(struct apple_vxd_dev *vxd)
+ 		v4l2_err(&vxd->v4l2_dev, "failed to register video device\n");
+ 		goto err_cleanup_mc;
+ 	}
++	vxd->v4l2_ready = true;
++	dev_info(vxd->dev, "v4l2: video device /dev/%s registered\n",
++		 video_device_node_name(&vxd->vdev));
+ 
+ 	ret = v4l2_m2m_register_media_controller(vxd->m2m_dev, &vxd->vdev,
+ 						 MEDIA_ENT_F_PROC_VIDEO_DECODER);
+@@ -788,6 +791,8 @@ int apple_vxd_v4l2_init(struct apple_vxd_dev *vxd)
+ 		v4l2_err(&vxd->v4l2_dev, "failed to register media device\n");
+ 		goto err_unregister_mc;
+ 	}
++	dev_info(vxd->dev, "v4l2: media device /dev/media registered (model %s)\n",
++		 vxd->mdev.model);
+ 
+ 	return 0;
+ 
+@@ -805,6 +810,7 @@ int apple_vxd_v4l2_init(struct apple_vxd_dev *vxd)
+ 
+ void apple_vxd_v4l2_cleanup(struct apple_vxd_dev *vxd)
+ {
++	vxd->v4l2_ready = false;
+ 	media_device_unregister(&vxd->mdev);
+ 	v4l2_m2m_unregister_media_controller(vxd->m2m_dev);
+ 	video_unregister_device(&vxd->vdev);
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd.h b/drivers/media/platform/apple/vxd/apple-vxd.h
+index c13632bfbc803769f02181023d9198aae6455fc0..24dd6b1482aa018556e18229b1e8dd90babba4e3 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd.h
++++ b/drivers/media/platform/apple/vxd/apple-vxd.h
+@@ -122,12 +122,16 @@ struct apple_vxd_dev {
+ 	bool hw_ready;			/* core up + firmware alive */
+ 	u32 core_id;
+ 	u32 core_rev;
++	u32 va_offset;			/* device-VA base offset (module param) */
+ 	u32 num_entropy_pipes;
+ 	u32 num_pixel_pipes;
+ 	u32 mtx_mem_size;		/* KiB, from MTX_MEM_CFG */
+ 	bool mmu_40bit;
+ 	bool mmu_tiling_ctx;
+ 	u32 pipe_status;		/* raw 0x40c0 after power-up */
++	u32 pipe_status_cfg;		/* OR of per-pipe 0x40c0 (R1 discovery) */
++	u32 pipe_status_2_max;		/* max per-pipe 0x40c4 & 3 */
++	u32 cfg_flags;			/* InitializeCoreConfig core[0x54] */
+ 
+ 	/* R1: firmware buffer + boot results. */
+ 	bool fw_loaded;
+@@ -136,6 +140,7 @@ struct apple_vxd_dev {
+ 	size_t fw_size;
+ 	u32 fw_dev_va;
+ 	u32 fw_build_1, fw_build_2;	/* raw register halves */
++	struct apple_vxd_mapping fw_map;	/* GART mapping of fw_dev_va */
+ 
+ 	struct apple_vxd_gart gart;
+ 
+@@ -150,7 +155,8 @@ struct apple_vxd_dev {
+ 	struct video_device vdev;
+ 	struct v4l2_m2m_dev *m2m_dev;
+ 	struct mutex vdev_lock;		/* serializes ioctls */
+-	struct dentry *debugfs_dir;	/* mbox/regs dump (R2) */
++	bool v4l2_ready;
++	struct dentry *debugfs_dir;	/* mbox/regs dumps + boot trigger (R2) */
+ };
+ 
+ struct apple_vxd_ctx {
+@@ -219,12 +225,17 @@ void apple_vxd_run_preamble(struct apple_vxd_ctx *ctx,
+ 			    struct apple_vxd_run *run);
+ void apple_vxd_run_postamble(struct apple_vxd_ctx *ctx,
+ 			     struct apple_vxd_run *run);
++void apple_vxd_log_pwrstate(struct apple_vxd_dev *vxd, const char *when);
++void vxd_step(const struct device *dev, const char *what);
+ 
+ /* gart.c */
+ int apple_vxd_gart_init(struct apple_vxd_dev *vxd);
+ void apple_vxd_gart_fini(struct apple_vxd_dev *vxd);
+ int apple_vxd_gart_map(struct apple_vxd_dev *vxd, dma_addr_t dma, size_t size,
+ 		       struct apple_vxd_mapping *map);
++int apple_vxd_gart_map_at(struct apple_vxd_dev *vxd, dma_addr_t dma,
++			  size_t size, u32 va_base,
++			  struct apple_vxd_mapping *map);
+ void apple_vxd_gart_unmap(struct apple_vxd_dev *vxd,
+ 			  struct apple_vxd_mapping *map);
+ 

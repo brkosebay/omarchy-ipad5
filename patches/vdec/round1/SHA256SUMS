@@ -1,0 +1,5 @@
+b5f7847c32a2bcd4a4dd3ff0a055483baaa7f5aaa1e37070fe004f81ddf24d2f  ./0001-dt-bindings-media-add-Apple-S8000-VXD-video-decoder.patch
+222ef35b47c03abf73f16eba2517532e6a14aadeaa4d674f470b230d4175cf39  ./0002-arm64-dts-apple-s8000-s8003-add-the-VXD-video-decode.patch
+ed505534d3b7faa1cda4aa0eff8361095fc9bdf37f92ce484ce70b74588650c7  ./0003-media-apple-add-VXD-PowerVR-MSVDX-probe-and-bring-up.patch
+e8ff94934769385f7b36e5bf9dfcb445a878e18a99cc90a5e1bb1a91bb9d8b65  ./0004-media-apple-vxd-add-the-V4L2-stateless-H.264-m2m-dev.patch
+88a7b350cca1c16d0e4c22010914f9e18c1ba4686d0f2a46642b9eafaf514b87  ./0005-MAINTAINERS-add-Apple-VXD-video-decoder-driver.patch

@@ -1,0 +1,54 @@
+From 39703809f0cc9bd446bed3f1a195584d7270dd09 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 23:30:18 +0000
+Subject: [PATCH 7/7] cpufreq: apple: keep disabled A9 tuning stubs in kernel
+ style
+
+Use the kernel object allocation helper and format the disabled-feature stubs as normal function definitions. Behavior is unchanged.
+---
+ drivers/cpufreq/apple-a9-tuning.h | 23 ++++++++++++++++++-----
+ 1 file changed, 18 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/cpufreq/apple-a9-tuning.h b/drivers/cpufreq/apple-a9-tuning.h
+index 23193851eb..f2336e5936 100644
+--- a/drivers/cpufreq/apple-a9-tuning.h
++++ b/drivers/cpufreq/apple-a9-tuning.h
+@@ -394,7 +394,7 @@ static int a9_guard_init(struct cpufreq_policy *policy)
+ 
+ 	if (!of_machine_is_compatible("apple,s8003"))
+ 		return 0;
+-	g = kzalloc(sizeof(*g), GFP_KERNEL);
++	g = kzalloc_obj(*g);
+ 	if (!g)
+ 		return -ENOMEM;
+ 	g->priv = priv;
+@@ -464,9 +464,22 @@ static bool a9_target_allowed(struct apple_cpu_priv *priv, unsigned int state,
+ 		!time_after(jiffies, READ_ONCE(g->heartbeat) + msecs_to_jiffies(A9_HEARTBEAT_MS)));
+ }
+ #else
+-static int a9_guard_init(struct cpufreq_policy *policy) { return 0; }
+-static void a9_guard_ready(struct cpufreq_policy *policy) {}
+-static void a9_guard_exit(struct apple_cpu_priv *priv) {}
++static int a9_guard_init(struct cpufreq_policy *policy)
++{
++	return 0;
++}
++
++static void a9_guard_ready(struct cpufreq_policy *policy)
++{
++}
++
++static void a9_guard_exit(struct apple_cpu_priv *priv)
++{
++}
++
+ static bool a9_target_allowed(struct apple_cpu_priv *priv, unsigned int state,
+-			      unsigned int khz) { return state <= 7 || !priv->a9; }
++			      unsigned int khz)
++{
++	return state <= 7 || !priv->a9;
++}
+ #endif
+-- 
+2.56.0
+

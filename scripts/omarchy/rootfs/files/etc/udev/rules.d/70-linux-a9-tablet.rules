@@ -1,0 +1,9 @@
+# linux-a9: the touchscreen and /dev/uinput for the seat's user, so the
+# gesture daemon (ipad-gestures, a user unit) can read whole-hand gestures and
+# turn a long press into a right click. uaccess (an ACL for the active
+# session) has to be tagged before 73-seat-late.rules applies it; the input
+# group is the fallback for a session logind doesn't call active.
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_TOUCHSCREEN}=="1", TAG+="uaccess"
+# The Smart Cover's switch (and any other input switch), for the ipad-lid daemon.
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_SWITCH}=="1", TAG+="uaccess"
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"

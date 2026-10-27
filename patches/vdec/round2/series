@@ -1,0 +1,5 @@
+0001-dt-bindings-media-add-Apple-S8000-VXD-video-decoder.patch
+0002-arm64-dts-apple-s8000-s8003-add-the-VXD-video-decode.patch
+0003-media-apple-add-VXD-PowerVR-MSVDX-probe-and-bring-up.patch
+0004-media-apple-vxd-add-the-V4L2-stateless-H.264-m2m-dev.patch
+0005-media-apple-vxd-wire-the-V4L2-device-into-probe-make.patch

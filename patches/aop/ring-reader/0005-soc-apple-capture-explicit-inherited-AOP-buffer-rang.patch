@@ -1,0 +1,705 @@
+From c225239c9069b600b2d5a3339dc6b29ff10b9bd3 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 12:32:41 +0000
+Subject: [PATCH 5/6] soc: apple: capture explicit inherited AOP buffer ranges
+ early
+
+AFK 0x89 buffers have per-session physical addresses and may contain a
+ring at an offset. Add immutable ring_pa/ring_pa_size lists so an iOS
+probe's exact buffer can be captured before a broad sweep reuses RAM.
+
+Capture up to four 64 KiB ranges at postcore, then again after one second.
+Use fixed BSS snapshots and page-confined nofault linear-map reads only
+after proving System RAM, valid PFNs and a mapped non-no-map range.
+Admit mapped reservations, quarantine faults across targets and samples,
+and hide partial failed copies. Exclude snapshot and stack pages and
+warn when supplied buffers occupy Linux allocator RAM. Do not reserve,
+pin, remap, write or maintain caches on the inherited source.
+
+Expose frozen prefix/nonzero-line dumps, offset header matches, range
+metadata and byte changes in root-only ring_pa debugfs. PA mode blocks
+the active and wrapper paths even for malformed lists. Preserve the
+existing broad-scan and reserved IIO contracts.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ .../driver-api/apple-a9-aop-target.rst        |  90 ++++++
+ Documentation/driver-api/apple-a9-aop.rst     |  11 +-
+ MAINTAINERS                                   |   2 +-
+ drivers/soc/apple/Kconfig                     |   5 +-
+ drivers/soc/apple/Makefile                    |   1 +
+ drivers/soc/apple/a9-aop-ring-reader.c        |  11 +-
+ drivers/soc/apple/a9-aop-ring-target.c        | 302 ++++++++++++++++++
+ drivers/soc/apple/a9-aop-ring-target.h        |  61 ++++
+ drivers/soc/apple/a9-aop.h                    |  10 +
+ drivers/soc/apple/apple-a9-aop.c              |  28 +-
+ 10 files changed, 514 insertions(+), 7 deletions(-)
+ create mode 100644 Documentation/driver-api/apple-a9-aop-target.rst
+ create mode 100644 drivers/soc/apple/a9-aop-ring-target.c
+ create mode 100644 drivers/soc/apple/a9-aop-ring-target.h
+
+diff --git a/Documentation/driver-api/apple-a9-aop-target.rst b/Documentation/driver-api/apple-a9-aop-target.rst
+new file mode 100644
+index 0000000000..af73a757ab
+--- /dev/null
++++ b/Documentation/driver-api/apple-a9-aop-target.rst
+@@ -0,0 +1,90 @@
++.. SPDX-License-Identifier: GPL-2.0-only
++
++J71t AOP directed AFK buffer capture
++==================================
++
++Use the exact buffer PA and size read from AppleSPU's AFK 0x89 allocation
++table in the last iOS session. The ring can start at an offset inside that
++buffer. This default-off diagnostic does not reserve or preserve the source.
++Bootloader and early kernel allocations may already have overwritten it.
++
++Parameters and timing
++---------------------
++
++Set these tokens on the FIRST Linux boot after iOS -> DFU -> Linux, with no
++intervening Linux boot, iOS reboot or AON power cycle. Substitute the actual
++PA and size; angle brackets below are placeholders, not literal arguments::
++
++  apple_a9_aop.debug=1 apple_a9_aop.ring_pa=<PA_FROM_IOS>
++  apple_a9_aop.ring_pa_size=<SIZE_FROM_IOS> apple_a9_aop.ring_scan=0
++  apple_a9_aop.active=0 apple_a9_aop.attach=0 apple_a9_aop.ring_iio=0
++
++``ring_pa`` and ``ring_pa_size`` accept matching comma-separated lists of
++one to four entries, in hex or decimal. Each size must be 1..65536 bytes;
++zero PAs, overflowing ranges and unequal list lengths are refused. Use one
++list per parameter; repeated occurrences replace rather than append a list.
++Unaligned PAs and partial final pages are supported without reading outside
++the supplied byte range.
++
++With debug=1 the lists automatically trigger postcore_initcall_sync capture
++on J71t. Neither ring_scan=1 nor ring_scan_early=1 is needed. The capture
++precedes the optional broad scan and its allocations: all first snapshots,
++one shared 1000 ms sleep, then all second snapshots. Each range reports its
++actual start-to-start interval. Total source reads are bounded to 512 KiB.
++Capture allocates no buffers: approximately 0.5 MiB of kernel BSS holds the
++two snapshots of four ranges. Pages containing this storage and the current
++kernel stack are excluded. Broad E1 also excludes the snapshot storage so
++saved signatures cannot become false hits. Boot still follows allocator
++initialization; historical allocation is unknown.
++
++Either PA parameter excludes the active driver and observer wrapper accesses
++even if the lists are malformed. Reading debugfs never retries a failed or
++unavailable early capture. Omitting both lists leaves this mode disabled.
++
++Read policy
++-----------
++
++All covering pages must be full memblock RAM, System RAM in the resource
++tree, pfn_valid, pfn_is_map_memory and virt_addr_valid through phys_to_virt.
++Reserved mapped RAM is admitted here without ring_scan_reserved=1. No-map
++pages, MMIO, non-System RAM and invalid mappings are refused before source
++bytes are read. The AOP firmware window at 0x210e00000 is not admitted.
++Metadata for all covering pages is retained even when one page is refused.
++
++Each exact byte range is copied in page-confined copy_from_kernel_nofault
++chunks, rechecking eligibility before each chunk. A fault quarantines that
++page across all ranges and both snapshots; other ranges continue. Partial
++failed data is never displayed or compared. No mapping, source write, page
++pin, reservation, cache maintenance, mailbox access or rptr acknowledgment
++occurs. A read barrier does not establish inherited DMA cache coherency.
++
++Frozen debugfs output
++---------------------
++
++Read the root-only file after boot::
++
++  sudo cat /sys/kernel/debug/apple-a9-aop/ring_pa
++
++Require phase=postcore-initcall, captured=1 and snapshot_end=1. Each requested
++range reports its PA, size and errno. Each snapshot reports page counts,
++System RAM/reserved/no-map membership (yes/no/mixed), linear-map coverage,
++timestamp, refusal reason and fault PA. Reservation labels are current
++metadata, not proof that Linux never wrote or owned the source.
++Successful ranges containing unreserved RAM produce a critical kernel log
++about possible inherited AOP DMA into Linux allocator pages, including free
++pages. Nothing claims or repairs them on this boot.
++
++Successful snapshots dump the first min(size,0x100) bytes and every non-zero
++64-byte line, including a shorter final line. Zero lines outside the prefix
++are omitted. These offsets are relative to the supplied PA. Signature checks
++use the exact a9-aop-ring.h header at +0 and every relative 0x40-aligned offset
++with 0x84 header bytes available. Matches report absolute PA, offset,
++bufsize=0x3f40, marker=0x00070006, aligned bounded rptr/wptr and whether the
++whole 16 KiB ring fits inside the supplied range. This does not parse samples.
++
++The comparison reports changed=yes/no/unavailable, byte and 64-byte-line
++change counts, and elapsed milliseconds. Changes establish only that the two
++CPU-visible snapshots differ: writer=unknown, because Linux or another agent
++could also write the bytes. Static data does not prove the AOP stopped. The
++two snapshots are not atomic relative to DMA. Repeated debugfs reads only
++format the saved bytes and must match exactly.
+diff --git a/Documentation/driver-api/apple-a9-aop.rst b/Documentation/driver-api/apple-a9-aop.rst
+index 2bffdda986..acd5155e5b 100644
+--- a/Documentation/driver-api/apple-a9-aop.rst
++++ b/Documentation/driver-api/apple-a9-aop.rst
+@@ -350,14 +350,19 @@ Inherited ring reader: E1 discovery and E2 read-only IIO
+ This is an independent, default-off experiment for the iOS-left AOP session.
+ Use ``apple_a9_aop.debug=1 apple_a9_aop.ring_scan=1`` for E1, or
+ ``apple_a9_aop.debug=1 apple_a9_aop.ring_iio=1`` for E2. Set active=0 and
+-attach=0. Either ring parameter excludes the active driver's probe before
++attach=0. Any ring mode excludes the active driver's probe before
+ resource mapping, IRQ requests or power/DMA operations, even if active=1 is
+ accidentally present. Ring mode bypasses the observer's wrapper maps and power
+-provider lookups too. Its only debugfs files are ring_scan and/or ring_reader;
+-status/preflight are absent. With both ring gates zero, existing behavior is
++provider lookups too. Its debugfs files are ring_scan, ring_reader and/or ring_pa;
++status/preflight are absent. With all ring gates zero, existing behavior is
+ unchanged. Probe does not start a scan. Ordinary E1 starts on the first
+ debugfs read; optional early capture is described below.
+ 
++Directed capture from an iOS-probed AFK buffer PA is also available using
++``ring_pa`` and ``ring_pa_size``. It automatically captures at the same
++postcore phase, before any broad scan, even with ring_scan=0. See
++:doc:`apple-a9-aop-target` for the bounded lists, RAM policy and frozen output.
++
+ E1: reading the root-only ``/sys/kernel/debug/apple-a9-aop/ring_scan`` performs
+ one scan per boot and freezes the result. Subsequent reads and seq_file buffer
+ retries only format the saved result. It inventories full pages in memblock
+diff --git a/MAINTAINERS b/MAINTAINERS
+index ce6541d14d..f68b3f6735 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -2050,7 +2050,7 @@ APPLE A9 AOP EXPERIMENTAL DRIVER
+ M:	Berkay Kosebay <brkosebay@users.noreply.github.com>
+ S:	Maintained
+ F:	Documentation/devicetree/bindings/soc/apple/apple,j71t-aop*.yaml
+-F:	Documentation/driver-api/apple-a9-aop.rst
++F:	Documentation/driver-api/apple-a9-aop*.rst
+ F:	arch/arm64/boot/dts/apple/s8003-j71t-aop*.dtsi
+ F:	drivers/soc/apple/a9-aop*
+ F:	drivers/soc/apple/apple-a9-aop*
+diff --git a/drivers/soc/apple/Kconfig b/drivers/soc/apple/Kconfig
+index 1dc169f2bd..67f053f349 100644
+--- a/drivers/soc/apple/Kconfig
++++ b/drivers/soc/apple/Kconfig
+@@ -16,12 +16,15 @@ config APPLE_A9_AOP
+ 	  apple_a9_aop.debug=1. An optional attach preflight never starts RTKit.
+ 	  ring_scan=1 instead scans linear-mapped System RAM once through debugfs;
+ 	  ring_iio=1 reads a previously reserved inherited ring when IIO=y.
+-	  Both ring parameters exclude the active driver and all wrapper access.
++	  All ring modes exclude the active driver and all wrapper access.
+ 	  With debug=1 ring_scan=1, ring_scan_early=1 captures at postcore initcall
+ 	  before device probing. E1 skips protected/unreadable pages and reports
+ 	  bounded coverage; it never reserves or writes the inherited rings.
+ 	  ring_scan_reserved=1 also reads reserved linear-mapped System RAM;
+ 	  no-map pages and MMIO remain excluded.
++	  With debug=1, matching ring_pa/ring_pa_size lists capture up to four
++	  exact linear-mapped System RAM ranges twice at postcore, 1 s apart.
++	  Each range is at most 64 KiB. No source reservation or write occurs.
+ 
+ config APPLE_A9_AOP_IIO
+ 	bool "J71t AOP accelerometer IIO consumer"
+diff --git a/drivers/soc/apple/Makefile b/drivers/soc/apple/Makefile
+index 53b135111f..3781bb2d81 100644
+--- a/drivers/soc/apple/Makefile
++++ b/drivers/soc/apple/Makefile
+@@ -2,6 +2,7 @@
+ 
+ obj-$(CONFIG_APPLE_A9_AOP) += apple-a9-aop.o
+ obj-$(CONFIG_APPLE_A9_AOP) += a9-aop-ring-reader.o
++obj-$(CONFIG_APPLE_A9_AOP) += a9-aop-ring-target.o
+ obj-$(CONFIG_APPLE_A9_AOP_IIO) += a9-aop-iio.o
+ obj-$(CONFIG_APPLE_A9_AOP_ACTIVE) += apple-a9-aop-active.o
+ 
+diff --git a/drivers/soc/apple/a9-aop-ring-reader.c b/drivers/soc/apple/a9-aop-ring-reader.c
+index 3dbfb9ed86..08d787d0b8 100644
+--- a/drivers/soc/apple/a9-aop-ring-reader.c
++++ b/drivers/soc/apple/a9-aop-ring-reader.c
+@@ -29,6 +29,7 @@
+ 
+ #include "a9-aop-ring.h"
+ #include "a9-aop-ring-reader.h"
++#include "a9-aop-ring-target.h"
+ #include "a9-aop.h"
+ 
+ #define RR_HITS		16
+@@ -142,6 +143,7 @@ static int rr_scan_page_reason(struct a9_ring_reader *rr, phys_addr_t pa)
+ 		return A9_RR_SKIP_RESOURCE;
+ 	/* Never rediscover our own copied headers as apparent live DMA rings. */
+ 	if (rr_contains_page(rr, sizeof(*rr), pa) ||
++	    a9_aop_ring_pa_own_page(pa) ||
+ 	    rr_contains_page(rr->page, PAGE_SIZE, pa) ||
+ 	    rr_contains_page(rr->snapshot, A9_RR_SIZE, pa) ||
+ 	    rr_contains_page(rr->read_pages, bitmap_size(rr->nr_pages), pa) ||
+@@ -886,7 +888,12 @@ static int early_errno;
+ 
+ static int __init rr_early_init(void)
+ {
+-	if (!apple_a9_aop_ring_scan_early() || !of_machine_is_compatible("apple,j71t"))
++	if (!of_machine_is_compatible("apple,j71t"))
++		return 0;
++	/* Exact PA evidence must precede both the allocator-backed reader and sweep. */
++	if (apple_a9_aop_ring_pa_enabled())
++		a9_aop_ring_pa_capture();
++	if (!apple_a9_aop_ring_scan_early())
+ 		return 0;
+ 	early_rr = rr_alloc();
+ 	if (IS_ERR(early_rr)) {
+@@ -913,6 +920,8 @@ int a9_aop_ring_reader_init(struct device *dev, struct dentry *dir,
+ 	struct a9_ring_reader *rr;
+ 	int ret;
+ 
++	if (apple_a9_aop_ring_pa_enabled())
++		a9_aop_ring_pa_debugfs(dir);
+ 	if (!scan && !iio)
+ 		return 0;
+ 	if (scan && early_rr) {
+diff --git a/drivers/soc/apple/a9-aop-ring-target.c b/drivers/soc/apple/a9-aop-ring-target.c
+new file mode 100644
+index 0000000000..dcdc4c003d
+--- /dev/null
++++ b/drivers/soc/apple/a9-aop-ring-target.c
+@@ -0,0 +1,302 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Frozen, allocation-free postcore capture of explicitly supplied AFK PAs. */
++#include <linux/debugfs.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/ioport.h>
++#include <linux/ktime.h>
++#include <linux/memblock.h>
++#include <linux/memory_hotplug.h>
++#include <linux/mm.h>
++#include <linux/sched/task_stack.h>
++#include <linux/seq_file.h>
++#include <linux/uaccess.h>
++#include <linux/vmalloc.h>
++
++#include "a9-aop-ring.h"
++#include "a9-aop-ring-target.h"
++
++/* BSS avoids allocating snapshot pages over an inherited heap buffer. */
++static struct a9_rt_capture rt_capture;
++
++bool a9_aop_ring_pa_own_page(u64 pa)
++{
++	phys_addr_t start = __pa_symbol(&rt_capture);
++
++	return pa < start + sizeof(rt_capture) && pa + PAGE_SIZE > start;
++}
++
++static bool rt_stack_page(u64 pa)
++{
++	const u8 *stack = task_stack_page(current);
++	struct page *page;
++	unsigned int offset;
++
++	for (offset = 0; offset < THREAD_SIZE; offset += PAGE_SIZE) {
++		page = is_vmalloc_addr(stack + offset) ? vmalloc_to_page(stack + offset) :
++			virt_to_page(stack + offset);
++		if (page && page_to_phys(page) == pa)
++			return true;
++	}
++	return false;
++}
++
++static bool rt_bad_page(u64 pa)
++{
++	unsigned int i;
++
++	for (i = 0; i < rt_capture.bad_count; i++)
++		if (rt_capture.bad_pa[i] == pa)
++			return true;
++	return false;
++}
++
++/* All counters describe metadata, never a new mapping or a source write. */
++static enum a9_rt_reason rt_page_info(struct a9_rt_info *s, u64 pa)
++{
++	unsigned long pfn = PHYS_PFN(pa);
++	bool reserved, system_ram;
++
++	s->pages++;
++	if (!memblock_is_region_memory(pa, PAGE_SIZE))
++		return A9_RT_NOT_RAM;
++	s->ram_pages++;
++	system_ram = region_intersects(pa, PAGE_SIZE, IORESOURCE_SYSTEM_RAM | IORESOURCE_BUSY,
++				       IORES_DESC_NONE) == REGION_INTERSECTS;
++	if (system_ram)
++		s->system_ram_pages++;
++	reserved = memblock_is_region_reserved(pa, PAGE_SIZE);
++	if (!pfn_is_map_memory(pfn)) {
++		s->nomap_pages++;
++		if (reserved)
++			s->reserved_pages++;
++		return A9_RT_NOMAP;
++	}
++	if (!pfn_valid(pfn)) {
++		if (reserved)
++			s->reserved_pages++;
++		return A9_RT_INVALID;
++	}
++	if (reserved || PageReserved(pfn_to_page(pfn)))
++		s->reserved_pages++;
++	if (!virt_addr_valid(phys_to_virt(pa)))
++		return A9_RT_INVALID;
++	s->linear_pages++;
++	if (!system_ram)
++		return A9_RT_NOT_SYSTEM_RAM;
++	if (a9_aop_ring_pa_own_page(pa) || rt_stack_page(pa))
++		return A9_RT_SELF;
++	if (rt_bad_page(pa))
++		return A9_RT_FAULT;
++	return A9_RT_OK;
++}
++
++static int rt_read_chunk(void *data, u8 *dst, u64 pa, size_t size)
++{
++	struct a9_rt_sample *s = data;
++	struct a9_rt_info info = {};
++	u64 page_pa = round_down(pa, PAGE_SIZE);
++	enum a9_rt_reason reason;
++
++	reason = rt_page_info(&info, page_pa);
++	if (reason != A9_RT_OK) {
++		s->info.reason = reason;
++		s->info.refused_pa = page_pa;
++		return -EACCES;
++	}
++	if (copy_from_kernel_nofault(dst, phys_to_virt(pa), size)) {
++		s->info.reason = A9_RT_FAULT;
++		s->info.refused_pa = page_pa;
++		if (rt_capture.bad_count < A9_RT_BAD_MAX)
++			rt_capture.bad_pa[rt_capture.bad_count++] = page_pa;
++		return -EFAULT;
++	}
++	return 0;
++}
++
++static void rt_take(struct a9_rt_target *t, unsigned int sample)
++{
++	struct a9_rt_sample *s = &t->sample[sample];
++	u64 page = round_down(t->request.pa, PAGE_SIZE);
++	u64 last = round_down(t->request.pa + t->request.size - 1, PAGE_SIZE), failed;
++	enum a9_rt_reason reason;
++
++	s->ns = ktime_get_boottime_ns();
++	for (;;) {
++		reason = rt_page_info(&s->info, page);
++		if (reason != A9_RT_OK && s->info.reason == A9_RT_OK) {
++			s->info.reason = reason;
++			s->info.refused_pa = page;
++		}
++		if (page == last)
++			break;
++		page += PAGE_SIZE;
++	}
++	/* Refuse the entire range before reading any byte if any page is unsafe. */
++	if (s->info.reason != A9_RT_OK) {
++		s->error = -EACCES;
++		return;
++	}
++	dma_rmb();
++	s->error = a9_rr_copy_pages(s, s->bytes, t->request.pa, t->request.size,
++				     PAGE_SIZE, &failed, rt_read_chunk);
++}
++
++static void rt_capture_ranges(const struct a9_aop_ring_pa *args, unsigned int count)
++{
++	struct a9_rt_target *t;
++	size_t offset, length;
++	unsigned int i;
++
++	if (!count || count > A9_AOP_RING_PA_MAX) {
++		rt_capture.error = -EINVAL;
++		return;
++	}
++	rt_capture.count = count;
++	get_online_mems();
++	for (i = 0; i < count; i++) {
++		t = &rt_capture.target[i];
++		t->request = args[i];
++		if (!args[i].pa || !args[i].size || args[i].size > A9_RT_SIZE_MAX ||
++		    args[i].size > ~(u64)0 - args[i].pa) {
++			t->error = -ERANGE;
++			continue;
++		}
++		rt_take(t, 0);
++		if (!t->sample[0].error &&
++		    t->sample[0].info.reserved_pages < t->sample[0].info.pages)
++			pr_crit("apple-a9-aop: directed buffer PA 0x%llx includes Linux allocator RAM; inherited AOP DMA may corrupt Linux-owned pages\n",
++				args[i].pa);
++	}
++	msleep(1000);
++	for (i = 0; i < count; i++) {
++		t = &rt_capture.target[i];
++		if (t->error)
++			continue;
++		rt_take(t, 1);
++		if (t->sample[0].error || t->sample[1].error)
++			continue;
++		for (offset = 0; offset < t->request.size; offset++)
++			if (t->sample[0].bytes[offset] != t->sample[1].bytes[offset])
++				t->changed_bytes++;
++		for (offset = 0; offset < t->request.size; offset += A9_RR_ALIGN) {
++			length = min_t(size_t, A9_RR_ALIGN, t->request.size - offset);
++			if (memcmp(t->sample[0].bytes + offset,
++				   t->sample[1].bytes + offset, length))
++				t->changed_lines++;
++		}
++	}
++	put_online_mems();
++}
++
++void a9_aop_ring_pa_capture(void)
++{
++	struct a9_aop_ring_pa args[A9_AOP_RING_PA_MAX];
++	int count;
++
++	if (rt_capture.ran)
++		return;
++	rt_capture.ran = true;
++	count = apple_a9_aop_ring_pa_args(args, ARRAY_SIZE(args));
++	if (count < 0) {
++		rt_capture.error = count;
++		return;
++	}
++	rt_capture_ranges(args, count);
++	pr_info("apple-a9-aop: directed PA capture frozen: ranges=%u errno=%d\n",
++		rt_capture.count, rt_capture.error);
++}
++
++static const char *rt_yes(u32 count, u32 total)
++{
++	return !count ? "no" : count == total ? "yes" : "mixed";
++}
++
++static bool rt_signature(const u8 *bytes, size_t size, size_t offset,
++			 struct a9_rr_header *header)
++{
++	if (offset % A9_RR_ALIGN || offset > size || size - offset < 0x84)
++		return false;
++	return a9_rr_header(bytes + offset, header);
++}
++
++static void rt_dump(struct seq_file *s, const struct a9_rt_target *t, unsigned int sample)
++{
++	const struct a9_rt_sample *v = &t->sample[sample];
++	const struct a9_rt_info *info = &v->info;
++	static const char * const reasons[] = {
++		"none", "not-ram", "no-map", "invalid-linear-map", "not-system-ram",
++		"reader-or-stack", "read-fault-quarantined",
++	};
++	struct a9_rr_header h;
++	size_t offset, length;
++	unsigned int matches = 0;
++
++	seq_printf(s, "sample=%u ns=%llu errno=%d reason=%s refused_pa=0x%016llx pages=%u ram_pages=%u system_ram=%s reserved=%s no_map=%s linear_pages=%u unreserved_ram_pages=%u\n",
++		   sample, v->ns, v->error, reasons[info->reason], info->refused_pa, info->pages,
++		   info->ram_pages,
++		   rt_yes(info->system_ram_pages, info->pages),
++		   rt_yes(info->reserved_pages, info->pages),
++		   rt_yes(info->nomap_pages, info->pages), info->linear_pages,
++		   info->ram_pages - info->reserved_pages);
++	if (v->error) {
++		seq_puts(s, "dump=unavailable partial_data_not_exposed=1\n");
++		return;
++	}
++	seq_printf(s, "signature_at_zero=%s\n", t->request.size < 0x84 ? "unavailable" :
++		   rt_signature(v->bytes, t->request.size, 0, &h) ? "yes" : "no");
++	for (offset = 0; offset + 0x84 <= t->request.size; offset += A9_RR_ALIGN) {
++		if (!rt_signature(v->bytes, t->request.size, offset, &h))
++			continue;
++		matches++;
++		seq_printf(s, "signature offset=0x%zx pa=0x%016llx bufsize=0x%x marker=0x%x rptr=0x%x wptr=0x%x full_ring=%u\n",
++			   offset, t->request.pa + offset, h.bufsize, h.marker, h.rptr, h.wptr,
++			   t->request.size - offset >= A9_RR_SIZE);
++	}
++	seq_printf(s, "signature_matches=%u prefix_bytes=%llu\n", matches,
++		   min_t(u64, 0x100, t->request.size));
++	seq_hex_dump(s, "prefix ", DUMP_PREFIX_OFFSET, 16, 1, v->bytes,
++		     min_t(size_t, 0x100, t->request.size), false);
++	for (offset = 0; offset < t->request.size; offset += A9_RR_ALIGN) {
++		length = min_t(size_t, A9_RR_ALIGN, t->request.size - offset);
++		if (!memchr_inv(v->bytes + offset, 0, length))
++			continue;
++		seq_printf(s, "nonzero64 offset=0x%zx pa=0x%016llx bytes=%zu data=%*phN\n",
++			   offset, t->request.pa + offset, length, (int)length, v->bytes + offset);
++	}
++}
++
++static int rt_show(struct seq_file *s, void *unused)
++{
++	const struct a9_rt_target *t;
++	bool comparable;
++	unsigned int i;
++
++	seq_puts(s, "format=1 phase=postcore-initcall frozen=1 hardware_writes=none mailbox=none cache_coherency=unverified\n");
++	seq_puts(s, "ownership=lockless-current-state historical_allocation=unknown\n");
++	seq_printf(s, "captured=%u config_errno=%d ranges=%u quarantine_pages=%u\n",
++		   rt_capture.ran, rt_capture.ran ? rt_capture.error : -ENODATA,
++		   rt_capture.count, rt_capture.bad_count);
++	for (i = 0; i < rt_capture.count; i++) {
++		t = &rt_capture.target[i];
++		seq_printf(s, "range=%u pa=0x%016llx size=0x%llx errno=%d\n",
++			   i, t->request.pa, t->request.size, t->error);
++		if (t->error)
++			continue;
++		rt_dump(s, t, 0);
++		rt_dump(s, t, 1);
++		comparable = !t->sample[0].error && !t->sample[1].error;
++		seq_printf(s, "changed=%s changed_bytes=%u changed_64b_lines=%u delta_ms=%llu writer=unknown\n",
++			   comparable ? (t->changed_bytes ? "yes" : "no") : "unavailable",
++			   t->changed_bytes, t->changed_lines,
++			   div_u64(t->sample[1].ns - t->sample[0].ns, NSEC_PER_MSEC));
++	}
++	seq_puts(s, "snapshot_end=1\n");
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(rt);
++
++void a9_aop_ring_pa_debugfs(struct dentry *dir)
++{
++	debugfs_create_file("ring_pa", 0400, dir, NULL, &rt_fops);
++}
+diff --git a/drivers/soc/apple/a9-aop-ring-target.h b/drivers/soc/apple/a9-aop-ring-target.h
+new file mode 100644
+index 0000000000..efa564e915
+--- /dev/null
++++ b/drivers/soc/apple/a9-aop-ring-target.h
+@@ -0,0 +1,61 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _A9_AOP_RING_TARGET_H
++#define _A9_AOP_RING_TARGET_H
++
++#include "a9-aop.h"
++
++#define A9_RT_SIZE_MAX 0x10000
++#define A9_RT_BAD_MAX (2 * A9_AOP_RING_PA_MAX)
++
++enum a9_rt_reason {
++	A9_RT_OK,
++	A9_RT_NOT_RAM,
++	A9_RT_NOMAP,
++	A9_RT_INVALID,
++	A9_RT_NOT_SYSTEM_RAM,
++	A9_RT_SELF,
++	A9_RT_FAULT,
++};
++
++struct a9_rt_info {
++	u64 refused_pa;
++	enum a9_rt_reason reason;
++	u32 pages;
++	u32 ram_pages;
++	u32 system_ram_pages;
++	u32 reserved_pages;
++	u32 nomap_pages;
++	u32 linear_pages;
++};
++
++struct a9_rt_sample {
++	u64 ns;
++	int error;
++	struct a9_rt_info info;
++	u8 bytes[A9_RT_SIZE_MAX];
++};
++
++struct a9_rt_target {
++	struct a9_aop_ring_pa request;
++	struct a9_rt_sample sample[2];
++	int error;
++	u32 changed_bytes;
++	u32 changed_lines;
++};
++
++struct a9_rt_capture {
++	bool ran;
++	int error;
++	u32 count;
++	u32 bad_count;
++	u64 bad_pa[A9_RT_BAD_MAX];
++	struct a9_rt_target target[A9_AOP_RING_PA_MAX];
++};
++
++struct dentry;
++
++void a9_aop_ring_pa_capture(void);
++void a9_aop_ring_pa_debugfs(struct dentry *dir);
++bool a9_aop_ring_pa_own_page(u64 pa);
++
++#endif
+diff --git a/drivers/soc/apple/a9-aop.h b/drivers/soc/apple/a9-aop.h
+index 4a0b8c96c5..5548e132f8 100644
+--- a/drivers/soc/apple/a9-aop.h
++++ b/drivers/soc/apple/a9-aop.h
+@@ -4,6 +4,13 @@
+ 
+ #include <linux/types.h>
+ 
++#define A9_AOP_RING_PA_MAX 4
++
++struct a9_aop_ring_pa {
++	u64 pa;
++	u64 size;
++};
++
+ /* Immutable apple_a9_aop.debug value, owned by the passive observer. */
+ bool apple_a9_aop_debug(void);
+ 
+@@ -17,4 +24,7 @@ bool apple_a9_aop_ring_scan_early(void);
+ 
+ bool apple_a9_aop_ring_scan_reserved(void);
+ 
++bool apple_a9_aop_ring_pa_enabled(void);
++int apple_a9_aop_ring_pa_args(struct a9_aop_ring_pa *args, unsigned int max);
++
+ #endif
+diff --git a/drivers/soc/apple/apple-a9-aop.c b/drivers/soc/apple/apple-a9-aop.c
+index 29b69d428d..ec858db501 100644
+--- a/drivers/soc/apple/apple-a9-aop.c
++++ b/drivers/soc/apple/apple-a9-aop.c
+@@ -33,13 +33,21 @@ MODULE_PARM_DESC(ring_scan_early, "Capture ring_scan at postcore initcall, befor
+ static bool ring_scan_reserved;
+ module_param(ring_scan_reserved, bool, 0400);
+ MODULE_PARM_DESC(ring_scan_reserved, "Also read reserved linear-mapped System RAM in E1 (requires debug=1 ring_scan=1)");
++static unsigned long long ring_pa[A9_AOP_RING_PA_MAX];
++static unsigned int ring_pa_nr;
++module_param_array(ring_pa, ullong, &ring_pa_nr, 0400);
++MODULE_PARM_DESC(ring_pa, "Up to four comma-separated AFK buffer PAs; capture at postcore with debug=1");
++static unsigned long long ring_pa_size[A9_AOP_RING_PA_MAX];
++static unsigned int ring_pa_size_nr;
++module_param_array(ring_pa_size, ullong, &ring_pa_size_nr, 0400);
++MODULE_PARM_DESC(ring_pa_size, "Matching comma-separated byte sizes for ring_pa, each 1..65536");
+ static bool ring_iio;
+ module_param(ring_iio, bool, 0400);
+ MODULE_PARM_DESC(ring_iio, "Read accel from early DT-reserved inherited ring, no traffic (default off)");
+ 
+ bool apple_a9_aop_ring_mode(void)
+ {
+-	return ring_scan || ring_iio;
++	return ring_scan || ring_iio || ring_pa_nr || ring_pa_size_nr;
+ }
+ 
+ bool apple_a9_aop_ring_scan_early(void)
+@@ -52,6 +60,24 @@ bool apple_a9_aop_ring_scan_reserved(void)
+ 	return debug && ring_scan && ring_scan_reserved;
+ }
+ 
++bool apple_a9_aop_ring_pa_enabled(void)
++{
++	return debug && (ring_pa_nr || ring_pa_size_nr);
++}
++
++int apple_a9_aop_ring_pa_args(struct a9_aop_ring_pa *args, unsigned int max)
++{
++	unsigned int i;
++
++	if (!ring_pa_nr || ring_pa_nr != ring_pa_size_nr || ring_pa_nr > max)
++		return -EINVAL;
++	for (i = 0; i < ring_pa_nr; i++) {
++		args[i].pa = ring_pa[i];
++		args[i].size = ring_pa_size[i];
++	}
++	return ring_pa_nr;
++}
++
+ /* Lets the active driver gate its debugfs on the same immutable parameter. */
+ bool apple_a9_aop_debug(void)
+ {

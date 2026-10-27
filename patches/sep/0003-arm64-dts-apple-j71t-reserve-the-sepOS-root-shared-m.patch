@@ -1,0 +1,56 @@
+From 759c7ffcd40be7166b1486dad70ef06e4aaa1002 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Mon, 26 Oct 2026 12:12:18 +0000
+Subject: [PATCH 3/3] arm64: dts: apple: j71t: reserve the sepOS root
+ shared-memory page
+
+pongoOS booted sepOS on 2026-10-26 with op 6 and handed it a one-page
+root shared-memory buffer on endpoint 0xfe at PA 0x87adb0000. XNU keeps
+its equivalent buffer for the lifetime of the system, so sepOS may read
+or write that page at any time. It lies inside the System RAM range
+m1n1 gives Linux (0x800000000-0x87b7fffff) and nothing reserved it; it
+only escaped reuse because the crashkernel=256M reservation happened to
+land on 0x86b800000-0x87b7fffff.
+
+Mark it no-map. 16 KiB covers the 4 KiB buffer with this kernel's page
+size. No label, so the node gets no phandle and the warm-kexec FDT merge
+has nothing to renumber.
+
+The address is a runtime value of that pongoOS session: if sepOS is
+booted again, read the "root shmem ... data=" line of the pongoOS log and
+update this node. The durable fix is for pongoOS/m1n1 to publish it.
+
+The SEPFW staging region (0x804f48000, 0x344000 bytes) is deliberately not
+reserved: XNU releases it (ml_static_mfree, and removes SEPFW from
+/chosen/memory-map) as soon as sepOS reports alive, so SEPROM does not
+need it after the op 6 load.
+---
+ arch/arm64/boot/dts/apple/s8003-j71t.dts | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/apple/s8003-j71t.dts b/arch/arm64/boot/dts/apple/s8003-j71t.dts
+index 274e41c1da..5c1d45752e 100644
+--- a/arch/arm64/boot/dts/apple/s8003-j71t.dts
++++ b/arch/arm64/boot/dts/apple/s8003-j71t.dts
+@@ -27,6 +27,18 @@ nvme_hmb: nvme-hmb@0 {
+ 			reg = <0 0 0 0>; /* To be filled by loader */
+ 			no-map;
+ 		};
++
++		/*
++		 * sepOS root shared-memory page, handed over by pongoOS with
++		 * op 6 on endpoint 0xfe (2026-10-26 boot: data=87adb0). sepOS
++		 * may use it for the rest of its life. The address belongs to
++		 * that pongoOS session: after a new sepOS boot, take it from
++		 * the "root shmem ... data=" line of the pongoOS log.
++		 */
++		sep-shmem@87adb0000 {
++			reg = <0x8 0x7adb0000 0x0 0x4000>;
++			no-map;
++		};
+ 	};
+ };
+ 
+-- 
+2.56.0
+

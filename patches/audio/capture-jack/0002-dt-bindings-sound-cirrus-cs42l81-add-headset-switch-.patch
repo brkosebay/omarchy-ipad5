@@ -1,0 +1,61 @@
+From 9b03d9f8fb62489b965e527a84c029962c36fd58 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 02:36:18 +0000
+Subject: [PATCH 2/5] dt-bindings: sound: cirrus,cs42l81: add headset switch
+ GPIOs
+
+Apple's ADT gives the codec node two lines for the external headset
+switch, function-ext_sw1/ext_sw2 (AP GPIO 68 and 66 on J71t). Their
+direction is not known yet. Describe them as hs-switch-gpios; the
+driver only reads them. Also name the pins machine drivers route:
+SPKOUT, HPOUT, DMIC1A and DMIC1B.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ .../bindings/sound/cirrus,cs42l81.yaml           | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/sound/cirrus,cs42l81.yaml b/Documentation/devicetree/bindings/sound/cirrus,cs42l81.yaml
+index a496011d54..47c1fd4f7d 100644
+--- a/Documentation/devicetree/bindings/sound/cirrus,cs42l81.yaml
++++ b/Documentation/devicetree/bindings/sound/cirrus,cs42l81.yaml
+@@ -10,8 +10,11 @@ maintainers:
+   - linux-a9 <linux-a9@localhost>
+ 
+ description:
+-  Apple-specific Cirrus Logic codec with integrated speaker drivers, used on
+-  the A9 iPad 5. Controlled over SPI with a 5-byte paged register protocol.
++  Apple-specific Cirrus Logic codec with integrated speaker drivers, a
++  headphone driver and digital microphone inputs, used on the A9 iPad 5.
++  Controlled over SPI with a 5-byte paged register protocol. The codec DAI
++  has outputs SPKOUT and HPOUT and DMIC inputs DMIC1A and DMIC1B for
++  machine routing.
+ 
+ allOf:
+   - $ref: dai-common.yaml#
+@@ -34,6 +37,13 @@ properties:
+     maxItems: 1
+     description: Speaker mute line, asserted while the speakers are muted.
+ 
++  hs-switch-gpios:
++    maxItems: 2
++    description:
++      The two control lines of the external headset switch (Apple
++      function-ext_sw1, function-ext_sw2). Their direction is not known;
++      the driver only reads them.
++
+   apple,max-speaker-gain-db-q8:
+     $ref: /schemas/types.yaml#/definitions/int32
+     description: Maximum speaker gain in 1/256 dB (ADT spkr-gain-db).
+@@ -68,6 +78,8 @@ examples:
+         clocks = <&mca0>;
+         clock-names = "mclk";
+         mute-gpios = <&pinctrl_ap 64 GPIO_ACTIVE_LOW>;
++        hs-switch-gpios = <&pinctrl_ap 68 GPIO_ACTIVE_HIGH>,
++                          <&pinctrl_ap 66 GPIO_ACTIVE_HIGH>;
+         #sound-dai-cells = <0>;
+       };
+     };
+-- 
+2.56.0
+

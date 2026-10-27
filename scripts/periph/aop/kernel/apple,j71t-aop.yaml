@@ -1,0 +1,83 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,j71t-aop.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple J71t always-on processor (AOP), experimental active driver
+
+maintainers:
+  - Berkay Kosebay <brkosebay@users.noreply.github.com>
+
+description: |
+  A7IOPV2 coprocessor running RTBuddy firmware with SPU/AFK services
+  (accelerometer, gyro, compass, pressure). Experimental and board specific;
+  the driver also requires the apple_a9_aop.active=1 boot parameter. The
+  PMGR domains are only observed: the AOP domain is always-on and holds its
+  parents, so no power-domains consumer is described.
+
+properties:
+  compatible:
+    const: apple,j71t-aop
+
+  reg:
+    items:
+      - description: IOP wrapper (CPU control, remap, mailbox)
+      - description: AOP target memory region (ADT region-base/region-size)
+      - description: Auto-boot control register
+
+  reg-names:
+    items:
+      - const: wrapper
+      - const: region
+      - const: auto-boot
+
+  interrupts:
+    items:
+      - description: Outbox not empty (IOP to AP)
+      - description: Inbox space (AP to IOP)
+
+  interrupt-names:
+    items:
+      - const: rx
+      - const: tx
+
+  apple,observe-domains:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    minItems: 5
+    maxItems: 5
+    description: |
+      PMGR nodes AOP_GPIO, AOP, AOP_BUSIF, AOP_CPU, AOP_FILTER. Checked
+      to be on before any access; never attached as power-domains.
+
+  apple,aop-target:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: ADT iop-aop-nub aop-target, written to the firmware AOPt tag.
+
+  apple,chip-id:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: SoC chip id (/chosen chip-id), written to the SOC_ tag.
+
+  apple,chip-revision:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: SoC revision (/arm-io chip-revision), written to the SOCR tag.
+
+  mount-matrix:
+    description: Residual screen matrix after the firmware applied ARot.
+
+  memory-region:
+    maxItems: 1
+    description: Dedicated non-reusable no-map AFK pool for attach_stage=3.
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - interrupts
+  - interrupt-names
+  - apple,observe-domains
+  - apple,aop-target
+  - apple,chip-id
+  - apple,chip-revision
+
+additionalProperties: false

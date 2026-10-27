@@ -1,0 +1,671 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 23:43:35 +0000
+Subject: [PATCH] PCI: apple-h9p: recover stuck A9 links with a bounded
+ training ladder
+
+Preserve the round-8e port-down contract and ordinary bring-up. Sample
+LINKSTS and the separate named LTSSM field every 20 ms within the existing
+500 ms link deadline, including root-port controls and PHY state.
+
+After the existing retry, try standard RL retraining, Gen1 lane init,
+three long-off port cycles, and a guarded pre-scan PHY/common replay.
+Keep recovered Gen1 links below the generic speed-up quirk. Log why
+actual genpd power-off cannot be certified with DART consumers and the
+warm keep-on policy; never claim an unavailable S3E rail/CPU reset.
+
+Expose an explicit rescue retry only for a port which never enumerated.
+Rebuild NVMMU before rescanning and close the gate before publication.
+Preserve bus-to-DART RIDs when ANS was initially absent. Rescue never
+replays shared PHY state under enumerated Wi-Fi or a live NVMe root.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ drivers/pci/controller/pcie-apple-h9p.c | 492 ++++++++++++++++++++++--
+ 1 file changed, 470 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/pci/controller/pcie-apple-h9p.c b/drivers/pci/controller/pcie-apple-h9p.c
+index adf44a100b..f3e3f5724e 100644
+--- a/drivers/pci/controller/pcie-apple-h9p.c
++++ b/drivers/pci/controller/pcie-apple-h9p.c
+@@ -25,6 +25,7 @@
+ #include <linux/io.h>
+ #include <linux/iopoll.h>
+ #include <linux/kernel.h>
++#include <linux/ktime.h>
+ #include <linux/mm.h>
+ #include <linux/module.h>
+ #include <linux/kexec.h>
+@@ -428,6 +429,13 @@ struct apple_h9p_pcie {
+ 	struct apple_h9p_nvmmu nvmmu;
+ 	enum apple_ans_boot_mode ans_mode;
+ 	bool ans_boot_retry_used;
++	bool ans_deep_recovery;
++	bool ans_gen1;
++	bool ans_pre_enumeration;
++	u16 link_cap[H9P_NUM_PORTS];
++	bool ans_rescue_allowed;
++	unsigned int ans_rescue_attempts;
++	int ans_rescue_result;
+ 
+ 	struct device **pd_dev;
+ 	struct device_link **pd_link;
+@@ -545,6 +553,30 @@ static struct apple_h9p_pcie *apple_h9p_pcie_lookup(struct device *dev)
+ 	return bridge ? pci_host_bridge_priv(bridge) : NULL;
+ }
+ 
++/* Keep the generic failed-link quirk from undoing a successful Gen1
++ * recovery. supported_speeds is initialized before HEADER fixups; scope
++ * this software ceiling to our recovered port 0, without falsifying ECAM.
++ */
++static void apple_h9p_ans_gen1_fixup(struct pci_dev *dev)
++{
++	struct pci_host_bridge *bridge;
++	struct apple_h9p_pcie *pcie;
++	struct device *parent;
++
++	if (!pci_is_root_bus(dev->bus) || dev->devfn != PCI_DEVFN(0, 0))
++		return;
++	bridge = pci_find_host_bridge(dev->bus);
++	parent = bridge->dev.parent;
++	if (!parent || !of_device_is_compatible(parent->of_node, "apple,s8003-pcie"))
++		return;
++	pcie = apple_h9p_pcie_lookup(parent);
++	if (pcie && pcie->ans_gen1) {
++		dev->supported_speeds = PCI_EXP_LNKCAP2_SLS_2_5GB;
++		pci_info(dev, "Apple ANS: STEP port 0 Gen1 recovery ceiling retained\n");
++	}
++}
++DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_APPLE, PCI_ANY_ID, apple_h9p_ans_gen1_fixup);
++
+ /* The root port that a bus below the root bus hangs off */
+ static unsigned int apple_h9p_pcie_bus_port(struct pci_bus *bus)
+ {
+@@ -1742,12 +1774,32 @@ static int apple_s8003_port_power_on(struct apple_h9p_pcie *pcie,
+ 	return 0;
+ }
+ 
++/* iOS name table at kernelcache 0xfffffff007a60538, not LINKSTS values. */
++static const char *apple_s8003_ltssm_name(u32 state)
++{
++	static const char * const names[] = {
++		"DETECT_QUIET", "DETECT_ACT", "POLL_ACTIVE", "POLL_COMPLIANCE",
++		"POLL_CONFIG", "PRE_DETECT_QUIET", "DETECT_WAIT", "CFG_LINKWD_START",
++		"CFG_LINKWD_ACEPT", "CFG_LANENUM_WAIT", "CFG_LANENUM_ACEPT",
++		"CFG_COMPLETE", "CFG_IDLE", "RCVRY_LOCK", "RCVRY_SPEED",
++		"RCVRY_RCVRCFG", "RCVRY_IDLE", "L0", "L0S", "L123_SEND_EIDLE",
++		"L1_IDLE", "L2_IDLE", "L2_WAKE", "DISABLED_ENTRY", "DISABLED_IDLE",
++		"DISABLED", "LPBK_ENTRY", "LPBK_ACTIVE", "LPBK_EXIT", "LPBK_EXIT_TIMEOUT",
++		"HOT_RESET_ENTRY", "HOT_RESET", "RCVRY_EQ0", "RCVRY_EQ1",
++		"RCVRY_EQ2", "RCVRY_EQ3",
++	};
++
++	return state < ARRAY_SIZE(names) ? names[state] : "UNKNOWN";
++}
++
+ /* Only while the port registers are powered; never read an endpoint BAR. */
+ static void apple_s8003_port_dump(struct apple_h9p_pcie *pcie,
+ 				  unsigned int port, const char *when)
+ {
+ 	void __iomem *rc = pcie->base_rc;
+ 	void __iomem *pb = pcie->base_port[port];
++	u32 link = readl(pb + S8003_PORT_LINKSTS);
++	u32 cdm = readl(pb + S8003_PORT_LINKCDMSTS);
+ 
+ 	dev_info(pcie->dev,
+ 		 "port %u %s: PERST %d ctl %#x pwr %#x refclk %#x ready %#x; LTSSMCTL %#x PME %#x link %#x LTSSM %#lx lanes %#x\n",
+@@ -1757,10 +1809,30 @@ static void apple_s8003_port_dump(struct apple_h9p_pcie *pcie,
+ 		 readl(rc + S8003_RC_PORT_REFCLK(port)),
+ 		 readl(rc + S8003_RC_PORT_READY(port)),
+ 		 readl(pb + H9P_PORT_LTSSMCTL), readl(pb + S8003_PORT_PMETO),
+-		 readl(pb + S8003_PORT_LINKSTS),
++		 link,
+ 		 FIELD_GET(S8003_PORT_LINKCDMSTS_LTSSM,
+-			   readl(pb + S8003_PORT_LINKCDMSTS)),
++			   cdm),
+ 		 readl(pcie->base_phy + H9P_PHY_PORTMASK));
++	dev_info(pcie->dev,
++		 "Apple ANS: STEP port %u capture %s LINKSTS=%#x CDM=%#x LTSSM=%#lx/%s IRQ=%#x/%#x PMGR=%#x PHY=%#x RC2c=%#x\n",
++		 port, when, link,
++		 cdm,
++		 FIELD_GET(S8003_PORT_LINKCDMSTS_LTSSM, cdm),
++		 apple_s8003_ltssm_name(FIELD_GET(S8003_PORT_LINKCDMSTS_LTSSM, cdm)),
++		 readl(pb + H9P_PORT_IRQSTAT), readl(pb + H9P_PORT_IRQMASK),
++		 readl(pb + S8003_PORT_LINKPMGRSTS),
++		 readl(pcie->base_phy + H9P_PHY_PORTMASK),
++		 readl(pcie->base_rc + S8003_RC_STAT));
++	if (pcie->link_cap[port]) {
++		void __iomem *cfg = pcie->base_config + port * H9P_CFG_PORT_STRIDE;
++		u16 cap = pcie->link_cap[port];
++
++		dev_info(pcie->dev,
++			 "Apple ANS: STEP port %u root-capture LNKCTL=%#x LNKCTL2=%#x LNKCAP2=%#x cfgA0=%#x cfg670=%#x cfg76c=%#x\n",
++			 port, readw(cfg + cap + PCI_EXP_LNKCTL),
++			 readw(cfg + cap + PCI_EXP_LNKCTL2), readl(cfg + cap + PCI_EXP_LNKCAP2),
++			 readw(cfg + 0xa0), readl(cfg + 0x670), readl(cfg + 0x76c));
++	}
+ }
+ 
+ /* Stop the retained LTSSM before changing clocks or releasing PERST#. */
+@@ -1937,16 +2009,34 @@ static int apple_s8003_setup_port_round7(struct apple_h9p_pcie *pcie,
+  * host-side, with the register block powered, and log before every phase.
+  * A returning failure drops the port; the early-USB initramfs reaches rescue.
+  */
++/* Keep the 100 us link poll and its original deadline; sample every 20 ms.
++ * Called only by LINKSTS waits after power/ready and capability setup.
++ */
++static bool apple_s8003_link_sample(struct apple_h9p_pcie *pcie,
++				    unsigned int port, u64 *next)
++{
++	u64 now = ktime_get_ns();
++
++	if (now >= *next) {
++		apple_s8003_port_dump(pcie, port, "training-sample");
++		*next = now + 20000000;
++	}
++	return true;
++}
++
+ static int apple_s8003_port_wait(struct apple_h9p_pcie *pcie, unsigned int port,
+ 				 void __iomem *addr, u32 mask, u32 expected,
+ 				 unsigned int timeout_us, const char *step)
+ {
+ 	u32 val;
++	u64 next = 0;
++	bool link = addr == pcie->base_port[port] + S8003_PORT_LINKSTS;
+ 	int ret;
+ 
+ 	dev_info(pcie->dev, "Apple ANS: STEP port %u %s wait timeout_us=%u\n",
+ 		 port, step, timeout_us);
+-	ret = readl_poll_timeout(addr, val, (val & mask) == expected,
++	ret = readl_poll_timeout(addr, val, (!link || apple_s8003_link_sample(pcie, port, &next)) &&
++				 (val & mask) == expected,
+ 				 100, timeout_us);
+ 	if (ret)
+ 		dev_err(pcie->dev, "Apple ANS: STEP port %u %s FAIL %d last=%#x mask=%#x expected=%#x\n",
+@@ -1957,6 +2047,56 @@ static int apple_s8003_port_wait(struct apple_h9p_pcie *pcie, unsigned int port,
+ 	return ret;
+ }
+ 
++static int apple_s8003_link_finish(struct apple_h9p_pcie *pcie,
++				   unsigned int port, unsigned int timeout_us)
++{
++	void __iomem *pb = pcie->base_port[port];
++	struct device *dev = pcie->dev;
++	u32 val;
++	int ret, sample;
++
++	ret = apple_s8003_port_wait(pcie, port, pb + S8003_PORT_LINKSTS,
++				    S8003_PORT_LINKSTS_UP, S8003_PORT_LINKSTS_UP,
++				    timeout_us, "link-up");
++	if (ret) {
++		apple_s8003_port_dump(pcie, port, "link-up-failed");
++		return ret;
++	}
++	ret = apple_s8003_port_wait(pcie, port, pb + S8003_PORT_LINKCDMSTS,
++				    S8003_PORT_LINKCDMSTS_LTSSM,
++				    S8003_LTSSM_L0 << 9, 100000, "link-L0");
++	if (ret) {
++		apple_s8003_port_dump(pcie, port, "link-L0-failed");
++		return ret;
++	}
++	dev_info(dev, "Apple ANS: STEP port %u link-up-confirm\n", port);
++	if (!(readl(pb + S8003_PORT_LINKSTS) & S8003_PORT_LINKSTS_UP)) {
++		apple_s8003_port_dump(pcie, port, "link-confirm-failed");
++		return dev_err_probe(dev, -ENOLINK, "STEP port %u link lost after L0\n", port);
++	}
++	if (!port && pcie->ans_deep_recovery) {
++		/* One transient UP/L0 sample cannot authorize config/BAR traffic. */
++		dev_info(dev, "Apple ANS: STEP port 0 deep-stable wait-100ms\n");
++		for (sample = 0; sample < 100; sample++) {
++			usleep_range(1000, 1100);
++			val = readl(pb + S8003_PORT_LINKCDMSTS);
++			if (!(readl(pb + S8003_PORT_LINKSTS) & S8003_PORT_LINKSTS_UP) ||
++			    FIELD_GET(S8003_PORT_LINKCDMSTS_LTSSM, val) != S8003_LTSSM_L0) {
++				apple_s8003_port_dump(pcie, port, "deep-stable-failed");
++				return dev_err_probe(dev, -ENOLINK,
++						     "STEP port 0 deep-stable FAIL sample=%d\n",
++						     sample);
++			}
++		}
++		dev_info(dev, "Apple ANS: STEP port 0 deep-stable done\n");
++	}
++	val = readl(pb + S8003_PORT_LINKCDMSTS);
++	dev_info(dev, "Apple ANS: STEP port %u full-bringup-done\n", port);
++	dev_info(dev, "port %u: link up (LTSSM %#lx)\n", port,
++		 FIELD_GET(S8003_PORT_LINKCDMSTS_LTSSM, val));
++	return 0;
++}
++
+ static int apple_s8003_setup_port_full(struct apple_h9p_pcie *pcie,
+ 				       unsigned int port)
+ {
+@@ -1964,7 +2104,8 @@ static int apple_s8003_setup_port_full(struct apple_h9p_pcie *pcie,
+ 	void __iomem *pb = pcie->base_port[port];
+ 	struct device *dev = pcie->dev;
+ 	u32 lanes = apple_s8003_lane_mask(pcie, port);
+-	u32 speed = pcie->max_speed[port];
++	u32 speed = !port && pcie->ans_deep_recovery ?
++		H9P_LINK_SPEED_2_5GT : pcie->max_speed[port];
+ 	u16 lnkcap2_speeds;
+ 	u64 cap;
+ 	u32 val;
+@@ -2044,6 +2185,7 @@ static int apple_s8003_setup_port_full(struct apple_h9p_pcie *pcie,
+ 		return dev_err_probe(dev, -ENODEV,
+ 				     "port %u root port has no PCIe capability\n",
+ 				     port);
++	pcie->link_cap[port] = cap;
+ 	/* Clamp to LNKCAP2 like iOS setMaximumLinkSpeed */
+ 	dev_info(dev, "Apple ANS: STEP port %u link-speed-config\n", port);
+ 	lnkcap2_speeds = (readl(pcie->base_config + port * H9P_CFG_PORT_STRIDE +
+@@ -2090,6 +2232,18 @@ static int apple_s8003_setup_port_full(struct apple_h9p_pcie *pcie,
+ 	dev_info(dev, "Apple ANS: STEP port %u msi-vector-base\n", port);
+ 	writel(port * 0x10001 * H9P_MSI_PER_PORT, pb + H9P_PORT_MSIVECBASE);
+ 
++	/* Tunables may include link controls. Enforce the recovery speed LAST. */
++	if (!port && pcie->ans_deep_recovery) {
++		h9p_rmww(pcie->base_config + cap + PCI_EXP_LNKCTL2,
++			 PCI_EXP_LNKCTL2_TLS | PCI_EXP_LNKCTL2_ENTER_COMP,
++			 H9P_LINK_SPEED_2_5GT);
++		val = readw(pcie->base_config + cap + PCI_EXP_LNKCTL2);
++		dev_info(dev, "Apple ANS: STEP port 0 deep-Gen1 LNKCTL2=%#x lanes=%#x\n",
++			 val, lanes);
++		if ((val & PCI_EXP_LNKCTL2_TLS) != H9P_LINK_SPEED_2_5GT)
++			return -EIO;
++	}
++
+ 	/* Clock is stable and reset is held even when GPIO ownership survived. */
+ 	dev_info(dev, "Apple ANS: STEP port %u perst-hold-100ms\n", port);
+ 	msleep(S8003_PORT_RESET_MS);
+@@ -2112,24 +2266,7 @@ static int apple_s8003_setup_port_full(struct apple_h9p_pcie *pcie,
+ 	dev_info(dev, "Apple ANS: STEP port %u ltssm-start\n", port);
+ 	h9p_rmw(pb + H9P_PORT_LTSSMCTL, 0, H9P_PORT_LTSSM_ENABLE);
+ 
+-	ret = apple_s8003_port_wait(pcie, port, pb + S8003_PORT_LINKSTS,
+-				    S8003_PORT_LINKSTS_UP, S8003_PORT_LINKSTS_UP,
+-				    500000, "link-up");
+-	if (ret)
+-		return ret;
+-	ret = apple_s8003_port_wait(pcie, port, pb + S8003_PORT_LINKCDMSTS,
+-				    S8003_PORT_LINKCDMSTS_LTSSM,
+-				    S8003_LTSSM_L0 << 9, 100000, "link-L0");
+-	if (ret)
+-		return ret;
+-	dev_info(dev, "Apple ANS: STEP port %u link-up-confirm\n", port);
+-	if (!(readl(pb + S8003_PORT_LINKSTS) & S8003_PORT_LINKSTS_UP))
+-		return dev_err_probe(dev, -ENOLINK, "STEP port %u link lost after L0\n", port);
+-	val = readl(pb + S8003_PORT_LINKCDMSTS);
+-	dev_info(dev, "Apple ANS: STEP port %u full-bringup-done\n", port);
+-	dev_info(dev, "port %u: link up (LTSSM %#lx)\n", port,
+-		 FIELD_GET(S8003_PORT_LINKCDMSTS_LTSSM, val));
+-	return 0;
++	return apple_s8003_link_finish(pcie, port, 500000);
+ }
+ 
+ static int apple_s8003_setup_port_once(struct apple_h9p_pcie *pcie,
+@@ -2200,6 +2337,194 @@ static int apple_s8003_setup_port(struct apple_h9p_pcie *pcie, unsigned int port
+ 	return ret;
+ }
+ 
++/* A9 has an external PCIe S3E, not an AP-visible ANS2/RTKit CPU.
++ * No ps_ans or endpoint PWREN exists in this DT. This resets only the
++ * port/endpoint PCIe interface: do not claim it removes the S3E NAND rail.
++ * PERST stays asserted throughout a 1 s refclk/port-off hold. Only port 0
++ * changes; shared RC/PHY/PMGR and Wi-Fi state must survive.
++ */
++static int apple_s8003_deep_cycle(struct apple_h9p_pcie *pcie)
++{
++	void __iomem *rc = pcie->base_rc;
++	u32 ctl, pwr, reset;
++	int ret;
++
++	WRITE_ONCE(pcie->down_ports, pcie->down_ports | BIT(0));
++	dev_warn(pcie->dev, "Apple ANS: STEP port 0 deep-recovery begin; S3E rail/firmware reset unavailable\n");
++	ret = gpiod_direction_output(pcie->perst[0], 1);
++	if (ret)
++		return ret;
++	if ((readl(rc + S8003_RC_PORT_CTL(0)) & S8003_RC_PORT_CTL_ENABLE) &&
++	    (readl(rc + S8003_RC_PORT_PWR(0)) & S8003_RC_PORT_PWR_ON)) {
++		apple_s8003_port_dump(pcie, 0, "deep-before-stop");
++		apple_s8003_port_stop(pcie, 0);
++		ret = apple_s8003_port_wait(pcie, 0,
++					    pcie->base_port[0] + H9P_PORT_LTSSMCTL,
++					    H9P_PORT_LTSSM_ENABLE, 0, 250000,
++					    "deep-stop");
++		if (ret)
++			return ret;
++	}
++	apple_s8003_port_off(pcie, 0);
++	ctl = readl(rc + S8003_RC_PORT_CTL(0));
++	pwr = readl(rc + S8003_RC_PORT_PWR(0));
++	reset = readl(rc + S8003_RC_PORT_REFCLK(0));
++	dev_info(pcie->dev, "Apple ANS: STEP port 0 deep-off RC124=%#x RC114=%#x RC100=%#x hold-1000ms\n",
++		 reset, pwr, ctl);
++	if ((ctl | pwr | reset) & BIT(0))
++		return -EIO;
++	msleep(1000);
++	pcie->ans_deep_recovery = true;
++	ret = apple_s8003_setup_port_full(pcie, 0);
++	pcie->ans_deep_recovery = false;
++	if (ret) {
++		gpiod_direction_output(pcie->perst[0], 1);
++		if ((readl(rc + S8003_RC_PORT_CTL(0)) & S8003_RC_PORT_CTL_ENABLE) &&
++		    (readl(rc + S8003_RC_PORT_PWR(0)) & S8003_RC_PORT_PWR_ON) &&
++		    (readl(rc + S8003_RC_PORT_READY(0)) & BIT(0))) {
++			apple_s8003_port_stop(pcie, 0);
++			if (apple_s8003_port_wait(pcie, 0,
++						  pcie->base_port[0] + H9P_PORT_LTSSMCTL,
++						  H9P_PORT_LTSSM_ENABLE, 0, 250000,
++						  "deep-failed-stop"))
++				return ret;
++		}
++		/* No powered-off port or endpoint readback. */
++		apple_s8003_port_off(pcie, 0);
++		dev_err(pcie->dev, "Apple ANS: STEP port 0 deep-recovery FAIL %d; PERST asserted, port off\n",
++			ret);
++	} else {
++		pcie->max_speed[0] = H9P_LINK_SPEED_2_5GT;
++		pcie->ans_gen1 = true;
++		dev_info(pcie->dev, "Apple ANS: STEP port 0 deep-recovery done; Gen1 retained\n");
++	}
++	return ret;
++}
++
++/* No power toggle: restart LTSSM, optionally re-run lane init at Gen1,
++ * then issue the standard RW1S LNKCTL.RL trigger. Never poll RL for one.
++ */
++static int apple_s8003_retrain(struct apple_h9p_pcie *pcie, bool gen1)
++{
++	void __iomem *pb = pcie->base_port[0];
++	void __iomem *rc = pcie->base_rc;
++	u16 cap = pcie->link_cap[0];
++	u32 state;
++	int ret;
++
++	if (!cap || gpiod_get_value_cansleep(pcie->perst[0]) ||
++	    !(readl(rc + S8003_RC_PORT_CTL(0)) & BIT(0)) ||
++	    !(readl(rc + S8003_RC_PORT_PWR(0)) & BIT(0)) ||
++	    !(readl(rc + S8003_RC_PORT_READY(0)) & BIT(0)))
++		return -ENOLINK;
++	state = FIELD_GET(S8003_PORT_LINKCDMSTS_LTSSM,
++			  readl(pb + S8003_PORT_LINKCDMSTS));
++	if (state >= 0x17 && state <= 0x19) {
++		dev_info(pcie->dev, "Apple ANS: STEP port 0 retrain SKIP disabled LTSSM=%#x\n",
++			 state);
++		return -ENOLINK;
++	}
++	dev_info(pcie->dev, "Apple ANS: STEP port 0 retrain-%s begin\n", gen1 ? "Gen1" : "current");
++	apple_s8003_port_dump(pcie, 0, "before-retrain");
++	apple_s8003_port_stop(pcie, 0);
++	ret = apple_s8003_port_wait(pcie, 0, pb + H9P_PORT_LTSSMCTL,
++				    H9P_PORT_LTSSM_ENABLE, 0, 20000, "retrain-stop");
++	if (ret)
++		return ret;
++	if (gen1) {
++		h9p_rmww(pcie->base_config + cap + PCI_EXP_LNKCTL2,
++			 PCI_EXP_LNKCTL2_TLS | PCI_EXP_LNKCTL2_ENTER_COMP,
++			 H9P_LINK_SPEED_2_5GT);
++		apple_s8003_phy_ip_init(pcie, 0, apple_s8003_lane_mask(pcie, 0),
++					H9P_LINK_SPEED_2_5GT);
++	}
++	h9p_rmw(pb + H9P_PORT_LTSSMCTL, 0, H9P_PORT_LTSSM_ENABLE);
++	h9p_rmww(pcie->base_config + cap + PCI_EXP_LNKCTL,
++		 PCI_EXP_LNKCTL_LD, PCI_EXP_LNKCTL_RL);
++	pcie->ans_deep_recovery = true;
++	ret = apple_s8003_link_finish(pcie, 0, 100000);
++	pcie->ans_deep_recovery = false;
++	if (!ret && gen1) {
++		pcie->ans_gen1 = true;
++		pcie->max_speed[0] = H9P_LINK_SPEED_2_5GT;
++	}
++	return ret;
++}
++
++static int apple_s8003_replay_phy(struct apple_h9p_pcie *pcie)
++{
++	void __iomem *rc = pcie->base_rc;
++	unsigned int port;
++	int ret;
++
++	if (!pcie->ans_pre_enumeration ||
++	    ((readl(rc + S8003_RC_PORT_CTL(0)) |
++	      readl(rc + S8003_RC_PORT_PWR(0)) |
++	      readl(rc + S8003_RC_PORT_REFCLK(0))) & BIT(0)))
++		return -EBUSY;
++	for (port = 0; port < H9P_NUM_PORTS; port++) {
++		if (!pcie->perst[port])
++			continue;
++		if (gpiod_get_value_cansleep(pcie->perst[port]) != 1)
++			return -EBUSY;
++		if (!(readl(rc + S8003_RC_PORT_CTL(port)) & BIT(0)) ||
++		    !(readl(rc + S8003_RC_PORT_PWR(port)) & BIT(0)))
++			continue;
++		apple_s8003_port_stop(pcie, port);
++		ret = apple_s8003_port_wait(pcie, port,
++					    pcie->base_port[port] + H9P_PORT_LTSSMCTL,
++					    H9P_PORT_LTSSM_ENABLE, 0, 250000,
++					    "shared-PHY-stop");
++		if (ret)
++			return ret;
++	}
++	dev_info(pcie->dev, "Apple ANS: STEP port 0 shared-PHY configure replay (pre-scan, all PERST asserted)\n");
++	return apple_s8003_init_common(pcie);
++}
++
++static int apple_s8003_deep_recover(struct apple_h9p_pcie *pcie)
++{
++	unsigned int attempt;
++	int ret;
++
++	dev_warn(pcie->dev, "Apple ANS: STEP port 0 deep-ladder begin\n");
++	ret = apple_s8003_retrain(pcie, false);
++	if (!ret)
++		return 0;
++	ret = apple_s8003_retrain(pcie, true);
++	if (!ret)
++		return 0;
++	for (attempt = 0; attempt < 3; attempt++) {
++		dev_info(pcie->dev, "Apple ANS: STEP port 0 deep-cycle %u/3\n", attempt + 1);
++		ret = apple_s8003_deep_cycle(pcie);
++		if (!ret)
++			return 0;
++		if (ret != -ETIMEDOUT && ret != -ENOLINK)
++			break;
++	}
++	/* A common PHY replay changes ALL lanes. Only the initial host probe
++	 * precedes Wi-Fi/PCI enumeration; an explicit rescue retry cannot do it.
++	 */
++	if (pcie->ans_pre_enumeration && (ret == -ETIMEDOUT || ret == -ENOLINK)) {
++		ret = apple_s8003_replay_phy(pcie);
++		if (!ret)
++			ret = apple_s8003_deep_cycle(pcie);
++		if (!ret)
++			return 0;
++	} else {
++		dev_info(pcie->dev, "Apple ANS: STEP port 0 shared-PHY replay SKIP after probe or non-link failure\n");
++	}
++	/* DART platform providers have already probed before this host. The
++	 * warm keep-on policy also makes genpd power_off a no-op. Detaching
++	 * only this consumer cannot certify actual-off and risks live DART
++	 * state. Do not call that an apcie or S3E power cycle.
++	 */
++	dev_err(pcie->dev, "Apple ANS: STEP port 0 apcie-domain-cycle SKIP: DART consumers/keep-on; actual-off unproven\n");
++	dev_err(pcie->dev, "Apple ANS: deep recovery exhausted %d; DFU required if explicit rescue retry fails\n",
++		ret);
++	return ret;
++}
++
+ /* Before enumeration there is no controller worker to recover a missing root.
+  * After the usual electrical attempts, allow one cold port-0 retry. Endpoint
+  * preinit then rebuilds DART/NVMMU and the controller/admin queues as usual.
+@@ -2242,6 +2567,11 @@ static int apple_s8003_boot_retry(struct apple_h9p_pcie *pcie, int reason)
+ 	dev_info(pcie->dev, "Apple ANS: STEP port 0 boot-retry-off hold-100ms\n");
+ 	msleep(100);
+ 	ret = apple_s8003_setup_port_full(pcie, 0);
++	if (ret == -ETIMEDOUT || ret == -ENOLINK) {
++		dev_warn(pcie->dev, "Apple ANS: boot retry failed %d; one deep link recovery\n",
++			 ret);
++		ret = apple_s8003_deep_recover(pcie);
++	}
+ 	if (ret) {
+ 		gpiod_direction_output(pcie->perst[0], 1);
+ 		dev_err(pcie->dev, "Apple ANS: boot retry exhausted %d; no root endpoint, leaving rescue armed\n",
+@@ -2333,6 +2663,21 @@ static int apple_t8010_init_common(struct apple_h9p_pcie *pcie)
+ 	return 0;
+ }
+ 
++/* The DT iommu-map assigns bus 1 to ANS/DART0 and bus 2 to Wi-Fi/DART1.
++ * If port 0 is missing, generic scanning otherwise gives bus 1 to Wi-Fi;
++ * a later rescue rescan would give ANS bus 2 and the wrong DART. Preserve
++ * those RIDs before ANY scan of a boot eligible for port-0 rescue.
++ */
++static void apple_s8003_rescue_bus(struct apple_h9p_pcie *pcie, unsigned int port)
++{
++	unsigned int secondary = port + 1;
++
++	h9p_rmw(pcie->base_config + port * H9P_CFG_PORT_STRIDE + PCI_PRIMARY_BUS,
++		GENMASK(23, 0), secondary << 8 | secondary << 16);
++	dev_info(pcie->dev, "Apple ANS: STEP port %u rescue-bus secondary=%u (fixed DART RID)\n",
++		 port, secondary);
++}
++
+ static int apple_h9p_setup_ports(struct apple_h9p_pcie *pcie)
+ {
+ 	unsigned int port;
+@@ -2350,12 +2695,23 @@ static int apple_h9p_setup_ports(struct apple_h9p_pcie *pcie)
+ 		 * A port that fails to come up is dropped, so config accesses
+ 		 * never reach a dead link; the other ports carry on.
+ 		 */
++		pcie->ans_pre_enumeration = true;
+ 		ret = pcie->hw->setup_port(pcie, port);
+ 		if (ret && !port && pcie->ans_mode != APPLE_ANS_ROUND7)
+ 			ret = apple_s8003_boot_retry(pcie, ret);
++		pcie->ans_pre_enumeration = false;
++		if (!ret) {
++			if (pcie->ans_rescue_allowed)
++				apple_s8003_rescue_bus(pcie, port);
++			WRITE_ONCE(pcie->down_ports, pcie->down_ports & ~BIT(port));
++		}
+ 		if (ret) {
+ 			gpiod_direction_output(pcie->perst[port], 1);
+ 			pcie->enabled_ports &= ~BIT(port);
++			WRITE_ONCE(pcie->down_ports, pcie->down_ports | BIT(port));
++			if (!port && pcie->ans_mode != APPLE_ANS_ROUND7 &&
++			    (ret == -ETIMEDOUT || ret == -ENOLINK))
++				pcie->ans_rescue_allowed = true;
+ 			dev_err(pcie->dev, "port %u disabled (%d)\n", port, ret);
+ 		}
+ 	}
+@@ -2422,6 +2778,8 @@ static int apple_h9p_late_port(struct apple_h9p_pcie *pcie, unsigned int port)
+ 		return ret;
+ 	}
+ 
++	if (pcie->ans_rescue_allowed)
++		apple_s8003_rescue_bus(pcie, port);
+ 	/* PCIe r6.0 6.6.1: 100 ms after link-up before the first config request */
+ 	msleep(100);
+ 	pcie->enabled_ports |= BIT(port);
+@@ -2668,6 +3026,89 @@ static int apple_h9p_pcie_get_gpios(struct apple_h9p_pcie *pcie)
+ 
+ static const struct attribute_group apple_h9p_crash_group;
+ 
++/* Only a port which NEVER enumerated in this kernel can be retried here.
++ * Serialize with PCI rescans, close the gate before publishing any function,
++ * and never remove a device or disturb a live/failed controller object.
++ */
++static ssize_t ans_recover_store(struct device *dev,
++				 struct device_attribute *attr,
++				 const char *buf, size_t count)
++{
++	struct apple_h9p_pcie *pcie = apple_h9p_pcie_lookup(dev);
++	struct pci_dev *rp;
++	int ret;
++
++	if (!pcie || !sysfs_streq(buf, "1") || is_kdump_kernel() ||
++	    !of_machine_is_compatible("apple,j71t") ||
++	    pcie->ans_mode == APPLE_ANS_ROUND7 ||
++	    !of_device_is_compatible(dev->of_node, "apple,s8003-pcie"))
++		return -EPERM;
++	pci_lock_rescan_remove();
++	ret = -EBUSY;
++	if (!pcie->ans_rescue_allowed || (pcie->enabled_ports & BIT(0)) ||
++	    pcie->nvmmu.tcb)
++		goto out;
++	rp = pci_get_slot(pcie->bridge->bus, PCI_DEVFN(0, 0));
++	if (rp) {
++		pci_dev_put(rp);
++		goto out;
++	}
++	pcie->ans_rescue_attempts++;
++	dev_warn(dev, "Apple ANS: STEP port 0 rescue-retry %u begin\n",
++		 pcie->ans_rescue_attempts);
++	ret = apple_s8003_deep_recover(pcie);
++	if (ret)
++		goto out;
++	apple_s8003_rescue_bus(pcie, 0);
++	/* Even an NVMMU allocation/init failure cannot reopen this gate. */
++	pcie->ans_rescue_allowed = false;
++	pcie->enabled_ports |= BIT(0);
++	ret = apple_h9p_setup_nvmmu(pcie);
++	if (ret) {
++		pcie->enabled_ports &= ~BIT(0);
++		gpiod_direction_output(pcie->perst[0], 1);
++		h9p_writel_flush(0, pcie->nvmmu.base + H9P_NVMMU_SART_CTRL);
++		pcie->nvmmu.ready = false;
++		pcie->nvmmu.active = false;
++		apple_s8003_port_stop(pcie, 0);
++		if (!apple_s8003_port_wait(pcie, 0,
++					   pcie->base_port[0] + H9P_PORT_LTSSMCTL,
++					   H9P_PORT_LTSSM_ENABLE, 0, 250000,
++					   "rescue-failed-stop"))
++			apple_s8003_port_off(pcie, 0);
++		goto out;
++	}
++	msleep(100);
++	WRITE_ONCE(pcie->down_ports, pcie->down_ports & ~BIT(0));
++	pci_rescan_bus(pcie->bridge->bus);
++	dev_info(dev, "Apple ANS: STEP port 0 rescue-rescan done; controller/DMA health gate required\n");
++out:
++	pcie->ans_rescue_result = ret;
++	pci_unlock_rescan_remove();
++	return ret ? ret : count;
++}
++
++static ssize_t ans_recover_show(struct device *dev,
++				struct device_attribute *attr, char *buf)
++{
++	struct apple_h9p_pcie *pcie = apple_h9p_pcie_lookup(dev);
++
++	return sysfs_emit(buf, "eligible=%u attempts=%u result=%d\n",
++			 READ_ONCE(pcie->ans_rescue_allowed),
++			 READ_ONCE(pcie->ans_rescue_attempts),
++			 READ_ONCE(pcie->ans_rescue_result));
++}
++static DEVICE_ATTR_RW(ans_recover);
++
++static struct attribute *apple_h9p_ans_attrs[] = {
++	&dev_attr_ans_recover.attr,
++	NULL,
++};
++
++static const struct attribute_group apple_h9p_ans_group = {
++	.attrs = apple_h9p_ans_attrs,
++};
++
+ static int apple_h9p_pcie_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -2768,6 +3209,13 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
++	if (pcie->ans_mode != APPLE_ANS_ROUND7 &&
++	    of_device_is_compatible(dev->of_node, "apple,s8003-pcie")) {
++		ret = devm_device_add_group(dev, &apple_h9p_ans_group);
++		if (ret)
++			return ret;
++	}
++
+ 	if (is_kdump_kernel() && of_machine_is_compatible("apple,j71t")) {
+ 		ret = devm_device_add_group(dev, &apple_h9p_crash_group);
+ 		if (ret)

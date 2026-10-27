@@ -1,0 +1,7 @@
+ae648413ba48df4a8009f4e8a84e10784564a9aa53c689025763895fe944235c  0001-dt-bindings-soc-apple-describe-inherited-A9-AOP-ring.patch
+d018d5a464bc00fb7f3b2aad1c899f8751649d706de3acd9a10218b7fe1f8afa  0002-soc-apple-add-zero-traffic-inherited-A9-AOP-ring-rea.patch
+b33a9d2d070af5716ec84dfa70e3e13e7ef1d6649246a481465cd9af8c74e484  0003-soc-apple-skip-unreadable-AOP-scan-pages-and-capture.patch
+b231f857716beac99d9d7721b3c4eea40ce9bef9790eae5224690a23d673126b  0004-soc-apple-opt-into-reserved-DRAM-AOP-ring-discovery.patch
+9fd718de8a95d5a381d0d508f75cff33062eefb3f53255884e85f1d078223d74  0005-soc-apple-capture-explicit-inherited-AOP-buffer-rang.patch
+2608a27b0cdb148ce6e98332d6b4f576eef9aa7b8411cead1b031e43bf46ecee  0006-soc-apple-add-guarded-probe-time-AOP-state-snapshot.patch
+3c96948073424ebadd2a3b9a0d5d28ab20aae4ece0ba319b97c03990e9381ea8  series

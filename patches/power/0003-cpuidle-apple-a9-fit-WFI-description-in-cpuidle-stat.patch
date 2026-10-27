@@ -1,0 +1,26 @@
+From d59013ae2dc796ebdbec35fd5ccbed435e89172d Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 21:21:01 +0000
+Subject: [PATCH 3/3] cpuidle: apple-a9: fit WFI description in cpuidle state
+ ABI
+
+---
+ drivers/cpuidle/cpuidle-apple-a9.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/cpuidle/cpuidle-apple-a9.c b/drivers/cpuidle/cpuidle-apple-a9.c
+index 91f4e0e589..663e2dc8ca 100644
+--- a/drivers/cpuidle/cpuidle-apple-a9.c
++++ b/drivers/cpuidle/cpuidle-apple-a9.c
+@@ -27,7 +27,7 @@ static struct cpuidle_driver a9_idle_driver = {
+ 		.target_residency = 1,
+ 		.power_usage = UINT_MAX,
+ 		.name = "WFI",
+-		.desc = "WFI with existing boot firmware configuration",
++		.desc = "WFI (boot firmware mode)",
+ 	},
+ 	.safe_state_index = 0,
+ 	.state_count = 1,
+-- 
+2.56.0
+

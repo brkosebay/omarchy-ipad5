@@ -1,0 +1,391 @@
+From b0270d0bb30a1f017aa4d7c7233fd4bfe5701c82 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 12:26:52 +0000
+Subject: [PATCH 7/9] input: apple_n1: correct N1 timing and diagnose discovery
+ failures
+
+N1 configureSPI overrides provider setup offset 0x0c to zero. That field maps to WORD_DELAY, so retaining the ADT 5000 ns minimum was wrong. Keep the separate 10 us CS setup/hold timing.
+
+Restore the additional 2 ms post-boot wait and per-GET delay. Wake on control attempts with the N1 100 ms suppression, and retry corrupt descriptor replies within one aggregate five-attempt budget. Preserve the verified wire packets and fail immediately on transport timeouts or malformed descriptors.
+
+Trace bounded boot/control exchanges as well as runtime headers. Always identify echo/checksum, length/status, endian and surface failures and dump complete offending replies, without logging firmware or calibration payloads.
+---
+ drivers/input/touchscreen/apple_n1.c | 182 +++++++++++++++++++++------
+ 1 file changed, 147 insertions(+), 35 deletions(-)
+
+diff --git a/drivers/input/touchscreen/apple_n1.c b/drivers/input/touchscreen/apple_n1.c
+index c37c4bdaf106fd1f77aaf5cb55ec42f83757a899..3f6330eebf7d5717de837e9695fd0b2a6afdcbd5 100644
+--- a/drivers/input/touchscreen/apple_n1.c
++++ b/drivers/input/touchscreen/apple_n1.c
+@@ -14,6 +14,7 @@
+ #include <linux/input/mt.h>
+ #include <linux/input/touchscreen.h>
+ #include <linux/interrupt.h>
++#include <linux/jiffies.h>
+ #include <linux/module.h>
+ #include <linux/pinctrl/consumer.h>
+ #include <linux/property.h>
+@@ -34,7 +35,7 @@ module_param(boot_stage, uint, 0644);
+ MODULE_PARM_DESC(boot_stage, "1=identity, 2=firmware/descriptors, 3=touchscreen (on next probe)");
+ static bool trace;
+ module_param(trace, bool, 0644);
+-MODULE_PARM_DESC(trace, "Log at most eight checksummed runtime frame headers per probe");
++MODULE_PARM_DESC(trace, "Log up to 64 boot/control exchanges and eight runtime headers per probe");
+ 
+ struct apple_n1 {
+ 	struct spi_device *spi;
+@@ -54,6 +55,10 @@ struct apple_n1 {
+ 	s16 x_min, x_max, y_min, y_max;
+ 	u8 sequence;
+ 	unsigned int traced_frames;
++	unsigned int traced_controls;
++	size_t control_length;
++	unsigned long last_wake;
++	bool wake_valid;
+ 	bool powered;
+ 	bool irq_enabled;
+ };
+@@ -99,13 +104,60 @@ static int n1_xfer(struct apple_n1 *n1, size_t len)
+ 	return spi_sync_transfer(n1->spi, &transfer, 1);
+ }
+ 
++/* Never pass firmware or calibration payloads to these diagnostic helpers. */
++static void n1_dump_error(struct apple_n1 *n1, const char *phase,
++			  const u8 *packet, size_t len)
++{
++	size_t offset;
++
++	for (offset = 0; offset < len; offset += 32)
++		dev_err(&n1->spi->dev, "%s rx[%zu/%zu]: %*ph\n", phase,
++			offset, len, (int)min_t(size_t, 32, len - offset), packet + offset);
++}
++
++static int n1_control_xfer(struct apple_n1 *n1, const char *phase, size_t len)
++{
++	bool log = READ_ONCE(trace) && n1->traced_controls < 64;
++	int ret;
++
++	n1->control_length = len;
++	if (log) {
++		n1->traced_controls++;
++		dev_info(&n1->spi->dev, "trace %s tx[%zu]: %*ph\n", phase,
++			 len, (int)min_t(size_t, len, 32), n1->tx);
++	}
++	ret = n1_xfer(n1, len);
++	if (ret)
++		dev_err(&n1->spi->dev, "%s transfer (%zu bytes) failed: %d\n",
++			phase, len, ret);
++	if (log)
++		dev_info(&n1->spi->dev, "trace %s rx[%zu] ret=%d: %*ph\n", phase,
++			 len, ret, (int)min_t(size_t, len, 32), n1->rx);
++	return ret;
++}
++
++static int n1_check_control(struct apple_n1 *n1, u8 command, u8 id, size_t len)
++{
++	u16 received = get_unaligned_le16(n1->rx + len - 2);
++	u16 calculated = n1_sum(n1->rx, len - 2);
++
++	if (n1->rx[0] == command && received == calculated)
++		return 0;
++	dev_err(&n1->spi->dev,
++		"control %02x/%02x %s mismatch: echo=%02x expected=%02x checksum=%04x calculated=%04x\n",
++		command, id, n1->rx[0] != command ? "echo" : "checksum",
++		n1->rx[0], command, received, calculated);
++	n1_dump_error(n1, "control", n1->rx, len);
++	return -EBADMSG;
++}
++
+ static int n1_ack(struct apple_n1 *n1, u16 *reply)
+ {
+ 	int ret;
+ 
+ 	n1->tx[0] = 0x1a;
+ 	n1->tx[1] = 0xa1;
+-	ret = n1_xfer(n1, 2);
++	ret = n1_control_xfer(n1, "HBPP ACK", 2);
+ 	if (!ret)
+ 		*reply = get_unaligned_be16(n1->rx);
+ 	return ret;
+@@ -128,8 +180,12 @@ static int n1_send_blob(struct apple_n1 *n1, size_t len)
+ 			ret = n1_ack(n1, &reply);
+ 			if (!ret && reply == 0x4bc1)
+ 				break;
+-			if (!ret)
++			if (!ret) {
++				dev_err(&n1->spi->dev,
++					"upload %zu bytes attempt %d/%u: ACK=%04x expected=4bc1 rx=%*ph\n",
++					len, attempt + 1, N1_RETRIES, reply, 2, n1->rx);
+ 				ret = -EPROTO;
++			}
+ 		}
+ 		usleep_range(1000, 2000);
+ 	}
+@@ -147,11 +203,11 @@ static int n1_read_register(struct apple_n1 *n1, u32 address, u32 *value)
+ 	put_unaligned_le16(0x731c, n1->tx);
+ 	n1_put32(n1->tx + 2, address);
+ 	put_unaligned_be16(n1_sum(n1->tx + 2, 4), n1->tx + 6);
+-	ret = n1_xfer(n1, 8);
++	ret = n1_control_xfer(n1, "register request", 8);
+ 	if (ret)
+ 		return ret;
+ 	memcpy(n1->tx, result_command, sizeof(result_command));
+-	ret = n1_xfer(n1, sizeof(result_command));
++	ret = n1_control_xfer(n1, "register result", sizeof(result_command));
+ 	if (!ret)
+ 		*value = n1_get32(n1->rx + 2);
+ 	return ret;
+@@ -167,13 +223,17 @@ static int n1_write_register(struct apple_n1 *n1, u32 address, u32 value)
+ 	n1_put32(n1->tx + 6, 0xffffffff);
+ 	n1_put32(n1->tx + 10, value);
+ 	put_unaligned_be16(n1_sum(n1->tx + 2, 12), n1->tx + 14);
+-	ret = n1_xfer(n1, 16);
++	ret = n1_control_xfer(n1, "register write", 16);
+ 	if (ret)
+ 		return ret;
+ 	ret = n1_ack(n1, &reply);
+ 	if (ret)
+ 		return ret;
+-	return reply == 0x4ad1 ? 0 : -EPROTO;
++	if (reply == 0x4ad1)
++		return 0;
++	dev_err(&n1->spi->dev, "register %#x ACK=%04x expected=4ad1 rx=%*ph\n",
++		address, reply, 2, n1->rx);
++	return -EPROTO;
+ }
+ 
+ static bool n1_hbpp_word(u16 word)
+@@ -264,6 +324,8 @@ static int n1_calibrate(struct apple_n1 *n1, u32 version)
+ 	u16 reply;
+ 	int i, ret;
+ 
++	dev_info(&n1->spi->dev, "calibrating controller %#x, const-cal=%u\n",
++		 version, version == 0x434d11a0 ? 2 : 3);
+ 	for (i = 0; i < ARRAY_SIZE(registers); i++) {
+ 		ret = n1_write_register(n1, registers[i].address, registers[i].value);
+ 		if (ret) {
+@@ -277,7 +339,7 @@ static int n1_calibrate(struct apple_n1 *n1, u32 version)
+ 		return ret;
+ 	dev_dbg(&n1->spi->dev, "SPI_APU_EN=%#x\n", apu);
+ 	put_unaligned_le16(0x011f, n1->tx);
+-	ret = n1_xfer(n1, 2);
++	ret = n1_control_xfer(n1, "calibration request", 2);
+ 	if (ret)
+ 		return ret;
+ 	msleep(65);
+@@ -296,9 +358,12 @@ static int n1_execute(struct apple_n1 *n1)
+ 	n1_put32(n1->tx + 2, 0x10003400);
+ 	put_unaligned_le32(0x100, n1->tx + 6);
+ 	put_unaligned_be16(n1_sum(n1->tx + 2, 8), n1->tx + 10);
+-	ret = n1_xfer(n1, 12);
+-	if (!ret)
++	ret = n1_control_xfer(n1, "firmware execute", 12);
++	if (!ret) {
+ 		msleep(40);
++		/* bootloadTimerFiredHandler waits another 2ms before discovery. */
++		usleep_range(2000, 3000);
++	}
+ 	return ret;
+ }
+ 
+@@ -306,12 +371,18 @@ static int n1_wake(struct apple_n1 *n1)
+ {
+ 	int ret;
+ 
++	/* N1 suppresses duplicate wake packets within 100ms. */
++	if (n1->wake_valid && time_before(jiffies, n1->last_wake + msecs_to_jiffies(100)))
++		return 0;
+ 	memset(n1->tx, 0, 16);
+ 	n1->tx[0] = 0xee;
+ 	put_unaligned_le16(0xee, n1->tx + 14);
+-	ret = n1_xfer(n1, 16);
+-	if (!ret)
++	ret = n1_control_xfer(n1, "runtime wake", 16);
++	if (!ret) {
++		n1->last_wake = jiffies;
++		n1->wake_valid = true;
+ 		usleep_range(2000, 3000);
++	}
+ 	return ret;
+ }
+ 
+@@ -319,27 +390,27 @@ static int n1_command16(struct apple_n1 *n1, u8 command, u8 argument)
+ {
+ 	int ret;
+ 
++	ret = n1_wake(n1);
++	if (ret)
++		return ret;
+ 	memset(n1->tx, 0, 16);
+ 	n1->tx[0] = command;
+ 	n1->tx[1] = argument;
+ 	put_unaligned_le16(n1_sum(n1->tx, 14), n1->tx + 14);
+-	ret = n1_xfer(n1, 16);
++	ret = n1_control_xfer(n1, "control request", 16);
+ 	if (ret)
+ 		return ret;
+ 	/* E2 repeats immediately; E3 has the configured control-read delay. */
+ 	if (command == 0xe3)
+ 		udelay(25);
+-	ret = n1_xfer(n1, 16);
++	ret = n1_control_xfer(n1, "control response", 16);
+ 	if (ret)
+ 		return ret;
+-	if (n1->rx[0] != command ||
+-	    get_unaligned_le16(n1->rx + 14) != (u16)n1_sum(n1->rx, 14))
+-		return -EBADMSG;
+-	return 0;
++	return n1_check_control(n1, command, argument, 16);
+ }
+ 
+ /* data has N1_REPORT_MAX bytes; accept descriptor extensions Apple ignores. */
+-static int n1_get_report(struct apple_n1 *n1, u8 id, u8 *data, size_t minimum)
++static int n1_get_report_once(struct apple_n1 *n1, u8 id, u8 *data, size_t minimum)
+ {
+ 	u16 length, checksum;
+ 	size_t transfer_length;
+@@ -350,8 +421,16 @@ static int n1_get_report(struct apple_n1 *n1, u8 id, u8 *data, size_t minimum)
+ 	if (ret)
+ 		return ret;
+ 	length = get_unaligned_le16(n1->rx + 3);
+-	if (n1->rx[2] || length < minimum || length > N1_REPORT_MAX)
++	if (n1->rx[2] || length < minimum || length > N1_REPORT_MAX) {
++		dev_err(&n1->spi->dev,
++			"report %02x info: status=%02x length=%u expected=%zu..%u\n",
++			id, n1->rx[2], length, minimum, N1_REPORT_MAX);
++		n1_dump_error(n1, "report info", n1->rx, 16);
+ 		return -EPROTO;
++	}
++	ret = n1_wake(n1);
++	if (ret)
++		return ret;
+ 	command = length < 12 ? 0xe6 : 0xe7;
+ 	transfer_length = length < 12 ? 16 : length + 5;
+ 	memset(n1->tx, 0, max_t(size_t, 16, transfer_length));
+@@ -360,7 +439,7 @@ static int n1_get_report(struct apple_n1 *n1, u8 id, u8 *data, size_t minimum)
+ 	put_unaligned_le16(length, n1->tx + 3);
+ 	checksum = n1_sum(n1->tx, 5);
+ 	put_unaligned_le16(checksum, n1->tx + 14);
+-	ret = n1_xfer(n1, 16);
++	ret = n1_control_xfer(n1, "report request", 16);
+ 	if (ret)
+ 		return ret;
+ 	udelay(25);
+@@ -371,37 +450,60 @@ static int n1_get_report(struct apple_n1 *n1, u8 id, u8 *data, size_t minimum)
+ 		n1->tx[15] = 0;
+ 		put_unaligned_le16(checksum, n1->tx + transfer_length - 2);
+ 	}
+-	ret = n1_xfer(n1, transfer_length);
++	ret = n1_control_xfer(n1, "report response", transfer_length);
++	if (ret)
++		return ret;
++	ret = n1_check_control(n1, command, id, transfer_length);
+ 	if (ret)
+ 		return ret;
+-	if (n1->rx[0] != command ||
+-	    get_unaligned_le16(n1->rx + transfer_length - 2) !=
+-	    (u16)n1_sum(n1->rx, transfer_length - 2))
+-		return -EBADMSG;
+ 	memcpy(data, n1->rx + 3, length);
+ 	return 0;
+ }
+ 
++static int n1_get_report(struct apple_n1 *n1, u8 id, u8 *data, size_t minimum)
++{
++	int ret, attempt;
++
++	/* iOS delays every GET invocation by 2ms and retries corrupt replies.
++	 * Use one aggregate budget instead of its nested E3/GET retry budgets.
++	 * Transport timeouts and valid unsupported/malformed descriptors abort.
++	 */
++	for (attempt = 0; attempt < N1_RETRIES; attempt++) {
++		usleep_range(2000, 3000);
++		ret = n1_get_report_once(n1, id, data, minimum);
++		if (ret != -EBADMSG)
++			return ret;
++		dev_err(&n1->spi->dev, "report %02x attempt %d/%u failed: %d\n",
++			id, attempt + 1, N1_RETRIES, ret);
++		if (attempt + 1 < N1_RETRIES)
++			usleep_range(1000, 2000);
++	}
++	return ret;
++}
++
+ static int n1_discover(struct apple_n1 *n1)
+ {
+ 	u8 family, sensor[5], descriptor[N1_REPORT_MAX];
+ 	const u8 *surface = descriptor;
+ 	int ret, attempt;
+ 
+-	ret = n1_wake(n1);
+-	if (ret)
+-		return ret;
+ 	for (attempt = 0; attempt < 4; attempt++) {
+ 		ret = n1_command16(n1, 0xe2, 0);
+ 		if (!ret)
+ 			break;
++		dev_err(&n1->spi->dev, "E2 discovery attempt %d/4 failed: %d\n",
++			attempt + 1, ret);
+ 		usleep_range(3000, 4000);
+ 	}
+ 	if (ret)
+ 		return ret;
+ 	n1->max_packet = get_unaligned_le16(n1->rx + 3);
+-	if (n1->rx[2] != 1 || n1->max_packet < 16 || n1->max_packet > N1_FRAME_MAX)
++	if (n1->rx[2] != 1 || n1->max_packet < 16 || n1->max_packet > N1_FRAME_MAX) {
++		dev_err(&n1->spi->dev, "E2 interface=%u expected=1 max-packet=%u expected=16..%u\n",
++			n1->rx[2], n1->max_packet, N1_FRAME_MAX);
++		n1_dump_error(n1, "device info", n1->rx, 16);
+ 		return -EPROTO;
++	}
+ 	ret = n1_get_report(n1, 0xd1, descriptor, 1);
+ 	if (ret)
+ 		return ret;
+@@ -410,8 +512,11 @@ static int n1_discover(struct apple_n1 *n1)
+ 	if (ret)
+ 		return ret;
+ 	memcpy(sensor, descriptor, sizeof(sensor));
+-	if (sensor[0] != 1)
++	if (sensor[0] != 1) {
++		dev_err(&n1->spi->dev, "D3 endianness=%u expected=1\n", sensor[0]);
++		n1_dump_error(n1, "D3", n1->rx, n1->control_length);
+ 		return -EPROTO;
++	}
+ 	ret = n1_get_report(n1, 0xd0, descriptor, 8);
+ 	if (ret)
+ 		return ret;
+@@ -423,14 +528,21 @@ static int n1_discover(struct apple_n1 *n1)
+ 		return ret;
+ 	/* Values from the live J71t descriptor, not display pixels. */
+ 	if (get_unaligned_le32(surface) != 14745 ||
+-	    get_unaligned_le32(surface + 4) != 19657)
++	    get_unaligned_le32(surface + 4) != 19657) {
++		dev_err(&n1->spi->dev, "D9 surface identity mismatch, expected 14745x19657\n");
++		n1_dump_error(n1, "D9", n1->rx, n1->control_length);
+ 		return -EPROTO;
++	}
+ 	n1->x_min = (s16)get_unaligned_le16(surface + 8);
+ 	n1->y_min = (s16)get_unaligned_le16(surface + 10);
+ 	n1->x_max = (s16)get_unaligned_le16(surface + 12);
+ 	n1->y_max = (s16)get_unaligned_le16(surface + 14);
+-	if (n1->x_min >= n1->x_max || n1->y_min >= n1->y_max)
++	if (n1->x_min >= n1->x_max || n1->y_min >= n1->y_max) {
++		dev_err(&n1->spi->dev, "D9 invalid edges: x=%d..%d y=%d..%d\n",
++			n1->x_min, n1->x_max, n1->y_min, n1->y_max);
++		n1_dump_error(n1, "D9", n1->rx, n1->control_length);
+ 		return -EPROTO;
++	}
+ 	dev_info(&n1->spi->dev,
+ 		 "N1 ready: interface 1, max packet %u, family %u, %ux%u, FW %#x, surface 14745x19657\n",
+ 		 n1->max_packet, family, sensor[1], sensor[2],
+@@ -692,8 +804,8 @@ static int n1_probe(struct spi_device *spi)
+ 		return -ENOMEM;
+ 	spi_set_drvdata(spi, n1);
+ 	spi->bits_per_word = 8;
+-	/* Selected iOS device tuple +12: minimum 5000ns inter-word delay. */
+-	spi->word_delay.value = 5;
++	/* N1 configureSPI overrides the ADT +12 word delay from 5000ns to 0. */
++	spi->word_delay.value = 0;
+ 	spi->word_delay.unit = SPI_DELAY_UNIT_USECS;
+ 	ret = spi_setup(spi);
+ 	if (ret)

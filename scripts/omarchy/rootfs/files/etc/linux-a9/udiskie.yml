@@ -1,0 +1,7 @@
+program_options:
+  file_manager: nautilus
+device_config:
+  - device_file: /dev/nvme*
+    ignore: true
+  - is_loop: true
+    ignore: true

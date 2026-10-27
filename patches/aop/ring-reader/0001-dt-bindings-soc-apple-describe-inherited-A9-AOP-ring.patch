@@ -1,0 +1,56 @@
+From b8a4acf3a1233ec7c8a067bb6184f5eac842f09f Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 02:23:55 +0000
+Subject: [PATCH 1/6] dt-bindings: soc: apple: describe inherited A9 AOP ring
+ hint
+
+Allow the J71t passive observer to reference an explicitly selected early
+no-map RAM reservation and residual screen mount matrix. The hint covers
+only the pages containing the 16 KiB inherited ring; the driver never
+chooses or creates this reservation itself.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ .../soc/apple/apple,j71t-aop-observer.yaml    | 22 ++++++++++++++++++-
+ 1 file changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/Documentation/devicetree/bindings/soc/apple/apple,j71t-aop-observer.yaml b/Documentation/devicetree/bindings/soc/apple/apple,j71t-aop-observer.yaml
+index 082c49ea22..195d9e9261 100644
+--- a/Documentation/devicetree/bindings/soc/apple/apple,j71t-aop-observer.yaml
++++ b/Documentation/devicetree/bindings/soc/apple/apple,j71t-aop-observer.yaml
+@@ -13,7 +13,9 @@ description: |
+   Experimental bring-up node, specific to the S8003 J71t board. Only the five
+   side-effect-free 32-bit status/control reads established from AppleA7IOPV2
+   are described. No power consumer, interrupt, FIFO, reset or firmware-memory
+-  resource belongs in this node. This is not a binding for a functional AOP.
++  resource belongs in this node. An optional early no-map RAM hint permits
++  read-only inherited ring observation, without an AOP handshake or control.
++  This is not a binding for a functional AOP transport.
+ 
+ properties:
+   compatible:
+@@ -44,6 +46,24 @@ properties:
+       These phandles only identify providers for read-only observation;
+       they are not power-domains and do not attach/resume a consumer.
+ 
++  memory-region:
++    maxItems: 1
++    description: |
++      Optional inherited AOP ring, reserved by the boot DT before allocation.
++      Must reference a plain non-reusable no-map System RAM region under
++      /reserved-memory, with no compatible/pool or other consumer. Its base
++      and size cover exactly the kernel pages containing the 16 KiB ring.
++      Never generated or reserved by this driver. Only used with ring_iio=1.
++
++  apple,ring-offset:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    multipleOf: 64
++    maximum: 16320
++    description: Byte offset of the ring within memory-region (default zero).
++
++  mount-matrix:
++    description: Residual screen matrix; firmware already applies ARot.
++
+ required:
+   - compatible
+   - reg

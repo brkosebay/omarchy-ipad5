@@ -1,0 +1,11 @@
+{
+  "base": "24ef187b3091aaeb17455fe2ba3bfcd9f935b603",
+  "head": "bd24e6785e050003481478d798a76695006f7341",
+  "branch": "a9/boot",
+  "incremental_after": "patches/boot/round8b",
+  "patches": {
+    "0001-nvme-PCI-apple-ans-keep-local-slot-errors-out-of-res.patch": "4cd722a5a2a2a5d75ee6745ef4e4e668da62cfaef69c8774045d25ee0cc12887"
+  },
+  "device_access": false,
+  "hardware_tested": false
+}

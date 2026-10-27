@@ -1,0 +1,24 @@
+From 744636325f11c5d3aa7e74bd363b49d15ec94d07 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 10:00:55 +0000
+Subject: [PATCH 36/55] dt-bindings: power: supply: fix D2365 register list
+ constraints
+
+The fixed two-entry items list already constrains the count; redundant minItems/maxItems fail current dt-schema meta-schema validation.
+---
+ .../devicetree/bindings/power/supply/apple,d2365-charger.yaml   | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/power/supply/apple,d2365-charger.yaml b/Documentation/devicetree/bindings/power/supply/apple,d2365-charger.yaml
+index 1d36bcdcc9..0baacaf0ea 100644
+--- a/Documentation/devicetree/bindings/power/supply/apple,d2365-charger.yaml
++++ b/Documentation/devicetree/bindings/power/supply/apple,d2365-charger.yaml
+@@ -23,8 +23,6 @@ properties:
+           - const: apple,d2365-charger
+ 
+   reg:
+-    minItems: 2
+-    maxItems: 2
+     items:
+       - description: Charger status register bank.
+       - description: Charger control register bank.

@@ -1,0 +1,30 @@
+From 775367c3d6f48e2a91b1f90e6d332932dfc766d5 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 01:53:38 +0000
+Subject: [PATCH 3/4] dt-bindings: backlight: apple-dwi: describe the S8000
+ block window
+
+Document the full S8000/S8003 DWI register window required to restore
+block configuration after power loss, while retaining the legacy
+channel-only mapping for other devices.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ .../devicetree/bindings/leds/backlight/apple,dwi-bl.yaml      | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/leds/backlight/apple,dwi-bl.yaml b/Documentation/devicetree/bindings/leds/backlight/apple,dwi-bl.yaml
+index 29caeb356e6f02d8945ab1b1f5f7572ff8592ead..3f443e10e9da0e68373e2ac6b86b5253d6dc7599 100644
+--- a/Documentation/devicetree/bindings/leds/backlight/apple,dwi-bl.yaml
++++ b/Documentation/devicetree/bindings/leds/backlight/apple,dwi-bl.yaml
+@@ -32,6 +32,10 @@ properties:
+       - const: apple,dwi-bl
+ 
+   reg:
++    description: |
++      WLED channel registers on legacy systems. On S8000/S8003, map the
++      complete 16 KiB DWI block, including the configuration registers
++      at offsets 0x00, 0x04 and 0xd0 and the WLED channel at 0x80.
+     maxItems: 1
+ 
+   power-domains:

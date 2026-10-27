@@ -1,0 +1,15 @@
+[Unit]
+Description=linux-a9: keep the iPad awake for unattended testing (lab mode)
+# Lab mode is on while /etc/linux-a9/lab-awake exists. Turn it off with
+#   sudo rm /etc/linux-a9/lab-awake && sudo systemctl stop linux-a9-lab-awake
+# Warm reboots and panic recovery start a new boot, so this has to be a boot
+# unit; a one-off systemd-run inhibitor is lost on every kexec.
+ConditionPathExists=/etc/linux-a9/lab-awake
+After=systemd-logind.service
+
+[Service]
+ExecStart=/usr/bin/systemd-inhibit --what=idle:sleep:handle-lid-switch:handle-power-key --mode=block --who=linux-a9 --why="lab mode: unattended tests" sleep infinity
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

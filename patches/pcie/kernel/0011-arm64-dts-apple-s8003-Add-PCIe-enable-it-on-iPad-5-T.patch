@@ -1,0 +1,210 @@
+From ea4ca97cf2ca150508088f2796c03a6d7e03b368 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 10:07:09 +0000
+Subject: [PATCH 11/43] arm64: dts: apple: s8003: Add PCIe, enable it on iPad 5
+ (TSMC)
+
+Describe the S8003 root complex from the j71t/j72t ADT: same MMIO as
+T8010, IRQs 244/247/250/253, NVMMU IRQ 246, MSIs at AIC 256..287,
+lane-cfg 1, PERST# on GPIO 160 (port 0, S3E, Gen2, NVMe mode) and 161
+(port 1, BCM4355, Gen1). CLKREQ# (GPIO 164/165) is not listed: iOS
+does not use it at bring-up and it must keep its peripheral function.
+Power domains mirror the ADT clock-gates 57-62 (pcie, pcie_aux,
+pcie_link0..3) plus pcie_ref.
+
+Use dma-ranges to keep IOVAs inside the DART window (0x80000000, size
+0x3c000000, ADT vm-offset/vm-size). The root complex routes inbound
+0x40000000.. to the NVMMU FlatDMA window, 0xbc000000.. to the NVMMU
+SART and 0xbffff000 to the MSI doorbell, so IOVAs there would never
+reach the DART. (The T8010 DT's apple,dma-range is not read by this
+tree's DART driver.)
+
+Enable it on j71t and j72t with an empty nvme-hmb reserved-memory node
+for the loader to fill. The S8000 apcie has no phy-ip block and is not
+described.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ arch/arm64/boot/dts/apple/s8003-j71t.dts | 25 ++++++
+ arch/arm64/boot/dts/apple/s8003-j72t.dts | 25 ++++++
+ arch/arm64/boot/dts/apple/s8003.dtsi     | 96 ++++++++++++++++++++++++
+ 3 files changed, 146 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/apple/s8003-j71t.dts b/arch/arm64/boot/dts/apple/s8003-j71t.dts
+index 0d906ae80b..ee97133d5b 100644
+--- a/arch/arm64/boot/dts/apple/s8003-j71t.dts
++++ b/arch/arm64/boot/dts/apple/s8003-j71t.dts
+@@ -12,4 +12,29 @@
+ / {
+ 	compatible = "apple,j71t", "apple,s8003", "apple,arm-platform";
+ 	model = "Apple iPad 5 (Wi-Fi) (TSMC)";
++
++	aliases {
++		nvme-hmb = &nvme_hmb; /* Used by loader */
++	};
++
++	reserved-memory {
++		nvme_hmb: nvme-hmb@0 {
++			reg = <0 0 0 0>; /* To be filled by loader */
++			no-map;
++		};
++	};
++};
++
++&pcie0_dart0 {
++	status = "okay";
++};
++
++&pcie0_dart1 {
++	status = "okay";
++};
++
++&pcie0 {
++	apple,lane-cfg = <1>;
++	apple,nvme-hmb = <&nvme_hmb>;
++	status = "okay";
+ };
+diff --git a/arch/arm64/boot/dts/apple/s8003-j72t.dts b/arch/arm64/boot/dts/apple/s8003-j72t.dts
+index 0cd7d88e9d..ac292cb309 100644
+--- a/arch/arm64/boot/dts/apple/s8003-j72t.dts
++++ b/arch/arm64/boot/dts/apple/s8003-j72t.dts
+@@ -12,4 +12,29 @@
+ / {
+ 	compatible = "apple,j72t", "apple,s8003", "apple,arm-platform";
+ 	model = "Apple iPad 5 (Cellular) (TSMC)";
++
++	aliases {
++		nvme-hmb = &nvme_hmb; /* Used by loader */
++	};
++
++	reserved-memory {
++		nvme_hmb: nvme-hmb@0 {
++			reg = <0 0 0 0>; /* To be filled by loader */
++			no-map;
++		};
++	};
++};
++
++&pcie0_dart0 {
++	status = "okay";
++};
++
++&pcie0_dart1 {
++	status = "okay";
++};
++
++&pcie0 {
++	apple,lane-cfg = <1>;
++	apple,nvme-hmb = <&nvme_hmb>;
++	status = "okay";
+ };
+diff --git a/arch/arm64/boot/dts/apple/s8003.dtsi b/arch/arm64/boot/dts/apple/s8003.dtsi
+index 79df5c7832..9b4ecdfed1 100644
+--- a/arch/arm64/boot/dts/apple/s8003.dtsi
++++ b/arch/arm64/boot/dts/apple/s8003.dtsi
+@@ -60,6 +60,102 @@ opp08 {
+ 	};
+ };
+ 
++&{/soc} {
++	/*
++	 * The TSMC part has the same PCIe PHY ("phy-ip" block) as T8010; the
++	 * Samsung S8000 apcie has no phy-ip region and is not described yet.
++	 */
++	pcie0: pcie@610000000 {
++		compatible = "apple,s8003-pcie";
++		device_type = "pci";
++
++		reg = <0x6 0x10000000 0x0 0x1000000>,
++		      <0x6 0x00000000 0x0 0x8000>,
++		      <0x6 0x00008000 0x0 0x4000>,
++		      <0x6 0x0a000000 0x0 0x40000>,
++		      <0x6 0x01000000 0x0 0x4000>,
++		      <0x6 0x02000000 0x0 0x4000>,
++		      <0x6 0x03000000 0x0 0x4000>,
++		      <0x6 0x04000000 0x0 0x4000>,
++		      <0x6 0x01004000 0x0 0x4000>;
++		reg-names = "config", "rc", "phy", "phy-ip",
++			    "port0", "port1", "port2", "port3",
++			    "nvmmu";
++
++		interrupt-parent = <&aic>;
++		interrupts = <AIC_IRQ 244 IRQ_TYPE_LEVEL_HIGH>,
++			     <AIC_IRQ 247 IRQ_TYPE_LEVEL_HIGH>,
++			     <AIC_IRQ 250 IRQ_TYPE_LEVEL_HIGH>,
++			     <AIC_IRQ 253 IRQ_TYPE_LEVEL_HIGH>,
++			     <AIC_IRQ 246 IRQ_TYPE_EDGE_RISING>;
++		interrupt-names = "port0", "port1", "port2", "port3",
++				  "nvmmu";
++
++		msi-controller;
++		msi-parent = <&pcie0>;
++		msi-ranges = <&aic AIC_IRQ 256 IRQ_TYPE_EDGE_RISING 32>;
++		apple,msi-doorbell = <0xbffff000>;
++		apple,nvmmu-iova = <0xbc000000>;
++
++		/*
++		 * Root-complex inbound windows: 0x40000000 NVMMU FlatDMA,
++		 * 0x80000000 DART (ADT vm-offset/vm-size), 0xbc000000 NVMMU
++		 * SART, 0xbffff000 MSI. Keep IOVAs inside the DART window.
++		 */
++		dma-ranges = <0x02000000 0x0 0x80000000 0x0 0x80000000
++			      0x0 0x3c000000>;
++		iommu-map = <0x100 &pcie0_dart0 0 1>,
++			    <0x200 &pcie0_dart1 0 1>;
++		iommu-map-mask = <0xff00>;
++
++		#address-cells = <3>;
++		#size-cells = <2>;
++		#interrupt-cells = <1>;
++		interrupt-controller;
++		bus-range = <0x00 0x0f>;
++		ranges = <0x03000000 0x0 0xc0000000
++			  0x7 0xc0000000 0x0 0x40000000>;
++
++		clocks = <&clkref>, <&clkref>, <&clkref>;
++		clock-names = "core", "aux", "ref";
++		/* ADT apcie clock-gates 57-62: pcie, pcie_aux, pcie_link0..3 */
++		power-domains = <&ps_pcie>, <&ps_pcie_aux>, <&ps_pcie_ref>,
++				<&ps_pcie_link0>, <&ps_pcie_link1>,
++				<&ps_pcie_link2>, <&ps_pcie_link3>;
++		power-domain-names = "core", "aux", "ref", "link0", "link1",
++				     "link2", "link3";
++		status = "disabled";
++
++		/*
++		 * PERST# from the j71t/j72t ADT pci-bridge0/1 function-perst.
++		 * CLKREQ# (GPIO 164/165) stays in its peripheral function:
++		 * iOS never waits on it here (no clkreq-wait-time).
++		 */
++		pcie0_port0: pci@0,0 {
++			device_type = "pci";
++			reg = <0x0 0x0 0x0 0x0 0x0>;
++			reset-gpios = <&pinctrl_ap 160 GPIO_ACTIVE_LOW>;
++			max-link-speed = <2>;
++			apple,nvme-mode;
++
++			#address-cells = <3>;
++			#size-cells = <2>;
++			ranges;
++		};
++
++		pcie0_port1: pci@1,0 {
++			device_type = "pci";
++			reg = <0x800 0x0 0x0 0x0 0x0>;
++			reset-gpios = <&pinctrl_ap 161 GPIO_ACTIVE_LOW>;
++			max-link-speed = <1>;
++
++			#address-cells = <3>;
++			#size-cells = <2>;
++			ranges;
++		};
++	};
++};
++
+ /*
+  * The A9 was made by two separate fabs on two different process
+  * nodes: Samsung made the S8000 (APL0898) on 14nm and TSMC made
+-- 
+2.56.0
+

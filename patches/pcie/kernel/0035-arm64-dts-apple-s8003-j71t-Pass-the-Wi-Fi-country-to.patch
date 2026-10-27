@@ -1,0 +1,32 @@
+From 868c0c56cc529fe83d671e95e07c23023de10a78 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 14:16:38 +0000
+Subject: [PATCH 35/43] arm64: dts: apple: s8003-j71t: Pass the Wi-Fi country
+ to the firmware
+
+brcm,ccode-map-trivial on wifi0: a country cfg80211 sets (iw reg set,
+cfg80211.ieee80211_regdom=, wpa_supplicant) now goes to the BCM4355 as
+<ISO code>/0, instead of the firmware staying at its NVRAM default
+(ccode=XZ).
+---
+ arch/arm64/boot/dts/apple/s8003-j71t.dts | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/boot/dts/apple/s8003-j71t.dts b/arch/arm64/boot/dts/apple/s8003-j71t.dts
+index c298ace046..90e60fea6b 100644
+--- a/arch/arm64/boot/dts/apple/s8003-j71t.dts
++++ b/arch/arm64/boot/dts/apple/s8003-j71t.dts
+@@ -117,7 +117,9 @@ wifi0: wifi@0,0 {
+ 		brcm,board-type = "apple,feara";
+ 		/* the staged firmware's antenna SKU (A10 J172 uses the same) */
+ 		apple,antenna-sku = "XX";
+-		/* filled by m1n1 from the ADT */
++		/* filled by m1n1 from the ADT (/chosen mac-address-wifi0) */
+ 		local-mac-address = [00 00 00 00 00 00];
++		/* cfg80211's country goes to the firmware as <ISO code>/0 */
++		brcm,ccode-map-trivial;
+ 	};
+ };
+-- 
+2.56.0
+

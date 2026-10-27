@@ -1,0 +1,445 @@
+From fbe06b833b52a1772782e2176ed536f172c9a82b Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 12:10:07 +0000
+Subject: [PATCH 22/43] nvme-pci: apple-ans: Staged, instrumented controller
+ enable
+
+The first enable with an HMB froze the whole SoC a few ms after
+"enabling controller", with no lockup detector output: on simpledrm's
+deferred-I/O console the last ~50 ms of messages and any panic never
+reach the screen. Make every step observable and the dangerous ones
+optional:
+
+- Read BAR 0x1b18 first, as iOS's InitializeController does; 0xbfbfbfbf
+  means the controller waits for a boot-from-host firmware upload, which
+  Linux can't do, so refuse.
+- Before CC.EN, log AQA/ASQ/ACQ and the S3E's MSI/MSI-X setup, and dump
+  the SoC-side host state (port, NVMMU, DART).
+- nvme.apple_ans_enable=0 stops right before CC.EN (dry run).
+- nvme.apple_ans_hold=<s> waits before CC.EN until
+  'echo 1 > /sys/module/nvme/parameters/apple_ans_go', so the enable can
+  be triggered from a shell with the kernel log streaming. On timeout the
+  controller stays disabled.
+- nvme.apple_ans_slow_ms=<ms> sleeps after each step so its message hits
+  the screen before the next step runs.
+- After CC.EN, watch only SoC-side state for nvme.apple_ans_watch_ms
+  (default 100) and log every change with a timestamp, before the first
+  non-posted CSTS read. A dead link or an NVMMU fault ends the bring-up
+  without touching the controller again.
+- While polling CSTS, check the same state before every read; DART
+  faults are logged once (the reflector absorbs them), link loss and
+  NVMMU faults stop the polling. A link that is down is re-sampled for
+  ~3 ms first, so a retrain right after CC.EN isn't taken for a loss.
+
+nvme-pci gets two optional dma_ops hooks for this, write_cc and
+read_csts, used by nvme_pci_reg_write32()/nvme_pci_reg_read32().
+---
+ drivers/nvme/host/pci-apple-ans.c | 282 +++++++++++++++++++++++++++++-
+ drivers/nvme/host/pci-internal.h  |   3 +
+ drivers/nvme/host/pci.c           |  12 +-
+ 3 files changed, 290 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/nvme/host/pci-apple-ans.c b/drivers/nvme/host/pci-apple-ans.c
+index b88c9db645..cec348d26a 100644
+--- a/drivers/nvme/host/pci-apple-ans.c
++++ b/drivers/nvme/host/pci-apple-ans.c
+@@ -8,6 +8,8 @@
+ 
+ #include <linux/apple-ans.h>
+ #include <linux/bitmap.h>
++#include <linux/completion.h>
++#include <linux/delay.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/gfp.h>
+ #include <linux/io-64-nonatomic-lo-hi.h>
+@@ -32,6 +34,13 @@
+ #define APPLE_ANS_REG_HMB_SIZE		0x1818
+ #define APPLE_ANS_REG_CORE_MASK		0x1824
+ #define APPLE_ANS_REG_LOG_SIZE		0x1828
++/*
++ * iOS reads this first in InitializeController: 0xbfbfbfbf means the
++ * controller waits for a boot-from-host firmware upload (0x1b00-0x1b14),
++ * which Linux doesn't do.
++ */
++#define APPLE_ANS_REG_BFH		0x1b18
++#define APPLE_ANS_BFH_MAGIC		0xbfbfbfbf
+ /*
+  * S3E config space: the A10 template wrote 0x17c, 0x18c and 0x188, which are
+  * the LTR max latencies and the L1 PM substates CTL2/CTL1 registers when the
+@@ -54,6 +63,65 @@ module_param(apple_ans_dart_hmb, bool, 0444);
+ MODULE_PARM_DESC(apple_ans_dart_hmb,
+ 	"Apple ANS: if the loader provides no HMB, use a DART-mapped host buffer (the iOS fallback)");
+ 
++/*
++ * Bring-up debugging knobs. Enabling the controller (CC.EN) has frozen
++ * the whole SoC, so the enable can be stopped short, held until userspace
++ * says go, slowed down so each step reaches the screen, and is followed by
++ * a watch of SoC-side state only.
++ */
++static unsigned int apple_ans_enable = 1;
++module_param(apple_ans_enable, uint, 0644);
++MODULE_PARM_DESC(apple_ans_enable,
++	"Apple ANS: 1 = enable the controller, 0 = stop right before CC.EN (dry run)");
++
++static unsigned int apple_ans_hold;
++module_param(apple_ans_hold, uint, 0644);
++MODULE_PARM_DESC(apple_ans_hold,
++	"Apple ANS: wait up to this many seconds before CC.EN for 'echo 1 > /sys/module/nvme/parameters/apple_ans_go' (0 = no wait); on timeout the controller stays disabled");
++
++static unsigned int apple_ans_slow_ms;
++module_param(apple_ans_slow_ms, uint, 0644);
++MODULE_PARM_DESC(apple_ans_slow_ms,
++	"Apple ANS: sleep this long after each bring-up message, so it reaches the (deferred) framebuffer console before the next step");
++
++static unsigned int apple_ans_watch_ms = 100;
++module_param(apple_ans_watch_ms, uint, 0644);
++MODULE_PARM_DESC(apple_ans_watch_ms,
++	"Apple ANS: after CC.EN, watch only SoC-side state (link, NVMMU, DART) this long before the first CSTS read");
++
++static DECLARE_COMPLETION(apple_ans_go_done);
++
++static int apple_ans_go_set(const char *val, const struct kernel_param *kp)
++{
++	bool go;
++	int ret = kstrtobool(val, &go);
++
++	if (ret)
++		return ret;
++	if (go)
++		complete_all(&apple_ans_go_done);
++	return 0;
++}
++
++static int apple_ans_go_get(char *buf, const struct kernel_param *kp)
++{
++	return sysfs_emit(buf, "%c\n",
++			  completion_done(&apple_ans_go_done) ? 'Y' : 'N');
++}
++
++static const struct kernel_param_ops apple_ans_go_ops = {
++	.set = apple_ans_go_set,
++	.get = apple_ans_go_get,
++};
++module_param_cb(apple_ans_go, &apple_ans_go_ops, NULL, 0644);
++MODULE_PARM_DESC(apple_ans_go, "Apple ANS: write 1 to release apple_ans_hold");
++
++static void apple_ans_settle(void)
++{
++	if (apple_ans_slow_ms)
++		msleep(apple_ans_slow_ms);
++}
++
+ struct apple_ans_nvme {
+ 	dma_addr_t hmb_dma;
+ 	u32 hmb_size;
+@@ -63,6 +131,11 @@ struct apple_ans_nvme {
+ 	unsigned int last_req;
+ 	/* Protects the FlatDMA request-slot bitmap. */
+ 	spinlock_t req_lock;
++	/* SoC-side state at CC.EN, for spotting faults while polling CSTS */
++	struct apple_ans_host_state cc_base;
++	bool cc_base_valid;
++	bool host_fault;	/* stop touching the controller */
++	bool dart_fault_logged;
+ };
+ 
+ static struct apple_ans_nvme *nvme_pci_apple_ans(struct nvme_dev *dev)
+@@ -302,7 +375,7 @@ static int nvme_pci_apple_ans_preinit(struct nvme_dev *dev)
+ {
+ 	struct apple_ans_nvme *ans = nvme_pci_apple_ans(dev);
+ 	u32 csts, core_mask, log_size;
+-	u32 hmb_size, hmb_align;
++	u32 hmb_size, hmb_align, bfh;
+ 	int ret;
+ 
+ 	if (!ans)
+@@ -315,10 +388,15 @@ static int nvme_pci_apple_ans_preinit(struct nvme_dev *dev)
+ 	dev_info(dev->dev,
+ 		 "Apple ANS: core_mask=%#x log_size=%#x hmb_req=%#x align=%#x\n",
+ 		 core_mask, log_size, hmb_size, hmb_align);
+-	dev_info(dev->dev, "Apple ANS: CAP=%#llx VS=%#x CC=%#x CSTS=%#x\n",
++	bfh = readl(dev->bar + APPLE_ANS_REG_BFH);
++	dev_info(dev->dev, "Apple ANS: CAP=%#llx VS=%#x CC=%#x CSTS=%#x BFH=%#x\n",
+ 		 lo_hi_readq(dev->bar + NVME_REG_CAP),
+ 		 readl(dev->bar + NVME_REG_VS), readl(dev->bar + NVME_REG_CC),
+-		 readl(dev->bar + NVME_REG_CSTS));
++		 readl(dev->bar + NVME_REG_CSTS), bfh);
++	apple_ans_settle();
++	if (bfh == APPLE_ANS_BFH_MAGIC)
++		return dev_err_probe(dev->dev, -ENODEV,
++				     "Apple ANS: controller waits for a boot-from-host firmware upload, not supported\n");
+ 
+ 	/*
+ 	 * Check everything this needs from the loader and the host bridge
+@@ -357,13 +435,74 @@ static int nvme_pci_apple_ans_preinit(struct nvme_dev *dev)
+ 				     "Apple ANS: controller did not stop (CSTS=%#x)\n",
+ 				     csts);
+ 	dev_info(dev->dev, "Apple ANS: controller stopped (CSTS=%#x)\n", csts);
++	apple_ans_settle();
++
++	return 0;
++}
+ 
++/* The S3E's MSI/MSI-X setup as the controller will use it */
++static void nvme_pci_apple_ans_log_msi(struct nvme_dev *dev)
++{
++	struct pci_dev *pdev = to_pci_dev(dev->dev);
++	u16 flags = 0, data = 0, xflags = 0;
++	u32 lo = 0, hi = 0;
++	int msi, msix;
++
++	msi = pdev->msi_cap;
++	if (msi) {
++		pci_read_config_word(pdev, msi + PCI_MSI_FLAGS, &flags);
++		pci_read_config_dword(pdev, msi + PCI_MSI_ADDRESS_LO, &lo);
++		if (flags & PCI_MSI_FLAGS_64BIT) {
++			pci_read_config_dword(pdev, msi + PCI_MSI_ADDRESS_HI, &hi);
++			pci_read_config_word(pdev, msi + PCI_MSI_DATA_64, &data);
++		} else {
++			pci_read_config_word(pdev, msi + PCI_MSI_DATA_32, &data);
++		}
++	}
++	msix = pdev->msix_cap;
++	if (msix)
++		pci_read_config_word(pdev, msix + PCI_MSIX_FLAGS, &xflags);
++	dev_info(dev->dev,
++		 "Apple ANS: MSI cap %#x flags %#x addr %#x:%08x data %#x; MSI-X cap %#x flags %#x; irq %d\n",
++		 msi, flags, hi, lo, data, msix, xflags, pci_irq_vector(pdev, 0));
++}
++
++/*
++ * Stop short or wait for userspace before CC.EN. Runs in reset_work with
++ * shutdown_lock held, so a reboot during the hold waits for it to end.
++ */
++static int nvme_pci_apple_ans_gate(struct nvme_dev *dev)
++{
++	long left;
++
++	if (!apple_ans_enable) {
++		dev_warn(dev->dev,
++			 "Apple ANS: dry run (nvme.apple_ans_enable=0): everything is programmed, CC.EN is not set\n");
++		return -ENODEV;
++	}
++	if (!apple_ans_hold || completion_done(&apple_ans_go_done))
++		return 0;
++
++	dev_warn(dev->dev,
++		 "Apple ANS: holding before CC.EN for up to %us: echo 1 > /sys/module/nvme/parameters/apple_ans_go\n",
++		 apple_ans_hold);
++	left = wait_for_completion_interruptible_timeout(&apple_ans_go_done,
++						apple_ans_hold * HZ);
++	if (left <= 0) {
++		dev_warn(dev->dev,
++			 "Apple ANS: hold ended without go (%ld), controller left disabled\n",
++			 left);
++		return left ? left : -ETIMEDOUT;
++	}
++	dev_info(dev->dev, "Apple ANS: go\n");
++	apple_ans_settle();
+ 	return 0;
+ }
+ 
+ static int nvme_pci_apple_ans_prepare_enable(struct nvme_dev *dev)
+ {
+ 	struct apple_ans_nvme *ans = nvme_pci_apple_ans(dev);
++	int ret;
+ 
+ 	if (!ans)
+ 		return 0;
+@@ -381,9 +520,140 @@ static int nvme_pci_apple_ans_prepare_enable(struct nvme_dev *dev)
+ 	readl(dev->bar + APPLE_ANS_REG_HMB_SIZE);
+ 
+ 	dev_info(dev->dev,
+-		 "Apple ANS: HMB DMA %#llx size %#x programmed, enabling controller (RDY timeout %llus)\n",
++		 "Apple ANS: HMB DMA %#llx size %#x programmed; AQA %#x ASQ %#llx ACQ %#llx\n",
+ 		 (u64)ans->hmb_dma, ans->hmb_size,
+-		 (NVME_CAP_TIMEOUT(dev->ctrl.cap) + 1) / 2);
++		 readl(dev->bar + NVME_REG_AQA),
++		 lo_hi_readq(dev->bar + NVME_REG_ASQ),
++		 lo_hi_readq(dev->bar + NVME_REG_ACQ));
++	nvme_pci_apple_ans_log_msi(dev);
++	apple_ans_host_dump(dev->dev, "before CC.EN");
++	apple_ans_settle();
++
++	ret = nvme_pci_apple_ans_gate(dev);
++	if (ret)
++		return ret;
++	if (nvme_pci_apple_ans_check_link(dev, "CC.EN"))
++		return -ENOLINK;
++
++	ans->host_fault = false;
++	ans->dart_fault_logged = false;
++	dev_info(dev->dev,
++		 "Apple ANS: enabling controller (RDY timeout %llus, SoC-side watch %ums)\n",
++		 (NVME_CAP_TIMEOUT(dev->ctrl.cap) + 1) / 2, apple_ans_watch_ms);
++	apple_ans_settle();
++	return 0;
++}
++
++/*
++ * An NVMMU error, or a link that stays down. The link can drop for a
++ * moment while it retrains, so re-sample for ~3 ms (@st is updated) before
++ * calling that a fault; a CSTS read over a dead link can stall the CPU.
++ */
++static bool nvme_pci_apple_ans_new_fault(struct nvme_dev *dev,
++					 struct apple_ans_host_state *st)
++{
++	struct apple_ans_nvme *ans = nvme_pci_apple_ans(dev);
++	int i;
++
++	if (st->nvmmu_err && st->nvmmu_err != ans->cc_base.nvmmu_err)
++		return true;
++	for (i = 0; i < 10 && !st->link_up; i++) {
++		usleep_range(200, 400);
++		apple_ans_host_state(dev->dev, st);
++	}
++	return !st->link_up;
++}
++
++static bool nvme_pci_apple_ans_new_dart_fault(struct apple_ans_nvme *ans,
++					      const struct apple_ans_host_state *st)
++{
++	/* apple-dart's handler clears the flag, the address register stays */
++	return (st->dart_err & BIT(31)) ||
++	       st->dart_addr != ans->cc_base.dart_addr;
++}
++
++/*
++ * CC writes. For CC.EN, write it, then watch only SoC-side state for a
++ * while: a stuck inbound path shows up there without a non-posted CSTS
++ * read that could stall the CPU. A dead link or an NVMMU fault (iOS
++ * panics on those) ends the bring-up before the controller is read.
++ */
++static int nvme_pci_apple_ans_write_cc(struct nvme_dev *dev, u32 cc)
++{
++	struct apple_ans_nvme *ans = nvme_pci_apple_ans(dev);
++	struct apple_ans_host_state prev, st;
++	ktime_t start;
++	s64 us;
++
++	if (!ans || !(cc & NVME_CC_ENABLE)) {
++		writel(cc, dev->bar + NVME_REG_CC);
++		return 0;
++	}
++
++	ans->cc_base_valid = !apple_ans_host_state(dev->dev, &ans->cc_base);
++	writel(cc, dev->bar + NVME_REG_CC);
++	start = ktime_get();
++	if (!ans->cc_base_valid)
++		return 0;
++
++	prev = ans->cc_base;
++	do {
++		usleep_range(200, 400);
++		apple_ans_host_state(dev->dev, &st);
++		us = ktime_us_delta(ktime_get(), start);
++		if (memcmp(&st, &prev, sizeof(st))) {
++			dev_info(dev->dev,
++				 "Apple ANS: CC.EN+%lldus: link %u ltssm %#x port irq %#x nvmmu err %#x dart err %#x addr %#x\n",
++				 us, st.link_up, st.ltssm, st.port_irq,
++				 st.nvmmu_err, st.dart_err, st.dart_addr);
++			prev = st;
++		}
++		if (nvme_pci_apple_ans_new_fault(dev, &st)) {
++			ans->host_fault = true;
++			dev_err(dev->dev,
++				"Apple ANS: host-side fault %lldus after CC.EN (link %u nvmmu err %#x), giving up on the controller\n",
++				us, st.link_up, st.nvmmu_err);
++			apple_ans_host_dump(dev->dev, "after fault");
++			return -EIO;
++		}
++	} while (us < apple_ans_watch_ms * USEC_PER_MSEC);
++
++	dev_info(dev->dev,
++		 "Apple ANS: %ums after CC.EN, no host-side fault; polling CSTS\n",
++		 apple_ans_watch_ms);
++	apple_ans_host_dump(dev->dev, "after watch");
++	apple_ans_settle();
++	return 0;
++}
++
++/* CSTS reads: only while the SoC side still looks sane */
++static int nvme_pci_apple_ans_read_csts(struct nvme_dev *dev, u32 *csts)
++{
++	struct apple_ans_nvme *ans = nvme_pci_apple_ans(dev);
++	struct apple_ans_host_state st;
++
++	if (ans && ans->cc_base_valid) {
++		if (ans->host_fault)
++			return -EIO;
++		apple_ans_host_state(dev->dev, &st);
++		if (nvme_pci_apple_ans_new_fault(dev, &st)) {
++			ans->host_fault = true;
++			dev_err(dev->dev,
++				"Apple ANS: host-side fault (link %u nvmmu err %#x) while polling CSTS, giving up on the controller\n",
++				st.link_up, st.nvmmu_err);
++			apple_ans_host_dump(dev->dev, "after fault");
++			return -EIO;
++		}
++		if (!ans->dart_fault_logged &&
++		    nvme_pci_apple_ans_new_dart_fault(ans, &st)) {
++			ans->dart_fault_logged = true;
++			dev_warn(dev->dev,
++				 "Apple ANS: DART fault since CC.EN (err %#x addr %#x), still polling\n",
++				 st.dart_err, st.dart_addr);
++		}
++	}
++
++	*csts = readl(dev->bar + NVME_REG_CSTS);
+ 	return 0;
+ }
+ 
+@@ -625,6 +895,8 @@ const struct nvme_pci_dma_ops nvme_pci_apple_ans_ops = {
+ 	.exit		= nvme_pci_apple_ans_exit,
+ 	.preinit	= nvme_pci_apple_ans_preinit,
+ 	.prepare_enable = nvme_pci_apple_ans_prepare_enable,
++	.write_cc	= nvme_pci_apple_ans_write_cc,
++	.read_csts	= nvme_pci_apple_ans_read_csts,
+ 	.map_data	= nvme_pci_apple_ans_map_data,
+ 	.unmap_data	= nvme_pci_apple_ans_unmap_data,
+ 	.queue_depth	= nvme_pci_apple_ans_queue_depth,
+diff --git a/drivers/nvme/host/pci-internal.h b/drivers/nvme/host/pci-internal.h
+index 216edd9b79..8cce5fb69e 100644
+--- a/drivers/nvme/host/pci-internal.h
++++ b/drivers/nvme/host/pci-internal.h
+@@ -37,6 +37,9 @@ struct nvme_pci_dma_ops {
+ 	void (*exit)(struct nvme_dev *dev);
+ 	int (*preinit)(struct nvme_dev *dev);
+ 	int (*prepare_enable)(struct nvme_dev *dev);
++	/* Optional: replace the CC write and the CSTS read (bring-up checks) */
++	int (*write_cc)(struct nvme_dev *dev, u32 cc);
++	int (*read_csts)(struct nvme_dev *dev, u32 *csts);
+ 	blk_status_t (*map_data)(struct request *req);
+ 	bool (*unmap_data)(struct request *req);
+ 	u32 (*queue_depth)(struct nvme_dev *dev, u32 depth);
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 7e4773b78c..fd40525a09 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -3499,13 +3499,21 @@ static void nvme_reset_work(struct work_struct *work)
+ 
+ static int nvme_pci_reg_read32(struct nvme_ctrl *ctrl, u32 off, u32 *val)
+ {
+-	*val = readl(to_nvme_dev(ctrl)->bar + off);
++	struct nvme_dev *dev = to_nvme_dev(ctrl);
++
++	if (off == NVME_REG_CSTS && dev->dma_ops && dev->dma_ops->read_csts)
++		return dev->dma_ops->read_csts(dev, val);
++	*val = readl(dev->bar + off);
+ 	return 0;
+ }
+ 
+ static int nvme_pci_reg_write32(struct nvme_ctrl *ctrl, u32 off, u32 val)
+ {
+-	writel(val, to_nvme_dev(ctrl)->bar + off);
++	struct nvme_dev *dev = to_nvme_dev(ctrl);
++
++	if (off == NVME_REG_CC && dev->dma_ops && dev->dma_ops->write_cc)
++		return dev->dma_ops->write_cc(dev, val);
++	writel(val, dev->bar + off);
+ 	return 0;
+ }
+ 
+-- 
+2.56.0
+

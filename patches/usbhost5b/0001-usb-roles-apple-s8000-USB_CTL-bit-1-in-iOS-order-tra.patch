@@ -1,0 +1,255 @@
+From bd387f2007f72411fbab682487a47c0f4e1dc452 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Tue, 27 Oct 2026 10:27:06 +0000
+Subject: [PATCH 1/4] usb: roles: apple-s8000: USB_CTL bit 1 in iOS order,
+ trace and force knob
+
+The usb-host5 device run (2026-10-27 11:17) entered host mode for the
+camera adapter with USB_CTL+0 = 0x1, although the switch had written
+bit 1 ("set by switch 1"). Something dropped it between the write and the
+end of the host entry, so the iOS 0x3 state was never tested.
+
+Follow iOS more closely and make the next run tell where the bit goes:
+
+- Write bit 1 before phy_init(), as AppleS5L8960XUSBPhy::setPowerLevel
+  does before its PHY reset sequence. Keep it in the host-select write
+  too, and assert it once more after EHCI and OHCI are up if it was lost.
+- Record USB_CTL+0 after each step (entry, gadget off, bit 1, PHY on,
+  host select, PHY host mode, EHCI, OHCI, re-assert). Log the trace once
+  per host entry and show it in debugfs regs.
+- usb_ctl_force (debug, default 0): once host mode is up, write
+  USB_CTL+0 = value | 1 (e.g. 3) and log the readback immediately, after
+  1 ms and after 100 ms. debugfs usb_ctl does the same on demand while in
+  host mode, and reads the register at any time. Only bits 0 and 1 can
+  be written; bit 0 (host select) is always kept.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ drivers/usb/roles/apple-s8000-usb-role.c | 139 +++++++++++++++++++++--
+ 1 file changed, 131 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/usb/roles/apple-s8000-usb-role.c b/drivers/usb/roles/apple-s8000-usb-role.c
+index 09a455e88c..4f58cea887 100644
+--- a/drivers/usb/roles/apple-s8000-usb-role.c
++++ b/drivers/usb/roles/apple-s8000-usb-role.c
+@@ -118,6 +118,17 @@ module_param(usb_ctl_phy_on, bool, 0644);
+ MODULE_PARM_DESC(usb_ctl_phy_on,
+ 		 "Set USB_CTL+0 bit 1 in host mode, as iOS does while its PHY is powered (default: on)");
+ 
++/*
++ * Debug: once host mode is up, write this value to USB_CTL+0 and log the
++ * readback. Only bits 0 (host select, always kept) and 1 are used.
++ */
++static unsigned int usb_ctl_force;
++module_param(usb_ctl_force, uint, 0644);
++MODULE_PARM_DESC(usb_ctl_force,
++		 "Debug: after host entry write USB_CTL+0 = this | 1 (e.g. 3) and log readbacks (0: off)");
++
++#define USB_CTL_TRACE_MAX		8
++
+ /* Only one switch exists on this SoC; the accessory API checks against it. */
+ static DEFINE_MUTEX(apple_usb_role_instance_lock);
+ static struct apple_usb_role *apple_usb_role_instance;
+@@ -168,6 +179,14 @@ struct apple_usb_role {
+ 	/* The current host role is the accessory policy's: no revert */
+ 	bool accessory;
+ 	bool dying;
++	/* USB_CTL+0 readbacks at each step of the last host entry */
++	const char *ctl_trace_what[USB_CTL_TRACE_MAX];
++	u32 ctl_trace[USB_CTL_TRACE_MAX];
++	unsigned int ctl_trace_n;
++	/* Last debug write (usb_ctl_force or debugfs usb_ctl) and its readbacks */
++	u32 ctl_forced;
++	u32 ctl_forced_rb[3];
++	bool ctl_force_done;
+ };
+ 
+ static void apple_usb_role_iounmap(void *addr)
+@@ -407,12 +426,58 @@ static void apple_usb_role_host_off(struct apple_usb_role *ur)
+ 	apple_usb_role_gates_off(ur);
+ }
+ 
++/* Record USB_CTL+0 after a step of the host entry (2026-10-27: bit 1 was lost). */
++static void apple_usb_role_ctl_trace(struct apple_usb_role *ur, const char *what)
++{
++	if (ur->ctl_trace_n >= USB_CTL_TRACE_MAX)
++		return;
++	ur->ctl_trace_what[ur->ctl_trace_n] = what;
++	ur->ctl_trace[ur->ctl_trace_n++] = readl(ur->usb_ctl + USB_CTL_HOST);
++}
++
++static void apple_usb_role_ctl_trace_log(struct apple_usb_role *ur)
++{
++	char line[192];
++	size_t len = 0;
++	unsigned int i;
++
++	for (i = 0; i < ur->ctl_trace_n; i++)
++		len += scnprintf(line + len, sizeof(line) - len, "%s%s %#x", i ? ", " : "",
++				 ur->ctl_trace_what[i], ur->ctl_trace[i]);
++	dev_info(ur->dev, "USB_CTL+0 trace: %s\n", len ? line : "none");
++}
++
++/* Debug write of USB_CTL+0 in host mode; bit 0 (host select) always kept. */
++static void apple_usb_role_ctl_force(struct apple_usb_role *ur, u32 value)
++{
++	u32 val = (value & USB_CTL_PHY_ON) | USB_CTL_HOST_EN;
++
++	writel(val, ur->usb_ctl + USB_CTL_HOST);
++	ur->ctl_forced_rb[0] = readl(ur->usb_ctl + USB_CTL_HOST);
++	usleep_range(1000, 1500);
++	ur->ctl_forced_rb[1] = readl(ur->usb_ctl + USB_CTL_HOST);
++	msleep(100);
++	ur->ctl_forced_rb[2] = readl(ur->usb_ctl + USB_CTL_HOST);
++	ur->ctl_forced = val;
++	ur->ctl_force_done = true;
++	/* Bit 1 written by us is cleared again when leaving host mode. */
++	if (val & USB_CTL_PHY_ON)
++		ur->ctl_phy_on = true;
++	dev_info(ur->dev, "USB_CTL+0 forced to %#x: read back %#x, %#x after 1 ms, %#x after 100 ms\n",
++		 val, ur->ctl_forced_rb[0], ur->ctl_forced_rb[1], ur->ctl_forced_rb[2]);
++}
++
+ static int apple_usb_role_enter_host(struct apple_usb_role *ur, unsigned int gates)
+ {
++	unsigned int force = READ_ONCE(usb_ctl_force);
+ 	u32 ctl;
+ 	int ret;
+ 
++	ur->ctl_trace_n = 0;
++	ur->ctl_force_done = false;
++	apple_usb_role_ctl_trace(ur, "entry");
+ 	apple_usb_role_release_gadget(ur);
++	apple_usb_role_ctl_trace(ur, "gadget-off");
+ 
+ 	ret = apple_usb_role_gates_on(ur, gates);
+ 	if (ret)
+@@ -421,6 +486,18 @@ static int apple_usb_role_enter_host(struct apple_usb_role *ur, unsigned int gat
+ 	apple_usb_role_remap(ur, REMAP_EHCI0);
+ 	apple_usb_role_remap(ur, REMAP_OHCI0);
+ 
++	/*
++	 * iOS setPowerLevel(1 -> 2): USB_CTL bit 1 first, then the PHY reset
++	 * sequence. Write it before phy_init(), which powers the PHY up again
++	 * once the gadget has let go of it.
++	 */
++	ctl = readl(ur->usb_ctl + USB_CTL_HOST);
++	if (usb_ctl_phy_on && !(ctl & USB_CTL_PHY_ON)) {
++		writel(ctl | USB_CTL_PHY_ON, ur->usb_ctl + USB_CTL_HOST);
++		ur->ctl_phy_on = true;
++	}
++	apple_usb_role_ctl_trace(ur, "bit1");
++
+ 	ret = phy_init(ur->phy);
+ 	if (ret)
+ 		goto fail;
+@@ -430,19 +507,15 @@ static int apple_usb_role_enter_host(struct apple_usb_role *ur, unsigned int gat
+ 		goto fail;
+ 	}
+ 	ur->phy_held = true;
++	apple_usb_role_ctl_trace(ur, "phy-on");
+ 
+-	/*
+-	 * setPowerLevel(2) sets USB_CTL bit 1 before its PHY reset; then
+-	 * enableHostMode: USB_CTL host select, tunables, reset (set_mode).
+-	 */
++	/* enableHostMode: host select, then tunables and the reset (set_mode). */
+ 	ctl = readl(ur->usb_ctl + USB_CTL_HOST);
+-	if (usb_ctl_phy_on && !(ctl & USB_CTL_PHY_ON)) {
++	if (usb_ctl_phy_on)
+ 		ctl |= USB_CTL_PHY_ON;
+-		writel(ctl, ur->usb_ctl + USB_CTL_HOST);
+-		ur->ctl_phy_on = true;
+-	}
+ 	writel(ctl | USB_CTL_HOST_EN, ur->usb_ctl + USB_CTL_HOST);
+ 	ur->ctl_host = true;
++	apple_usb_role_ctl_trace(ur, "host");
+ 	if (clear_device_enable) {
+ 		writel(readl(ur->usb_ctl + USB_CTL_DEVICE) & ~USB_CTL_DEVICE_EN,
+ 		       ur->usb_ctl + USB_CTL_DEVICE);
+@@ -451,6 +524,7 @@ static int apple_usb_role_enter_host(struct apple_usb_role *ur, unsigned int gat
+ 	ret = phy_set_mode(ur->phy, PHY_MODE_USB_HOST);
+ 	if (ret)
+ 		goto fail;
++	apple_usb_role_ctl_trace(ur, "phy-host");
+ 
+ 	/* EHCI before its OHCI companion, as for any companion pair. */
+ 	ur->ehci = apple_usb_role_add_hc(ur, ur->ehci_np);
+@@ -458,9 +532,21 @@ static int apple_usb_role_enter_host(struct apple_usb_role *ur, unsigned int gat
+ 		ret = -ENODEV;
+ 		goto fail;
+ 	}
++	apple_usb_role_ctl_trace(ur, "ehci");
+ 	ur->ohci = apple_usb_role_add_hc(ur, ur->ohci_np);
+ 	if (!ur->ohci)
+ 		dev_warn(ur->dev, "no OHCI: low/full-speed devices will not work\n");
++	apple_usb_role_ctl_trace(ur, "ohci");
++
++	/* If something dropped bit 1 on the way, assert it once more. */
++	ctl = readl(ur->usb_ctl + USB_CTL_HOST);
++	if (usb_ctl_phy_on && !(ctl & USB_CTL_PHY_ON)) {
++		writel(ctl | USB_CTL_PHY_ON, ur->usb_ctl + USB_CTL_HOST);
++		apple_usb_role_ctl_trace(ur, "reassert");
++	}
++	apple_usb_role_ctl_trace_log(ur);
++	if (force)
++		apple_usb_role_ctl_force(ur, force);
+ 
+ 	dev_info(ur->dev, "host mode%s (USB_CTL %#x/%#x, accessory power: %s)\n",
+ 		 ur->accessory_claim ? " for the Lightning accessory" : "",
+@@ -823,6 +909,14 @@ static int apple_usb_role_regs_show(struct seq_file *s, void *unused)
+ 		   readl(ur->usb_ctl + USB_CTL_HOST), readl(ur->usb_ctl + USB_CTL_DEVICE),
+ 		   ur->ctl_host, !!(readl(ur->usb_ctl + USB_CTL_HOST) & USB_CTL_PHY_ON),
+ 		   ur->ctl_phy_on);
++	seq_puts(s, "usb_ctl trace (last host entry):");
++	for (i = 0; i < ur->ctl_trace_n; i++)
++		seq_printf(s, " %s=%x", ur->ctl_trace_what[i], ur->ctl_trace[i]);
++	seq_putc(s, '\n');
++	if (ur->ctl_force_done)
++		seq_printf(s, "usb_ctl forced: wrote %x, read %x, %x after 1 ms, %x after 100 ms\n",
++			   ur->ctl_forced, ur->ctl_forced_rb[0], ur->ctl_forced_rb[1],
++			   ur->ctl_forced_rb[2]);
+ 	apple_usb_role_dump(s, "remap", ur->remap, REMAP_DEVICE, REMAP_LAST);
+ 
+ 	if (ur->phy_regs) {
+@@ -966,10 +1060,39 @@ static int apple_usb_role_sink_get(void *data, u64 *val)
+ DEFINE_DEBUGFS_ATTRIBUTE(apple_usb_role_sink_fops, apple_usb_role_sink_get,
+ 			 apple_usb_role_sink_set, "%llu\n");
+ 
++/* Debug: write USB_CTL+0 (bit 1, bit 0 kept) while in host mode; read: current value. */
++static int apple_usb_role_usb_ctl_set(void *data, u64 val)
++{
++	struct apple_usb_role *ur = data;
++	int ret = 0;
++
++	if (val & ~(u64)(USB_CTL_HOST_EN | USB_CTL_PHY_ON))
++		return -EINVAL;
++	mutex_lock(&ur->lock);
++	if (ur->role != USB_ROLE_HOST || !ur->ctl_host)
++		ret = -EBUSY;
++	else
++		apple_usb_role_ctl_force(ur, val);
++	mutex_unlock(&ur->lock);
++	return ret;
++}
++
++static int apple_usb_role_usb_ctl_get(void *data, u64 *val)
++{
++	struct apple_usb_role *ur = data;
++
++	*val = readl(ur->usb_ctl + USB_CTL_HOST);
++	return 0;
++}
++DEFINE_DEBUGFS_ATTRIBUTE(apple_usb_role_usb_ctl_fops, apple_usb_role_usb_ctl_get,
++			 apple_usb_role_usb_ctl_set, "0x%llx\n");
++
+ static void apple_usb_role_debugfs(struct apple_usb_role *ur)
+ {
+ 	ur->debugfs = debugfs_create_dir("apple-usb-role", NULL);
+ 	debugfs_create_file("regs", 0400, ur->debugfs, ur, &apple_usb_role_regs_fops);
++	debugfs_create_file_unsafe("usb_ctl", 0600, ur->debugfs, ur,
++				   &apple_usb_role_usb_ctl_fops);
+ 	if (ur->pmic) {
+ 		debugfs_create_file_unsafe("pmu_ldo5", 0600, ur->debugfs, ur,
+ 					   &apple_usb_role_ldo5_fops);

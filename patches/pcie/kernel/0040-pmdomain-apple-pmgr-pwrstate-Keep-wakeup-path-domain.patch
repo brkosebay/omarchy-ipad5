@@ -1,0 +1,33 @@
+From 02f018b0320903f6c66309c7afd51135c61450ac Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 15:35:15 +0000
+Subject: [PATCH 40/43] pmdomain: apple: pmgr-pwrstate: Keep wakeup-path
+ domains on in sleep
+
+Set GENPD_FLAG_ACTIVE_WAKEUP, so that a domain stays on over system
+sleep while a device in it is on the wakeup path. Only system sleep is
+affected.
+---
+ drivers/pmdomain/apple/pmgr-pwrstate.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/pmdomain/apple/pmgr-pwrstate.c b/drivers/pmdomain/apple/pmgr-pwrstate.c
+index 82c33cf727..38ffee9f00 100644
+--- a/drivers/pmdomain/apple/pmgr-pwrstate.c
++++ b/drivers/pmdomain/apple/pmgr-pwrstate.c
+@@ -224,7 +224,11 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
+ 		return ret;
+ 	}
+ 
+-	ps->genpd.flags |= GENPD_FLAG_IRQ_SAFE;
++	/*
++	 * Keep a domain on over system sleep while a device in it is on the
++	 * wakeup path (e.g. a USB gadget kept connected in s2idle).
++	 */
++	ps->genpd.flags |= GENPD_FLAG_IRQ_SAFE | GENPD_FLAG_ACTIVE_WAKEUP;
+ 	ps->genpd.name = name;
+ 	ps->genpd.power_on = apple_pmgr_ps_power_on;
+ 	ps->genpd.power_off = apple_pmgr_ps_power_off;
+-- 
+2.56.0
+

@@ -1,0 +1,8 @@
+build/
+third_party/
+docs/adt/
+__pycache__/
+*.py[cod]
+.DS_Store
+.vdec*/
+-rescored.json

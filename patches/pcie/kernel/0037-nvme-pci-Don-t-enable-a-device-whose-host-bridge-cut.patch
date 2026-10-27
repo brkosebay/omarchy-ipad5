@@ -1,0 +1,35 @@
+From ae519224205a8b1cb17e275fc5b38b581072e821 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 15:35:15 +0000
+Subject: [PATCH 37/43] nvme-pci: Don't enable a device whose host bridge cut
+ it off
+
+A host bridge marks the devices behind a port disconnected when the
+port's link did not come back from system sleep. nvme_pci_enable() is
+the first BAR access on the reset path; skip it so a dead link is
+never touched.
+---
+ drivers/nvme/host/pci.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index dc45a347a8..012cccc4a9 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -3201,6 +3201,13 @@ static int nvme_pci_enable(struct nvme_dev *dev)
+ 	struct pci_dev *pdev = to_pci_dev(dev->dev);
+ 	unsigned int flags = PCI_IRQ_ALL_TYPES;
+ 
++	/*
++	 * A host bridge cuts off a port whose link did not come back after
++	 * system sleep; a BAR read over it could stall the CPU.
++	 */
++	if (pci_dev_is_disconnected(pdev))
++		return -ENODEV;
++
+ 	if (pci_enable_device_mem(pdev))
+ 		return result;
+ 
+-- 
+2.56.0
+

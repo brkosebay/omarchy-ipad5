@@ -1,0 +1,73 @@
+From 3e86ad4fb426b649634cffac5f14e346e7419509 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 12:03:59 +0000
+Subject: [PATCH 17/43] iommu: apple-dart: Fix the S5L8960X fault handler and
+ TCR update
+
+apple_dart_s5l8960x_irq() looked up the iommu master config of the DART's
+own device. That device is not behind an IOMMU, dev_iommu_priv_get()
+returns NULL, and the handler dereferenced it to print the fault address.
+So every S5L8960X DART fault was a NULL dereference in hard IRQ context,
+i.e. a panic. On a framebuffer console behind deferred I/O (simpledrm)
+nothing of it reaches the screen; the machine just stops. Print the
+error address register as is: iOS prints it as the IOVA without adding
+any window base.
+
+apple_dart_s5l8960x_write_tcr() masked the TCR with the stream's own byte
+instead of clearing it, and wrote the new value into stream 0's byte
+whatever the stream. Disabling a stream could not clear its enable bit,
+and any write cleared the other streams. Replace the stream's byte only,
+matching apple_dart_s5l8960x_read_tcr().
+---
+ drivers/iommu/apple-dart.c | 17 ++++++++++++-----
+ 1 file changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/iommu/apple-dart.c b/drivers/iommu/apple-dart.c
+index 85311e95ff..4333c3451f 100644
+--- a/drivers/iommu/apple-dart.c
++++ b/drivers/iommu/apple-dart.c
+@@ -368,10 +368,12 @@ static u32 apple_dart_s5l8960x_read_tcr(struct apple_dart *dart, u32 sid)
+ static void apple_dart_s5l8960x_write_tcr(struct apple_dart *dart, u32 sid, u32 val)
+ {
+ 	WARN_ON(sid >= 4);
++	u32 shift = sid * DART_S5L8960X_TCR_BITS_PER_STREAM;
+ 	u32 tcr = readl(dart->regs + dart->hw->tcr);
+ 
+-	tcr &= 0xff << (sid * DART_S5L8960X_TCR_BITS_PER_STREAM);
+-	tcr |= val;
++	/* One byte per stream: replace this stream's byte, keep the others */
++	tcr &= ~(0xff << shift);
++	tcr |= (val & 0xff) << shift;
+ 	writel(tcr, dart->regs + dart->hw->tcr);
+ }
+ 
+@@ -1182,7 +1184,6 @@ static const struct iommu_ops apple_dart_iommu_ops = {
+ static irqreturn_t apple_dart_s5l8960x_irq(int irq, void *dev)
+ {
+ 	struct apple_dart *dart = dev;
+-	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dart->dev);
+ 	const char *fault_name = NULL;
+ 	u32 error = readl(dart->regs + DART_S5L8960X_ERROR);
+ 	u32 error_code = FIELD_GET(DART_S5L8960X_ERROR_CODE, error);
+@@ -1206,10 +1207,16 @@ static irqreturn_t apple_dart_s5l8960x_irq(int irq, void *dev)
+ 	else
+ 		fault_name = "unknown";
+ 
++	/*
++	 * The DART's own device has no iommu master config (dev->iommu is
++	 * NULL), so don't look one up here: doing so turned every fault into
++	 * a NULL dereference in hard IRQ context, i.e. a silent panic. iOS
++	 * prints this register as the IOVA without adding any window base.
++	 */
+ 	dev_err_ratelimited(
+ 		dart->dev,
+-		"translation fault: status:0x%x stream:%d code:0x%x (%s) at 0x%llx",
+-		error, stream_idx, error_code, fault_name, addr | cfg->dma_min);
++		"translation fault: status:0x%x stream:%d code:0x%x (%s) at 0x%x\n",
++		error, stream_idx, error_code, fault_name, addr);
+ 
+ 	writel(error, dart->regs + DART_S5L8960X_ERROR);
+ 	return IRQ_HANDLED;
+-- 
+2.56.0
+

@@ -1,0 +1,22 @@
+  // linux-a9: iPad screen orientation and pointer (ipad-rotate, ipad-pointer), auto-brightness, the Smart Cover, screen off and idle sleep.
+  // Plain actions, and a few cheap guards (a grep of a status file, no process) for the sensor entries below.
+  "trigger.toggle.ipad": {"icon":"","label":"iPad Screen"},
+  "trigger.toggle.ipad.landscape": {"icon":"","label":"Landscape","description":"home button on the right","action":"ipad-rotate landscape"},
+  "trigger.toggle.ipad.portrait": {"icon":"","label":"Portrait","description":"home button at the bottom","action":"ipad-rotate portrait"},
+  "trigger.toggle.ipad.landscape-flipped": {"icon":"","label":"Landscape (flipped)","description":"home button on the left","action":"ipad-rotate landscape-flipped"},
+  "trigger.toggle.ipad.portrait-flipped": {"icon":"","label":"Portrait (flipped)","description":"home button at the top","action":"ipad-rotate portrait-flipped"},
+  "trigger.toggle.ipad.pointer-visible": {"icon":"","label":"Pointer Always Visible","action":"ipad-pointer visible"},
+  "trigger.toggle.ipad.pointer-auto": {"icon":"","label":"Pointer Hides on Touch","description":"until a mouse moves","action":"ipad-pointer auto"},
+  "trigger.toggle.ipad.pointer-hidden": {"icon":"","label":"Pointer Hidden","description":"like iPadOS","action":"ipad-pointer hidden"},
+  // Ambient-light auto-brightness: shown while its daemon runs (an IIO light sensor exists). Off by default.
+  "trigger.toggle.ipad.autobright-on": {"icon":"󰃡","label":"Auto-Brightness On","description":"follow the ambient light","when":"[[ -e ${XDG_RUNTIME_DIR:-/tmp}/ipad-als-brightness.json ]] && ! grep -q '\"enabled\": true' ${XDG_RUNTIME_DIR:-/tmp}/ipad-als-brightness.json","action":"ipad-als-brightness on"},
+  "trigger.toggle.ipad.autobright-off": {"icon":"󰃡","label":"Auto-Brightness Off","when":"grep -qs '\"enabled\": true' ${XDG_RUNTIME_DIR:-/tmp}/ipad-als-brightness.json","action":"ipad-als-brightness off"},
+  // Smart Cover (hall sensor): shown while its daemon runs (the kernel has the switch). Off by default; suspend never without its own switch.
+  "trigger.toggle.ipad.cover-on": {"icon":"󰌾","label":"Cover Closes Screen On","description":"lock (with a password) and turn the display off","when":"[[ -e ${XDG_RUNTIME_DIR:-/tmp}/ipad-lid.json ]] && ! grep -q '\"actions\": true' ${XDG_RUNTIME_DIR:-/tmp}/ipad-lid.json","action":"ipad-lid on"},
+  "trigger.toggle.ipad.cover-off": {"icon":"󰌾","label":"Cover Closes Screen Off","when":"grep -qs '\"actions\": true' ${XDG_RUNTIME_DIR:-/tmp}/ipad-lid.json","action":"ipad-lid off"},
+  "trigger.toggle.ipad.cover-sleep-on": {"icon":"󰤄","label":"Sleep When Cover Closes On","description":"experimental: resume after sleep is not reliable yet","when":"grep -qs '\"actions\": true' ${XDG_RUNTIME_DIR:-/tmp}/ipad-lid.json && ! grep -q '\"suspend\": true' ${XDG_RUNTIME_DIR:-/tmp}/ipad-lid.json","action":"ipad-lid suspend on"},
+  "trigger.toggle.ipad.cover-sleep-off": {"icon":"󰤄","label":"Sleep When Cover Closes Off","when":"grep -qs '\"suspend\": true' ${XDG_RUNTIME_DIR:-/tmp}/ipad-lid.json","action":"ipad-lid suspend off"},
+  // Screen off without sleep (ipad-screen); touch, a key or Power turn it back on. Idle: screen off at 5 min, s2idle as well only when switched on.
+  "trigger.toggle.ipad.screen-off": {"icon":"󰶐","label":"Screen Off","description":"touch or a key turns it back on","action":"ipad-screen off"},
+  "trigger.toggle.ipad.idle-suspend-on": {"icon":"󰒲","label":"Sleep When Idle On","description":"s2idle after 5 min, not only screen off","when":"! grep -qs '^idle_suspend=on' ${XDG_STATE_HOME:-$HOME/.local/state}/linux-a9/display","action":"ipad-sleep idle-suspend on"},
+  "trigger.toggle.ipad.idle-suspend-off": {"icon":"󰒲","label":"Sleep When Idle Off","description":"screen off only","when":"grep -qs '^idle_suspend=on' ${XDG_STATE_HOME:-$HOME/.local/state}/linux-a9/display","action":"ipad-sleep idle-suspend off"},

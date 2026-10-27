@@ -1,0 +1,93 @@
+From 5a9ae9ed821f54b155cad6defae3e45769bcd55a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Berkay=20K=C3=B6sebay?= <maintainer@example.invalid>
+Date: Thu, 22 Oct 2026 14:03:39 +0200
+Subject: [PATCH] Skip the first-boot initramfs rebuild when no mkinitcpio is
+ installed
+
+omarchy-provision-hardware rebuilds the initramfs after the deferred
+hardware steps whenever a step changed its inputs, and runs mkinitcpio -P
+when Limine's wrapper is absent. A machine whose kernel and initramfs are
+built outside its root (a board's own loader, a chainloaded payload) has
+no mkinitcpio at all, so that call fails with "command not found", the
+service exits 1 and stays armed, and it fails again on every boot. Its
+initramfs isn't built here, so there is nothing to rebuild: say so and
+finish the setup.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ bin/omarchy-provision-hardware               | 24 +++++++++++++-------
+ test/shell.d/image-deferred-hardware-test.sh | 15 ++++++++++++
+ 2 files changed, 31 insertions(+), 8 deletions(-)
+
+diff --git a/bin/omarchy-provision-hardware b/bin/omarchy-provision-hardware
+index fee987635..67baaf82e 100755
+--- a/bin/omarchy-provision-hardware
++++ b/bin/omarchy-provision-hardware
+@@ -11,7 +11,8 @@
+ # Steps run in order and each one that succeeds leaves the queue, so a failure
+ # stops the run and the next run resumes at that step. Once the queue is empty
+ # the initramfs is rebuilt if any step changed its configuration or asked for
+-# the rebuild, and the service is disabled. With nothing deferred this does
++# the rebuild (on a machine that builds its own initramfs at all), and the
++# service is disabled. With nothing deferred this does
+ # nothing. A failed step, or a failure to make the pacman keyring the build
+ # asked for, exits 75 (it stays queued for the next run); anything else that
+ # stops the run, such as an untrusted manifest or queue, exits 1.
+@@ -140,14 +141,21 @@ while (( ${#remaining[@]} )); do
+ done
+ 
+ if [[ -e $omarchy_image_boot_rebuild || $(initramfs_inputs) != "$(<"$omarchy_image_initramfs_baseline")" ]]; then
+-  echo "Rebuilding the initramfs for the deferred hardware setup"
+-  if omarchy-cmd-present limine-mkinitcpio; then
+-    limine-mkinitcpio </dev/null >>"$OMARCHY_INSTALL_LOG_FILE" 2>&1
++  if omarchy-cmd-present limine-mkinitcpio || omarchy-cmd-present mkinitcpio; then
++    echo "Rebuilding the initramfs for the deferred hardware setup"
++    if omarchy-cmd-present limine-mkinitcpio; then
++      limine-mkinitcpio </dev/null >>"$OMARCHY_INSTALL_LOG_FILE" 2>&1
++    else
++      mkinitcpio -P </dev/null >>"$OMARCHY_INSTALL_LOG_FILE" 2>&1
++    fi || fail "Initramfs rebuild failed (see $OMARCHY_INSTALL_LOG_FILE); the next run retries it"
++    # The new image must be on disk before the queue that owes it is cleared.
++    sync || fail "could not flush the rebuilt initramfs to disk"
+   else
+-    mkinitcpio -P </dev/null >>"$OMARCHY_INSTALL_LOG_FILE" 2>&1
+-  fi || fail "Initramfs rebuild failed (see $OMARCHY_INSTALL_LOG_FILE); the next run retries it"
+-  # The new image must be on disk before the queue that owes it is cleared.
+-  sync || fail "could not flush the rebuilt initramfs to disk"
++    # No initramfs builder installed: the kernel and initramfs this machine
++    # boots are built outside its root (a board's own loader or a chainloaded
++    # payload), so there is nothing here to rebuild.
++    echo "No mkinitcpio installed, so this machine's initramfs is built elsewhere; nothing to rebuild"
++  fi
+ fi
+ rm -f "$omarchy_image_initramfs_baseline" "$omarchy_image_boot_rebuild"
+ 
+diff --git a/test/shell.d/image-deferred-hardware-test.sh b/test/shell.d/image-deferred-hardware-test.sh
+index 741ef4d3b..e97f2245d 100644
+--- a/test/shell.d/image-deferred-hardware-test.sh
++++ b/test/shell.d/image-deferred-hardware-test.sh
+@@ -358,6 +358,21 @@ first_boot "$root" >/dev/null || fail "a step that changes module options finish
+ rm -f "$fixture/install/hardware/modprobe.sh"
+ pass "a step that only changed module options gets the rebuild"
+ 
++# A machine with no initramfs builder boots a kernel and initramfs built
++# outside its root, so a changed input owes no rebuild: the setup finishes.
++reset_logs
++rm -f "$stub_bin/mkinitcpio"
++root=$(new_root no-builder)
++write_manifest "$root"
++build "$root" >/dev/null || fail "the fixture image builds"
++output=$(first_boot "$root") || fail "a machine without mkinitcpio finishes the deferred hardware setup" "$output"
++[[ ! -e $REBUILDS && ! -e $root/var/lib/omarchy/image/initramfs-inputs && ! -e $root/var/lib/omarchy/image/deferred-steps ]] ||
++  fail "a machine without mkinitcpio owes no rebuild once the queue is empty" "$output"
++[[ ! -L $root/etc/systemd/system/multi-user.target.wants/$unit_name ]] ||
++  fail "a machine without mkinitcpio disarms the service"
++stub_rebuild mkinitcpio
++pass "a machine without mkinitcpio has no initramfs to rebuild"
++
+ # --- The pacman keyring -------------------------------------------------------
+ 
+ # Install finalization makes the pacman keyring on plain aarch64.
+-- 
+2.49.0
+

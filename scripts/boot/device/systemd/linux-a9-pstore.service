@@ -1,0 +1,11 @@
+[Unit]
+Description=Archive linux-a9 panic records copied by initramfs
+After=local-fs.target
+ConditionPathExists=/run/linux-a9/pstore
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/linux-a9/linux-a9-pstore --archive
+
+[Install]
+WantedBy=multi-user.target

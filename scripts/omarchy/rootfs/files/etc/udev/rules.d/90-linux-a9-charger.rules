@@ -1,0 +1,2 @@
+# Retired: charge7+ applies the board input ceiling in the kernel.
+# Explicit input_current_limit sysfs writes remain per-attach user policy.

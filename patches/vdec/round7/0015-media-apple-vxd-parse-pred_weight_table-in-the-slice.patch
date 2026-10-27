@@ -1,0 +1,165 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 12:40:06 +0000
+Subject: [PATCH 15/21] media: apple: vxd: parse pred_weight_table in the slice
+ parser
+
+Frame-based decoding has no PRED_WEIGHTS control (it is part of the
+slice-based interface), so explicit weighted prediction needs the table
+from the slice header itself.  The parser used to skip it; it now keeps
+the luma/chroma log2 denominators and, per reference of both lists, the
+weights and offsets, filling in the values clause 7.4.3.2 infers for
+absent flags (weight 1 << denominator, offset 0) the way AppleD5500's
+copy (0xfffffff0062b0e9c) fills its arrays.  Out-of-range denominators
+(> 7) or weights/offsets (outside -128..127) refuse the picture.
+
+The slice limit goes from 64 to 128 per picture; the submit path is
+lifted to match in the next patches.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ .../platform/apple/vxd/apple-vxd-h264-parse.c      | 66 +++++++++++++++++-----
+ .../platform/apple/vxd/apple-vxd-h264-parse.h      | 15 ++++-
+ 2 files changed, 66 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-h264-parse.c b/drivers/media/platform/apple/vxd/apple-vxd-h264-parse.c
+index 2a1d5f79600110ee0c0d5fe9ef092c8a5720be13..b091235c47e0fac74f48e8d9c28bea09478ad040 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-h264-parse.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-h264-parse.c
+@@ -125,16 +125,34 @@ static int vxd_parse_mods(struct vxd_bits *b, struct apple_vxd_h264_slice *sl,
+ 	return 0;
+ }
+ 
+-static void vxd_skip_pred_weight_table(struct vxd_bits *b,
++/* luma/chroma_weight and _offset: se(v) in -128..127 (7.4.3.2, 8 bits). */
++static bool vxd_weight_ok(s32 v)
++{
++	return v >= -128 && v <= 127;
++}
++
++/*
++ * Clause 7.3.3.2, with the inferred weights and offsets filled in.  The
++ * command stream carries the table for every active reference.
++ */
++static int vxd_parse_pred_weight_table(struct vxd_bits *b,
+ 				       const struct v4l2_ctrl_h264_sps *sps,
+-				       const struct apple_vxd_h264_slice *sl)
++				       struct apple_vxd_h264_slice *sl)
+ {
+ 	unsigned int chroma = vxd_chroma_array_type(sps);
+-	unsigned int list, i, n;
++	unsigned int list, i, c, n;
++	u32 v;
+ 
+-	vxd_bits_ue(b);			/* luma_log2_weight_denom */
+-	if (chroma)
+-		vxd_bits_ue(b);		/* chroma_log2_weight_denom */
++	v = vxd_bits_ue(b);
++	if (v > 7)
++		return -EINVAL;
++	sl->luma_log2_weight_denom = v;
++	if (chroma) {
++		v = vxd_bits_ue(b);
++		if (v > 7)
++			return -EINVAL;
++		sl->chroma_log2_weight_denom = v;
++	}
+ 
+ 	for (list = 0; list < 2; list++) {
+ 		if (list && !vxd_slice_is(sl->slice_type, V4L2_H264_SLICE_TYPE_B))
+@@ -142,18 +160,35 @@ static void vxd_skip_pred_weight_table(struct vxd_bits *b,
+ 		n = list ? sl->num_ref_idx_l1_active_minus1 :
+ 			   sl->num_ref_idx_l0_active_minus1;
+ 		for (i = 0; i <= n && !b->overrun; i++) {
++			struct apple_vxd_h264_weight *w = &sl->weights[list][i];
++			s32 wt, off;
++
++			w->weight[0] = 1 << sl->luma_log2_weight_denom;
+ 			if (vxd_bit(b)) {	/* luma_weight_lX_flag */
+-				vxd_bits_se(b);
+-				vxd_bits_se(b);
++				wt = vxd_bits_se(b);
++				off = vxd_bits_se(b);
++				if (!vxd_weight_ok(wt) || !vxd_weight_ok(off))
++					return -EINVAL;
++				w->weight[0] = wt;
++				w->offset[0] = off;
+ 			}
+-			if (chroma && vxd_bit(b)) {
+-				vxd_bits_se(b);
+-				vxd_bits_se(b);
+-				vxd_bits_se(b);
+-				vxd_bits_se(b);
++			if (!chroma)
++				continue;
++			for (c = 1; c < 3; c++)
++				w->weight[c] = 1 << sl->chroma_log2_weight_denom;
++			if (!vxd_bit(b))	/* chroma_weight_lX_flag */
++				continue;
++			for (c = 1; c < 3; c++) {
++				wt = vxd_bits_se(b);
++				off = vxd_bits_se(b);
++				if (!vxd_weight_ok(wt) || !vxd_weight_ok(off))
++					return -EINVAL;
++				w->weight[c] = wt;
++				w->offset[c] = off;
+ 			}
+ 		}
+ 	}
++	return 0;
+ }
+ 
+ static int vxd_skip_dec_ref_pic_marking(struct vxd_bits *b,
+@@ -281,7 +316,10 @@ static int vxd_parse_slice_header(const u8 *nal, size_t len,
+ 	if (((pps->flags & V4L2_H264_PPS_FLAG_WEIGHTED_PRED) && (p || sp)) ||
+ 	    (pps->weighted_bipred_idc == 1 && b_slice)) {
+ 		sl->has_pred_weight_table = true;
+-		vxd_skip_pred_weight_table(&b, sps, sl);
++		if (vxd_parse_pred_weight_table(&b, sps, sl)) {
++			*why = "bad pred_weight_table";
++			return -EINVAL;
++		}
+ 	}
+ 
+ 	if (sl->nal_ref_idc && vxd_skip_dec_ref_pic_marking(&b, sl)) {
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-h264-parse.h b/drivers/media/platform/apple/vxd/apple-vxd-h264-parse.h
+index fce6918ce4dc2bc17266f4ed84186c5f1226599b..625bca644f63de4c5e191a6b0c5281bcc8d3144e 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-h264-parse.h
++++ b/drivers/media/platform/apple/vxd/apple-vxd-h264-parse.h
+@@ -17,7 +17,7 @@
+ #include <linux/types.h>
+ #include <linux/v4l2-controls.h>
+ 
+-#define APPLE_VXD_H264_MAX_SLICES	64
++#define APPLE_VXD_H264_MAX_SLICES	128
+ 
+ #define APPLE_VXD_H264_NAL_SLICE	1
+ #define APPLE_VXD_H264_NAL_IDR		5
+@@ -27,6 +27,16 @@ struct apple_vxd_h264_ref_mod {
+ 	u32 val;			/* abs_diff_pic_num_minus1 or long_term_pic_num */
+ };
+ 
++/*
++ * One pred_weight_table() entry with the values clause 7.4.3.2 infers for
++ * absent flags (weight 1 << denominator, offset 0), the way AppleD5500's
++ * copy (0xfffffff0062b0e9c) fills its per-reference arrays.
++ */
++struct apple_vxd_h264_weight {
++	s16 weight[3];			/* Y, Cb, Cr */
++	s8 offset[3];
++};
++
+ struct apple_vxd_h264_slice {
+ 	/* Location in the OUTPUT buffer. */
+ 	u32 sc_offset;			/* first byte of the start code */
+@@ -58,6 +68,9 @@ struct apple_vxd_h264_slice {
+ 	u8 num_mods[2];
+ 	struct apple_vxd_h264_ref_mod mods[2][V4L2_H264_REF_LIST_LEN + 1];
+ 	bool has_pred_weight_table;
++	u8 luma_log2_weight_denom;
++	u8 chroma_log2_weight_denom;
++	struct apple_vxd_h264_weight weights[2][V4L2_H264_REF_LIST_LEN];
+ 	bool no_output_of_prior_pics;
+ 	bool long_term_reference;
+ 	bool adaptive_ref_pic_marking;

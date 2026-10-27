@@ -1,0 +1,21 @@
+# linux-a9: a bonded Bluetooth keyboard reconnects by paging the iPad when a
+# key wakes it, so the controller must be page-scanning while the keyboard is
+# disconnected. BlueZ leaves "connectable" off and relies on the kernel's
+# accept list for that, which left page scan off on this iPad (device boots 4
+# and 5); this turns connectable on once the controller is powered
+# (ipad-bt-doctor --ensure-pagescan). Runs after every bluetooth start and
+# from linux-a9-bt-pagescan.timer, because bluetoothd turns connectable off
+# again whenever discoverable goes off. When it acts it logs the page scan it
+# found, so `journalctl -u linux-a9-bt-pagescan` shows how often that was.
+[Unit]
+Description=linux-a9: let bonded Bluetooth keyboards reconnect (page scan)
+After=bluetooth.service
+PartOf=bluetooth.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ipad-bt-doctor --ensure-pagescan
+TimeoutStartSec=90
+
+[Install]
+WantedBy=bluetooth.service

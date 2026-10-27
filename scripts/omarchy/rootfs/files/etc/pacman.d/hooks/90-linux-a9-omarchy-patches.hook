@@ -1,0 +1,16 @@
+# Re-apply linux-a9's local Omarchy patches (iDevice platform detection, Snapper
+# on a non-btrfs root, no initramfs rebuild without mkinitcpio) after an Omarchy
+# update replaces a patched file. Drop this hook once the fixes are upstream
+# (patches/omarchy/ in the linux-a9 repo has them with PR text).
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Path
+Target = usr/bin/omarchy-hw-platform
+Target = usr/bin/omarchy-provision-hardware
+Target = usr/share/omarchy/install/config/snapper.sh
+
+[Action]
+Description = Re-applying linux-a9 Omarchy patches...
+When = PostTransaction
+Exec = /usr/local/sbin/linux-a9-omarchy-patches

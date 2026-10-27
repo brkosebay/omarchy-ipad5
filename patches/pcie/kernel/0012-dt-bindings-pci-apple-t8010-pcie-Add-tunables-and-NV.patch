@@ -1,0 +1,81 @@
+From cf4b81002d1d586827de2c7899422a910ee35888 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 11:16:14 +0000
+Subject: [PATCH 12/43] dt-bindings: pci: apple,t8010-pcie: Add tunables and
+ NVMMU FIFO mode
+
+iBoot fills tunables into the live Apple device tree that iOS applies
+while bringing the root complex up (apcie-phy-tunables,
+apcie-common-tunables, and per bridge apcie-config-tunables and
+pcie-rc-tunables), and marks the A9 NVMMU with
+invalidate-fifo-workaround. Describe them as <offset mask value>
+matrices and a small enum.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ .../bindings/pci/apple,t8010-pcie.yaml        | 42 +++++++++++++++++++
+ 1 file changed, 42 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/pci/apple,t8010-pcie.yaml b/Documentation/devicetree/bindings/pci/apple,t8010-pcie.yaml
+index 2b6db0909d..5db406d0cd 100644
+--- a/Documentation/devicetree/bindings/pci/apple,t8010-pcie.yaml
++++ b/Documentation/devicetree/bindings/pci/apple,t8010-pcie.yaml
+@@ -88,6 +88,37 @@ properties:
+       - const: link2
+       - const: link3
+ 
++  apple,tunable-phy:
++    $ref: /schemas/types.yaml#/definitions/uint32-matrix
++    items:
++      items:
++        - description: register offset in the "phy" block
++        - description: mask
++        - description: value
++    description:
++      PHY tunables (Apple device tree apcie-phy-tunables), applied as
++      (reg & ~mask) | (value & mask) after the common init.
++
++  apple,tunable-common:
++    $ref: /schemas/types.yaml#/definitions/uint32-matrix
++    items:
++      items:
++        - description: register offset in the "rc" block
++        - description: mask
++        - description: value
++    description:
++      Root complex tunables (apcie-common-tunables), applied after the PHY
++      tunables.
++
++  apple,nvmmu-invalidate-fifo:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    enum: [0, 1, 2]
++    default: 0
++    description:
++      NVMMU invalidate workaround (nvme-mmu0 invalidate-fifo-workaround):
++      1 waits for the invalidate FIFO in the port 0 block to drain before
++      each invalidate, 2 spaces invalidates by a fixed delay.
++
+   apple,lane-cfg:
+     $ref: /schemas/types.yaml#/definitions/uint32
+     maximum: 15
+@@ -146,6 +177,17 @@ patternProperties:
+           Target link speed of the root port. Defaults to 3 (8 GT/s) for
+           port 0 on T8010, 2 (5 GT/s) for port 0 on S8003 and 1 otherwise.
+ 
++      apple,tunable-config:
++        $ref: /schemas/types.yaml#/definitions/uint32-matrix
++        description:
++          Port block tunables (apcie-config-tunables), <offset mask value>.
++
++      apple,tunable-rc:
++        $ref: /schemas/types.yaml#/definitions/uint32-matrix
++        description:
++          Root port config space tunables (pcie-rc-tunables),
++          <offset mask value>.
++
+       apple,nvme-mode:
+         type: boolean
+         description:
+-- 
+2.56.0
+

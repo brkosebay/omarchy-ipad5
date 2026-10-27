@@ -1,0 +1,14 @@
+5195bb9e7c03beee41b36fca394da6467a1b6402e5976ddc6bf49527786ea220  ./0001-dt-bindings-media-add-Apple-S8000-VXD-video-decoder.patch
+c011231c64659e53836587ee9b5e803f6c71f96412cfcd3832b6e4986f16de78  ./0002-arm64-dts-apple-s8000-s8003-add-the-VXD-video-decode.patch
+d1cc588a0c2c43072fb5fa06f36fc3f6afa2b22eb24b393b2a1a42be79d7af51  ./0003-media-apple-add-VXD-PowerVR-MSVDX-probe-and-bring-up.patch
+5282ab4d3b0250fefbefb5711d555ca492a7799918081088c533d0bc558680c5  ./0004-media-apple-vxd-add-the-V4L2-stateless-H.264-m2m-dev.patch
+f7c3e1320d4f53fe05c8c8e8a58f5320ba370d7e0e3f13eea8958d144ea918dc  ./0005-media-apple-vxd-wire-the-V4L2-device-into-probe-make.patch
+dccd7ac74382a2a2010c47e03a46ead1281452efc116bc8ec5129556ed20389d  ./0006-media-apple-vxd-fix-the-open-NULL-dereference-and-ha.patch
+13eaf2e619274632a72f1a0d8ebc70aa74572ac81ffd7d7d069f34b22f840747  ./0007-media-apple-vxd-fix-the-GART-for-16-KiB-pages-and-DR.patch
+24db394fc37a5f51d4ac118c76770f4a143e25b7fa96b3f9468855814a650812  ./0008-media-apple-vxd-bring-up-the-host-MTX-mailbox-R3a.patch
+21c4f5135b11b2c122d689d2127086ad229cd949bcdf7a58f3069df7d808f6f1  ./0009-media-apple-vxd-add-the-command-buffer-layer-R3b.patch
+f57c8d283bd7faa5982f7ff846124f2f78eaf1139d96f56e530dcb214507de80  ./0010-media-apple-vxd-split-the-command-encoders-out-of-th.patch
+1e110c0d630be3d388d254d56b250125aab795777ebcc911c6671d346b06d780  ./0011-media-apple-vxd-add-a-debugfs-check-that-the-firmwar.patch
+33761b15a9017154c10499a9949008e066443e235e2b9309c346254b630190df  ./0012-media-apple-vxd-find-and-parse-H.264-slices-in-the-d.patch
+647b5c289ac892f059d0c8328e25ebbc4e33d648951ac0c5504d7b20ba96f3e8  ./0013-media-apple-vxd-add-the-H.264-AVC-command-stream-bui.patch
+5e1b79443bc4a5b4db68ff1730e9f7dbb2ab73543f541284be9bc5143f98c3e5  ./0014-media-apple-vxd-decode-H.264-pictures-through-the-ma.patch

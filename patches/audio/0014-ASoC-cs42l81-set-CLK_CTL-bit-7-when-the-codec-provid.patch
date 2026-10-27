@@ -1,0 +1,213 @@
+From 3a15ff483a2a470364f3b7f361c20c1cc7f61afb Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 12:51:46 +0000
+Subject: [PATCH 14/17] ASoC: cs42l81: set CLK_CTL bit 7 when the codec
+ provides the clocks
+
+iOS 16.7.10's AppleCS42L81Audio::enableAudio writes CLK_CTL (0x000f)
+[7:6,3:0] = 0x80 when its IIS link is not clock master and 0x0c
+otherwise: the flag at +0x1ec bit 0 is set at start from
+!AppleARMIISDevice::isMaster() (vtable +0x580, iisConfig[0] & 1), which is
+0 on J71t (iisConfig 0x10: MCA0 consumer, MCLK output). The driver always
+wrote 0x0c, i.e. the SoC-master setting, while also making the ASP the
+clock master (0x0012 bit 7).
+
+On the device the codec then produced no BCLK/LRCK and never reported
+PDN_DONE at power-down. Use 0x80 for the codec-provider case, and log
+CLK_CTL and the latched status registers after power-up.
+
+Also add bring-up debugfs: cs42l81-regs dumps every register the driver
+programs plus the latched status registers; cs42l81-reg selects ("REG")
+or writes ("REG VAL") one register and reads the selection back.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ sound/soc/codecs/cs42l81.c | 112 +++++++++++++++++++++++++++++++++++--
+ 1 file changed, 108 insertions(+), 4 deletions(-)
+
+diff --git a/sound/soc/codecs/cs42l81.c b/sound/soc/codecs/cs42l81.c
+index 3bec71e6df..454ba21d8d 100644
+--- a/sound/soc/codecs/cs42l81.c
++++ b/sound/soc/codecs/cs42l81.c
+@@ -15,13 +15,16 @@
+ 
+ #include <linux/bitfield.h>
+ #include <linux/clk.h>
++#include <linux/debugfs.h>
+ #include <linux/delay.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/regmap.h>
++#include <linux/seq_file.h>
+ #include <linux/slab.h>
+ #include <linux/spi/spi.h>
++#include <linux/uaccess.h>
+ #include <sound/pcm.h>
+ #include <sound/pcm_params.h>
+ #include <sound/soc.h>
+@@ -42,7 +45,15 @@
+ #define CS42L81_PWR_CTL2	0x0007
+ #define CS42L81_ADC_PWR		0x000d
+ #define CS42L81_PATH_PWR	0x000e	/* bit 7 DAC PDN, 6 ADC PDN, 5 ? */
+-#define CS42L81_CLK_CTL		0x000f	/* [3:0] rate code */
++#define CS42L81_CLK_CTL		0x000f	/* [3:0] rate code, bit 7 see below */
++/*
++ * iOS enableAudio writes CLK_CTL[7:6,3:0] = 0x80 when the IIS link's
++ * isMaster() is false (codec provides BCLK/LRCK from MCLK, J71t) and 0x0c
++ * when the SoC is clock master (AppleCS42L81Audio flag +0x1ec bit 0 =
++ * !AppleARMIISDevice::isMaster() = !(iisConfig[0] & 1)).
++ */
++#define CS42L81_CLK_CTL_CODEC_MASTER	0x80
++#define CS42L81_CLK_CTL_CODEC_SLAVE	0x0c
+ #define CS42L81_ASP_PWR		0x0011	/* bit 7 ASP RX PDN, 6 ASP TX PDN */
+ #define CS42L81_ASP_CLK		0x0012	/* bit 7 ASP clock master, [3:0] rate */
+ #define CS42L81_ASP_RX_SLOT(n)	(0x0022 + (n))	/* n = 0..9 */
+@@ -116,6 +127,8 @@ struct cs42l81 {
+ 	bool spk_switch;
+ 	bool spk_on;
+ 	bool core_on;
++	bool clk_provider;	/* codec drives BCLK/LRCK (set_fmt) */
++	unsigned int dbg_reg;	/* debugfs cs42l81-reg selection */
+ 	u32 spk_mode;		/* 2 = stereo speakers (both outputs) */
+ };
+ 
+@@ -279,7 +292,9 @@ static int cs42l81_core_power_up(struct cs42l81 *cs)
+ 		regmap_set_bits(map, CS42L81_PWR_CTL1, CS42L81_PWR_CTL1_REVA0);
+ 
+ 	regmap_clear_bits(map, CS42L81_PWR_CTL2, 0x80);
+-	regmap_update_bits(map, CS42L81_CLK_CTL, 0xcf, 0x0c);
++	regmap_update_bits(map, CS42L81_CLK_CTL, 0xcf,
++			   cs->clk_provider ? CS42L81_CLK_CTL_CODEC_MASTER :
++					      CS42L81_CLK_CTL_CODEC_SLAVE);
+ 	regmap_clear_bits(map, CS42L81_ASP_CLK, 0xc0);
+ 	regmap_clear_bits(map, CS42L81_ASP_PWR, 0x10);
+ 
+@@ -316,8 +331,18 @@ static int cs42l81_core_power_up(struct cs42l81 *cs)
+ 	regmap_set_bits(map, CS42L81_PATH_PWR, 0x40);
+ 
+ 	cs->core_on = true;
+-	dev_dbg(cs->dev, "core powered up (rev %#x, rate code %#x)\n",
+-		rev, cs->rate_code);
++	/* latched status after power-up: clock-error bits help the bring-up */
++	{
++		unsigned int st[4] = {};
++
++		regmap_read(map, CS42L81_INT_STATUS1, &st[0]);
++		regmap_read(map, CS42L81_INT_STATUS2, &st[1]);
++		regmap_read(map, CS42L81_INT_STATUS3, &st[2]);
++		regmap_read(map, CS42L81_CLK_CTL, &st[3]);
++		dev_info(cs->dev,
++			 "powered up: rev %#x clk_ctl %#x status 2e=%#x 2f=%#x 33=%#x\n",
++			 rev, st[3], st[0], st[1], st[2]);
++	}
+ 	return 0;
+ 
+ err:
+@@ -536,6 +561,7 @@ static int cs42l81_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
+ 	/* The codec provides BCLK and LRCK; MCA0 is the consumer (iOS). */
+ 	if ((fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) != SND_SOC_DAIFMT_CBP_CFP)
+ 		return -EINVAL;
++	((struct cs42l81 *)snd_soc_component_get_drvdata(dai->component))->clk_provider = true;
+ 	if ((fmt & SND_SOC_DAIFMT_FORMAT_MASK) != SND_SOC_DAIFMT_I2S)
+ 		return -EINVAL;
+ 	if ((fmt & SND_SOC_DAIFMT_INV_MASK) != SND_SOC_DAIFMT_NB_NF)
+@@ -600,6 +626,79 @@ static const struct snd_soc_component_driver cs42l81_component = {
+ 	.endianness = 1,
+ };
+ 
++/* --- debugfs (bring-up) ---------------------------------------------------- */
++
++/* every register the driver touches, plus the latched status registers */
++static const u16 cs42l81_dbg_regs[] = {
++	0x0001, 0x0002, 0x0003, 0x0005, 0x0006, 0x0007, 0x000d, 0x000e,
++	0x000f, 0x0011, 0x0012, 0x0022, 0x0023, 0x002e, 0x002f, 0x0033,
++	0x007b, 0x007c, 0x0106, 0x0123, 0x0129, 0x012e, 0x012f, 0x0131,
++	0x0201, 0x0203, 0x0204, 0x0205, 0x020f, 0x0210, 0x0211, 0x0219,
++	0x0220, 0x0221, 0x0222, 0x0223, 0x0224, 0x0225, 0x0226, 0x0227,
++	0x0229, 0x022e, 0x022f, 0x0230, 0x0231, 0x0232, 0x0528, 0x9901,
++	0xc81f, 0xc85f, 0xc96f,
++};
++
++static int cs42l81_regs_show(struct seq_file *s, void *unused)
++{
++	struct cs42l81 *cs = dev_get_drvdata(s->private);
++	unsigned int i, val;
++
++	seq_printf(s, "core_on %d spk_on %d clk_provider %d rate %#x slot %u\n",
++		   cs->core_on, cs->spk_on, cs->clk_provider, cs->rate_code,
++		   cs->slot_bytes);
++	for (i = 0; i < ARRAY_SIZE(cs42l81_dbg_regs); i++) {
++		if (regmap_read(cs->regmap, cs42l81_dbg_regs[i], &val))
++			seq_printf(s, "%04x = (err)\n", cs42l81_dbg_regs[i]);
++		else
++			seq_printf(s, "%04x = %02x\n", cs42l81_dbg_regs[i], val);
++	}
++	return 0;
++}
++
++/* write "REG" to select, "REG VAL" to write; read prints the selection */
++static ssize_t cs42l81_reg_write(struct file *f, const char __user *ubuf,
++				 size_t len, loff_t *ppos)
++{
++	struct cs42l81 *cs = f->private_data;
++	unsigned int reg, val;
++	char buf[32] = {};
++	int n;
++
++	if (len >= sizeof(buf))
++		return -EINVAL;
++	if (copy_from_user(buf, ubuf, len))
++		return -EFAULT;
++	n = sscanf(buf, "%x %x", &reg, &val);
++	if (n < 1 || reg > 0xffff || (reg & 0x80))
++		return -EINVAL;
++	cs->dbg_reg = reg;
++	if (n == 2 && regmap_write(cs->regmap, reg, val & 0xff))
++		return -EIO;
++	return len;
++}
++
++static ssize_t cs42l81_reg_read(struct file *f, char __user *ubuf,
++				size_t len, loff_t *ppos)
++{
++	struct cs42l81 *cs = f->private_data;
++	unsigned int val = 0;
++	char buf[32];
++	int n;
++
++	if (regmap_read(cs->regmap, cs->dbg_reg, &val))
++		return -EIO;
++	n = scnprintf(buf, sizeof(buf), "%04x = %02x\n", cs->dbg_reg, val);
++	return simple_read_from_buffer(ubuf, len, ppos, buf, n);
++}
++
++static const struct file_operations cs42l81_reg_fops = {
++	.open = simple_open,
++	.read = cs42l81_reg_read,
++	.write = cs42l81_reg_write,
++	.llseek = default_llseek,
++};
++
+ /* --- probe ---------------------------------------------------------------- */
+ 
+ static int cs42l81_check_id(struct cs42l81 *cs)
+@@ -685,6 +784,8 @@ static int cs42l81_spi_probe(struct spi_device *spi)
+ 	/* Default: -24 dB, quiet but audible */
+ 	cs->spk_vol = min_t(unsigned int, 204 - 48, cs->vol_max);
+ 	cs->spk_switch = true;
++	/* the DAI only accepts codec-provided clocks (J71t, as on iOS) */
++	cs->clk_provider = true;
+ 	cs->rate_code = 0xc;
+ 	cs->slot_bytes = 2;
+ 
+@@ -692,6 +793,9 @@ static int cs42l81_spi_probe(struct spi_device *spi)
+ 	if (ret)
+ 		return ret;
+ 
++	debugfs_create_devm_seqfile(dev, "cs42l81-regs", NULL, cs42l81_regs_show);
++	debugfs_create_file("cs42l81-reg", 0600, NULL, cs, &cs42l81_reg_fops);
++
+ 	return devm_snd_soc_register_component(dev, &cs42l81_component,
+ 					       &cs42l81_dai, 1);
+ }

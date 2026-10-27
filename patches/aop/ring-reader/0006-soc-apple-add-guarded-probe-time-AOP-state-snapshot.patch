@@ -1,0 +1,312 @@
+From 906da12f51cbd53bf8bc13df196281983f3fe5de Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 12:58:33 +0000
+Subject: [PATCH 6/6] soc: apple: add guarded probe-time AOP state snapshot
+
+Add an independent default-off state_probe parameter for the controlled
+iOS power-off to DFU experiment. Reuse the existing five-domain PMGR
+guard before reading only CPU status at +0xb88 and outbox control at
++0x4020. CPU status is the raw +0xb88 word, so do not read it twice.
+
+Log PMGR target/actual, raw status and the two bit-zero values on one
+line, and expose the same frozen string in root-only state_probe debugfs.
+Report unpowered only for a successfully observed zero AOP ACTUAL;
+mark wrapper fields skipped on any guard refusal. Preserve unknown for
+transitions and errors rather than inventing a halted or powered state.
+Defer until PMGR providers exist without reading the wrapper.
+
+State-only mode requires no debug or ring parameter and maps only the
+two required wrapper resources. It can coexist with ring diagnostics,
+blocks the active driver before resource access, and never writes,
+resumes a domain, touches a FIFO or sends a mailbox message.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ Documentation/driver-api/apple-a9-aop.rst | 55 ++++++++++++-
+ drivers/soc/apple/Kconfig                 |  3 +
+ drivers/soc/apple/a9-aop.h                |  3 +
+ drivers/soc/apple/apple-a9-aop-active.c   |  4 +-
+ drivers/soc/apple/apple-a9-aop.c          | 94 ++++++++++++++++++++---
+ 5 files changed, 147 insertions(+), 12 deletions(-)
+
+diff --git a/Documentation/driver-api/apple-a9-aop.rst b/Documentation/driver-api/apple-a9-aop.rst
+index acd5155e5b..d258d68208 100644
+--- a/Documentation/driver-api/apple-a9-aop.rst
++++ b/Documentation/driver-api/apple-a9-aop.rst
+@@ -53,6 +53,58 @@ freshness and buffer timestamps; no AOP timestamp is exported.
+ 
+ No part of this work writes syscfg, NVRAM or boot firmware storage.
+ 
++Probe-time power-off discriminator
++==================================
++
++``apple_a9_aop.state_probe=1`` is an independent, default-off, read-only
++probe-time snapshot. It requires neither debug=1 nor ring_scan/ring_pa and
++can coexist with either ring diagnostic. It excludes the active driver
++before any active-driver allocation or resource access, even with active=1.
++For the isolated experiment use::
++
++  apple_a9_aop.state_probe=1 apple_a9_aop.debug=0
++  apple_a9_aop.active=0 apple_a9_aop.attach=0
++  apple_a9_aop.ring_scan=0 apple_a9_aop.ring_iio=0
++
++From iOS, slide to power off, wait 30 seconds, then enter DFU from that off
++state and boot Linux without an intervening iOS boot. Keep the existing
++non-AOP boot arguments. Omit stale ring_pa/ring_pa_size lists. There is no
++device access or power-off action performed by the driver.
++
++At observer probe, the existing five-domain PMGR API reads the label-checked
++AOP domain (observe-domains[1]) and its dependencies under genpd locks. It
++invokes the wrapper callback only when every software domain is ON, hardware
++ACTUAL=TARGET=15, and reset/disable/parent-off are clear. Until the PMGR
++providers exist, probe defers without wrapper reads. No power-domain attach,
++resume, state write, mailbox FIFO, IRQ or cache operation occurs.
++
++The callback reads exactly two allowlisted u32 words: +0xb88 and +0x4020.
++cpu_status is the raw +0xb88 word, not another register. The single log line
++is also frozen in root-only debugfs at
++``/sys/kernel/debug/apple-a9-aop/state_probe``. For example::
++
++  aop state: pmgr target=0xf actual=0xf cpu_status=0x00020001 b88=1 4020=1 -> running
++
++The b88 and 4020 fields are bit 0; PMGR target/actual are the raw hardware
++nibbles. CPU-running bit 0 selects running versus halted. A typical halted
++but powered cpu_status is 0x00020000; bit 17's meaning is not established.
++When AOP ACTUAL=0, no wrapper word is read: cpu_status/b88/4020 are marked
++skipped and the result is unpowered. A transition, unavailable/error state,
++or another domain blocking access reports unknown and guard_errno, never
++an inferred halted CPU. Read failures do not fabricate PMGR zero values.
++
++Read the saved line with::
++
++  sudo cat /sys/kernel/debug/apple-a9-aop/state_probe
++
++Debugfs reads issue no hardware accesses. With debug=0, only state_probe is
++exposed and only those two wrapper resources are mapped. Explicit debug=1
++retains the normal live status/preflight files when not in ring mode. Ring
++mode alone still bypasses wrapper access; adding state_probe authorizes its
++separate two-word snapshot. The probe runs after the ordinary PMGR provider,
++whose existing always-on policy may already have powered a domain; it is not
++a pre-Linux rail measurement. Hardware automatic gating is not inhibited.
++
+ Active driver (CONFIG_APPLE_A9_AOP_ACTIVE)
+ ==========================================
+ 
+@@ -353,7 +405,8 @@ Use ``apple_a9_aop.debug=1 apple_a9_aop.ring_scan=1`` for E1, or
+ attach=0. Any ring mode excludes the active driver's probe before
+ resource mapping, IRQ requests or power/DMA operations, even if active=1 is
+ accidentally present. Ring mode bypasses the observer's wrapper maps and power
+-provider lookups too. Its debugfs files are ring_scan, ring_reader and/or ring_pa;
++provider lookups too, unless state_probe separately requests its guarded
++two-word snapshot. Its ring debugfs files are ring_scan, ring_reader and/or ring_pa;
+ status/preflight are absent. With all ring gates zero, existing behavior is
+ unchanged. Probe does not start a scan. Ordinary E1 starts on the first
+ debugfs read; optional early capture is described below.
+diff --git a/drivers/soc/apple/Kconfig b/drivers/soc/apple/Kconfig
+index 67f053f349..03ee67b263 100644
+--- a/drivers/soc/apple/Kconfig
++++ b/drivers/soc/apple/Kconfig
+@@ -25,6 +25,9 @@ config APPLE_A9_AOP
+ 	  With debug=1, matching ring_pa/ring_pa_size lists capture up to four
+ 	  exact linear-mapped System RAM ranges twice at postcore, 1 s apart.
+ 	  Each range is at most 64 KiB. No source reservation or write occurs.
++	  Independent state_probe=1 captures only CPU status and outbox enable at
++	  probe after the five-domain PMGR check; debugfs repeats the saved line.
++	  It needs neither debug=1 nor ring mode and excludes the active driver.
+ 
+ config APPLE_A9_AOP_IIO
+ 	bool "J71t AOP accelerometer IIO consumer"
+diff --git a/drivers/soc/apple/a9-aop.h b/drivers/soc/apple/a9-aop.h
+index 5548e132f8..270ab12e5b 100644
+--- a/drivers/soc/apple/a9-aop.h
++++ b/drivers/soc/apple/a9-aop.h
+@@ -14,6 +14,9 @@ struct a9_aop_ring_pa {
+ /* Immutable apple_a9_aop.debug value, owned by the passive observer. */
+ bool apple_a9_aop_debug(void);
+ 
++/* Independent read-only state capture excludes the active driver. */
++bool apple_a9_aop_state_probe(void);
++
+ /* Shared attach gate; the active driver additionally requires active=1. */
+ bool apple_a9_aop_attach(void);
+ 
+diff --git a/drivers/soc/apple/apple-a9-aop-active.c b/drivers/soc/apple/apple-a9-aop-active.c
+index 7b76b069d9..1ec8f62176 100644
+--- a/drivers/soc/apple/apple-a9-aop-active.c
++++ b/drivers/soc/apple/apple-a9-aop-active.c
+@@ -2364,8 +2364,8 @@ static int a9_aop_probe(struct platform_device *pdev)
+ 	/* No resource is touched unless explicitly enabled on this board. */
+ 	if (!active || !of_machine_is_compatible("apple,j71t"))
+ 		return -ENODEV;
+-	if (apple_a9_aop_ring_mode())
+-		return dev_err_probe(dev, -EBUSY, "read-only ring mode excludes active AOP\n");
++	if (apple_a9_aop_ring_mode() || apple_a9_aop_state_probe())
++		return dev_err_probe(dev, -EBUSY, "read-only diagnostics exclude active AOP\n");
+ 	aop = devm_kzalloc(dev, sizeof(*aop), GFP_KERNEL);
+ 	if (!aop)
+ 		return -ENOMEM;
+diff --git a/drivers/soc/apple/apple-a9-aop.c b/drivers/soc/apple/apple-a9-aop.c
+index ec858db501..1bcec498ba 100644
+--- a/drivers/soc/apple/apple-a9-aop.c
++++ b/drivers/soc/apple/apple-a9-aop.c
+@@ -21,6 +21,9 @@
+ static bool debug;
+ module_param(debug, bool, 0400);
+ MODULE_PARM_DESC(debug, "Enable read-only J71t AOP debugfs (default off)");
++static bool state_probe;
++module_param(state_probe, bool, 0400);
++MODULE_PARM_DESC(state_probe, "Capture powered/running AOP state once at probe, PMGR guarded (default off)");
+ static bool attach;
+ module_param(attach, bool, 0400);
+ MODULE_PARM_DESC(attach, "Allow running-AOP handshake with active=1; observer stays read-only (default off)");
+@@ -50,6 +53,11 @@ bool apple_a9_aop_ring_mode(void)
+ 	return ring_scan || ring_iio || ring_pa_nr || ring_pa_size_nr;
+ }
+ 
++bool apple_a9_aop_state_probe(void)
++{
++	return state_probe;
++}
++
+ bool apple_a9_aop_ring_scan_early(void)
+ {
+ 	return debug && ring_scan && ring_scan_early;
+@@ -106,6 +114,7 @@ struct a9_aop {
+ 	struct device *dev;
+ 	void __iomem *regs[AOP_REGS];
+ 	struct device_node *domains[AOP_DOMAINS];
++	char state_line[192];
+ };
+ 
+ struct a9_aop_snapshot {
+@@ -113,6 +122,62 @@ struct a9_aop_snapshot {
+ 	u32 values[AOP_REGS];
+ };
+ 
++/* Called only inside the existing five-domain PMGR guard. No FIFO reads. */
++static void a9_aop_read_state(void *data)
++{
++	struct a9_aop_snapshot *snapshot = data;
++
++	/* cpu_status is the raw +0xb88 word, not a separate register. */
++	snapshot->values[1] = readl(snapshot->aop->regs[1]);
++	snapshot->values[3] = readl(snapshot->aop->regs[3]);
++}
++
++static void a9_aop_state_format(char *line, size_t size, u32 pmgr, u32 cpu_status,
++			      u32 outbox, int guard_errno)
++{
++	u32 target = pmgr & 15, actual = (pmgr >> 4) & 15;
++
++	if (guard_errno && guard_errno != -EHOSTDOWN) {
++		scnprintf(line, size,
++			  "aop state: pmgr target=unknown actual=unknown cpu_status=skipped b88=skipped 4020=skipped -> unknown guard_errno=%d\n",
++			  guard_errno);
++	} else if (guard_errno) {
++		scnprintf(line, size,
++			  "aop state: pmgr target=0x%x actual=0x%x cpu_status=skipped b88=skipped 4020=skipped -> %s guard_errno=%d\n",
++			  target, actual, actual == 0 ? "unpowered" : "unknown", guard_errno);
++	} else {
++		scnprintf(line, size,
++			  "aop state: pmgr target=0x%x actual=0x%x cpu_status=0x%08x b88=%u 4020=%u -> %s\n",
++			  target, actual, cpu_status, cpu_status & 1, outbox & 1,
++			  cpu_status & 1 ? "running" : "halted");
++	}
++}
++
++static int a9_aop_capture_state(struct a9_aop *aop)
++{
++	struct apple_pmgr_observation states[AOP_DOMAINS] = {};
++	struct a9_aop_snapshot snapshot = { .aop = aop };
++	int ret;
++
++	ret = apple_pmgr_observe(aop->domains, AOP_DOMAINS, states,
++				 a9_aop_read_state, &snapshot);
++	if (ret == -EPROBE_DEFER)
++		return ret;
++	/* observe-domains[1] is label-checked ps_aop; all reads must succeed. */
++	a9_aop_state_format(aop->state_line, sizeof(aop->state_line), states[1].raw,
++			    snapshot.values[1], snapshot.values[3], ret);
++	return 0;
++}
++
++static int a9_aop_state_show(struct seq_file *s, void *unused)
++{
++	struct a9_aop *aop = s->private;
++
++	seq_puts(s, aop->state_line);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(a9_aop_state);
++
+ static void a9_aop_read_status(void *data)
+ {
+ 	struct a9_aop_snapshot *snapshot = data;
+@@ -232,7 +297,7 @@ static int a9_aop_probe(struct platform_device *pdev)
+ 	int ret;
+ 
+ 	/* No resource requests or MMIO on the ordinary boot path. */
+-	if (!debug || !of_machine_is_compatible("apple,j71t"))
++	if ((!debug && !state_probe) || !of_machine_is_compatible("apple,j71t"))
+ 		return -ENODEV;
+ 	if (of_find_property(dev->of_node, "power-domains", NULL) ||
+ 	    platform_get_resource(pdev, IORESOURCE_MEM, AOP_REGS))
+@@ -241,10 +306,12 @@ static int a9_aop_probe(struct platform_device *pdev)
+ 	if (!aop)
+ 		return -ENOMEM;
+ 	aop->dev = dev;
+-	/* Ring mode never even maps the wrapper or looks at power state. */
+-	if (apple_a9_aop_ring_mode())
++	/* Ring-only mode leaves the wrapper untouched; state_probe is independent. */
++	if (apple_a9_aop_ring_mode() && !state_probe)
+ 		goto debugfs;
+ 	for (i = 0; i < AOP_REGS; i++) {
++		if ((apple_a9_aop_ring_mode() || !debug) && i != 1 && i != 3)
++			continue;
+ 		res = platform_get_resource(pdev, IORESOURCE_MEM, i);
+ 		if (!res || res->start != reg_addresses[i] || resource_size(res) != 4)
+ 			return -EINVAL;
+@@ -265,28 +332,37 @@ static int a9_aop_probe(struct platform_device *pdev)
+ 		    strcmp(label, domain_names[i]))
+ 			return -EINVAL;
+ 	}
++	if (state_probe) {
++		ret = a9_aop_capture_state(aop);
++		if (ret)
++			return dev_err_probe(dev, ret, "state probe needs PMGR providers\n");
++	}
+ debugfs:
+ 	dir = debugfs_create_dir("apple-a9-aop", NULL);
+ 	if (IS_ERR(dir))
+ 		return PTR_ERR(dir);
+-	if (apple_a9_aop_ring_mode()) {
++	if (debug && apple_a9_aop_ring_mode()) {
+ 		ret = a9_aop_ring_reader_init(dev, dir, ring_scan, ring_iio);
+ 		if (ret) {
+ 			debugfs_remove_recursive(dir);
+ 			return ret;
+ 		}
+-	} else {
++	} else if (debug) {
+ 		debugfs_create_file("status", 0400, dir, aop, &a9_aop_status_fops);
+ 		debugfs_create_file("preflight", 0400, dir, aop, &a9_aop_preflight_fops);
+ 	}
++	if (state_probe)
++		debugfs_create_file("state_probe", 0400, dir, aop, &a9_aop_state_fops);
+ 	/* Register last: remove open debugfs users before any private data/maps. */
+ 	ret = devm_add_action_or_reset(dev, a9_aop_remove_debugfs, dir);
+ 	if (ret)
+ 		return ret;
+-	if (apple_a9_aop_ring_mode())
+-		dev_info(dev, "read-only RAM reader ready; scan=%u iio=%u; no wrapper or mailbox\n",
+-			 ring_scan, ring_iio);
+-	else
++	if (state_probe)
++		pr_info("%s", aop->state_line);
++	if (debug && apple_a9_aop_ring_mode())
++		dev_info(dev, "read-only RAM reader ready; scan=%u iio=%u; wrapper=%s mailbox=none\n",
++			 ring_scan, ring_iio, state_probe ? "state-probe-only" : "none");
++	else if (debug)
+ 		dev_info(dev, "read-only debugfs ready; attach preflight %s; no power consumer\n",
+ 			 attach ? "enabled" : "disabled");
+ 	return 0;

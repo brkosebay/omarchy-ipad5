@@ -1,0 +1,40 @@
+From b48c325d1a1dc8c10f821a6b8dff9811cb1f6d40 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 13:24:22 +0000
+Subject: [PATCH] pinctrl: apple: preserve output and peripheral modes on
+ orphan IRQ latches
+
+Only disable an actual GPIO input IRQ mode when retiring an unmapped warm interrupt. A stale latch on a pin now configured as output or peripheral must be acknowledged without changing that pin mode.
+---
+ drivers/pinctrl/pinctrl-apple-gpio.c | 15 +++++++++++----
+ 1 file changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/pinctrl/pinctrl-apple-gpio.c b/drivers/pinctrl/pinctrl-apple-gpio.c
+index a2cc1eaabd..7b21d5014d 100644
+--- a/drivers/pinctrl/pinctrl-apple-gpio.c
++++ b/drivers/pinctrl/pinctrl-apple-gpio.c
+@@ -384,10 +384,17 @@ static void apple_gpio_irq_handler(struct irq_desc *desc)
+ 				/* An inherited, unmapped source has nobody to ack it.
+ 				 * Mask only this GPIO, then clear this group's latch.
+ 				 */
+-				if (pin < gc->ngpio)
+-					apple_gpio_set_reg(pctl, pin, REG_GPIOx_MODE,
+-							   FIELD_PREP(REG_GPIOx_MODE,
+-								      REG_GPIOx_IN_IRQ_OFF));
++				if (pin < gc->ngpio) {
++					u32 reg = apple_gpio_get_reg(pctl, pin);
++					u32 mode = FIELD_GET(REG_GPIOx_MODE, reg);
++					u32 off = FIELD_PREP(REG_GPIOx_MODE,
++							     REG_GPIOx_IN_IRQ_OFF);
++
++					if (!(reg & REG_GPIOx_PERIPH) &&
++					    mode >= REG_GPIOx_IN_IRQ_HI &&
++					    mode <= REG_GPIOx_IN_IRQ_ANY)
++						apple_gpio_set_reg(pctl, pin, REG_GPIOx_MODE, off);
++				}
+ 				writel(BIT(pinl), pctl->base + REG_IRQ(*grpp, pinh));
+ 				dev_warn_ratelimited(pctl->dev,
+ 						     "masked orphan warm GPIO IRQ group=%u pin=%u\n",
+-- 
+2.56.0
+

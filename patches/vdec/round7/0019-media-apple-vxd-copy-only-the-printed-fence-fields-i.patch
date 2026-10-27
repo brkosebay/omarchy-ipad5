@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 12:45:05 +0000
+Subject: [PATCH 19/21] media: apple: vxd: copy only the printed fence fields in the
+ mbox dump
+
+The debugfs mbox dump copied all sixteen struct apple_vxd_fence under
+the lock to print five fields of each.  Every fence carries a struct
+completion, which lockdep makes large: with the QEMU smoke's KASAN +
+PROVE_LOCKING config the frame reached 2176 bytes, over the 2048-byte
+limit (-Wframe-larger-than).  Copy just the state, id, type, error and
+status.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ drivers/media/platform/apple/vxd/apple-vxd-mbox.c | 21 +++++++++++++++++++--
+ 1 file changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-mbox.c b/drivers/media/platform/apple/vxd/apple-vxd-mbox.c
+index 466d8c069a362d39b19ea0176ff215283df8cd3e..b030d70d48886b2d01aaa7f232b8eb9d577e41ca 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-mbox.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-mbox.c
+@@ -1180,7 +1180,18 @@ static int apple_vxd_mbox_dump_show(struct seq_file *m, void *v)
+ 	struct apple_vxd_dev *vxd = m->private;
+ 	struct apple_vxd_mbox_stats st;
+ 	struct apple_vxd_ring to_mtx, to_host;
+-	struct apple_vxd_fence fences[APPLE_VXD_NUM_FENCES];
++	/*
++	 * Only what the dump prints: a whole struct apple_vxd_fence carries a
++	 * struct completion, which lockdep makes large (a 16-entry copy
++	 * overflowed the 2 KiB frame limit in the QEMU smoke's KASAN build).
++	 */
++	struct {
++		enum apple_vxd_fence_state state;
++		u16 id;
++		u8 type;
++		bool error;
++		u32 status;
++	} fences[APPLE_VXD_NUM_FENCES];
+ 	u32 raw_mtx, raw_host, rd, wr;
+ 	unsigned long flags;
+ 	bool ready;
+@@ -1196,7 +1207,13 @@ static int apple_vxd_mbox_dump_show(struct seq_file *m, void *v)
+ 	to_mtx = vxd->to_mtx;
+ 	to_host = vxd->to_host;
+ 	st = vxd->stats;
+-	memcpy(fences, vxd->fences, sizeof(fences));
++	for (i = 0; i < APPLE_VXD_NUM_FENCES; i++) {
++		fences[i].state = vxd->fences[i].state;
++		fences[i].id = vxd->fences[i].id;
++		fences[i].type = vxd->fences[i].type;
++		fences[i].error = vxd->fences[i].error;
++		fences[i].status = vxd->fences[i].status;
++	}
+ 	spin_unlock_irqrestore(&vxd->mbox_lock, flags);
+ 
+ 	raw_mtx = vxd_read(vxd, VXD_REG_TO_MTX_RING);

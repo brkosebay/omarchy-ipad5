@@ -1,0 +1,104 @@
+From 5133d982ce3b4748f813cd0517948942358553a9 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 02:36:20 +0000
+Subject: [PATCH 5/5] arm64: dts: apple: j71t: add mics, headphones and MCA0 RX
+ DMA
+
+Wire MCA0's SmartIO RX endpoint 0x29 as "rx". Route the built-in mics
+("Internal Mic" to DMIC1A and DMIC1B) and a "Headphones" widget to
+HPOUT, and add pin switches for "Speakers" and "Headphones". Give the
+codec the headset switch lines (ADT ext_sw1 = GPIO 68, ext_sw2 = GPIO
+66), which it only reads. The codec interrupt (ADT: AP GPIO 54) is not
+used: iOS detects the jack with a timer, and the driver polls.
+
+The card keeps its name "iPad5 Speakers", so the ALSA card id and the
+existing test scripts stay the same.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ .../boot/dts/apple/s8003-j71t-audio.dtsi      | 44 +++++++++++++++----
+ 1 file changed, 36 insertions(+), 8 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/apple/s8003-j71t-audio.dtsi b/arch/arm64/boot/dts/apple/s8003-j71t-audio.dtsi
+index f4c2d76e16..ad463056f7 100644
+--- a/arch/arm64/boot/dts/apple/s8003-j71t-audio.dtsi
++++ b/arch/arm64/boot/dts/apple/s8003-j71t-audio.dtsi
+@@ -1,9 +1,10 @@
+ // SPDX-License-Identifier: GPL-2.0+ OR MIT
+ /*
+- * J71t built-in speakers: CS42L81 on SPI1 (control) + MCA0 (data).
++ * J71t audio: CS42L81 on SPI1 (control) + MCA0 (data). Built-in speakers,
++ * 3.5 mm headphones and the two built-in DMICs (capture over MCA0 RX).
+  * Values: Apple's J71t ADT and iOS 16.7.10's AppleCS42L81Audio/AppleAE2MCA
+- * (linux-a9 docs/audio/playback-path.md). Items marked "inferred" are
+- * unverified on hardware.
++ * (linux-a9 docs/audio/playback-path.md, ds-capture-and-jack.md). Items
++ * marked "inferred" are unverified on hardware.
+  */
+ 
+ / {
+@@ -16,12 +17,24 @@ spi1_nclk: clock-spi1 {
+ 
+ 	sound: sound {
+ 		compatible = "simple-audio-card";
++		/* name kept from the speaker-only card: ALSA card id iPad5Speakers */
+ 		simple-audio-card,name = "iPad5 Speakers";
+ 		simple-audio-card,format = "i2s";
+ 		simple-audio-card,bitclock-master = <&j71t_codec_dai>;
+ 		simple-audio-card,frame-master = <&j71t_codec_dai>;
+-		simple-audio-card,widgets = "Speaker", "Speakers";
+-		simple-audio-card,routing = "Speakers", "SPKOUT";
++		simple-audio-card,widgets = "Speaker", "Speakers",
++					    "Headphone", "Headphones",
++					    "Microphone", "Internal Mic";
++		/* ADT dmic1a-intmic "cimi", dmic1b-intmic "cims" */
++		simple-audio-card,routing = "Speakers", "SPKOUT",
++					    "Headphones", "HPOUT",
++					    "DMIC1A", "Internal Mic",
++					    "DMIC1B", "Internal Mic";
++		/*
++		 * The codec's "Headphone Jack" switches HPOUT/SPKOUT; these add
++		 * user switches on top (ALSA "Speakers/Headphones Switch").
++		 */
++		simple-audio-card,pin-switches = "Speakers", "Headphones";
+ 
+ 		simple-audio-card,cpu {
+ 			sound-dai = <&mca0>;
+@@ -96,9 +109,12 @@ mca0: mca@20a0a0000 {
+ 		apple,i2s-switch-route = <0x00 0x00000018>,
+ 					 <0x14 0x00080808>,
+ 					 <0x3c 0x00000010>;
+-		/* SmartIO MCA0_TX, ADT dma-channels: 0x28 {0x21|0x22, 0, 0x300, 0x180} */
+-		dmas = <&sio 0x28>;
+-		dma-names = "tx";
++		/*
++		 * SmartIO MCA0 TX/RX, ADT dma-channels: 0x28 and 0x29, both
++		 * {0x21|0x22, 0, 0x300, 0x180}.
++		 */
++		dmas = <&sio 0x28>, <&sio 0x29>;
++		dma-names = "tx", "rx";
+ 		apple,sio-dma-config = <0x21 0x22 0 0x300 0x180>;
+ 	};
+ 
+@@ -127,6 +143,18 @@ cs42l81: audio-codec@0 {
+ 			/* spkr-gain-db = -3.0 dB */
+ 			apple,max-speaker-gain-db-q8 = <(-768)>;
+ 			apple,speaker-mode = <2>;
++			/*
++			 * ADT function-ext_sw1 = GPIO(0x44, 0x101), ext_sw2 =
++			 * GPIO(0x42, 0x101): headset switch, direction unknown.
++			 * The driver only reads them (GPIOD_ASIS).
++			 */
++			hs-switch-gpios = <&pinctrl_ap 68 GPIO_ACTIVE_HIGH>,
++					  <&pinctrl_ap 66 GPIO_ACTIVE_HIGH>;
++			/*
++			 * No interrupts yet: ADT has <0x36 0x1> (AP GPIO 54),
++			 * but iOS detects the jack with a timer; the driver
++			 * polls (jack_poll_ms).
++			 */
+ 			#sound-dai-cells = <0>;
+ 		};
+ 	};
+-- 
+2.56.0
+

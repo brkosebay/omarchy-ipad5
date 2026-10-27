@@ -1,0 +1,7 @@
+#!/bin/sh
+# Omarchy's stock autostart joins our one user service. Other CLI invocations
+# preserve the packaged program's behavior; the service uses /usr/bin/udiskie.
+if [ "$#" = 3 ] && [ "$1" = --automount ] && [ "$2" = --no-notify ] && [ "$3" = --no-tray ]; then
+    exec systemctl --user start linux-a9-udiskie.service
+fi
+exec /usr/bin/udiskie "$@"

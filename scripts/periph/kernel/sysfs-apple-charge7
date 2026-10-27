@@ -1,0 +1,19 @@
+What:		/sys/class/power_supply/charger/charge7_state
+Date:		October 2026
+Contact:	linux-a9 maintainers
+Description:
+		Read-only J71t charging policy snapshot. Space-separated key=value
+		pairs: attach (physical source epoch), source_type (numeric Linux
+		power_supply_usb_type, also exposed textually by usb/usb_type),
+		ceiling_ua (detected/board ceiling), step_ua (active nominal ladder
+		budget, zero if inactive), live_ua (0xa03 setting decoded in uA,
+		negative errno on read failure), override_ua (per-attach user cap),
+		adaptive_ua (back-off cap), backoffs (count this attach),
+		last_backoff (none or pmic-input-reduced), vbus_mv (unavailable),
+		policy_error (last policy errno), active (boolean).
+
+		live_ua is a programmed setting, not measured current. An observed
+		lower PMU input setting triggers bounded back-off. No verified
+		voltage-triggered droop protection or D2365 VINDPM setting is
+		claimed by this interface. The epoch advances on observed VBUS
+		removal; a pulse shorter than all polling observations can be missed.

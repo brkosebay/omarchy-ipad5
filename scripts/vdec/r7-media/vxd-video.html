@@ -1,0 +1,22 @@
+<!doctype html>
+<!-- linux-a9 video decoder round 7: Chromium playback check. Open as
+     file:///var/tmp/vdec/vxd-video.html next to clip1080.mp4. The window
+     title carries the counters so they can be read over SSH with
+     `hyprctl clients | grep "title: vxd"`. -->
+<meta charset="utf-8">
+<title>vxd starting</title>
+<style>body{margin:0;background:#000;color:#0f0;font:16px monospace}video{width:100%}</style>
+<video id="v" src="clip1080.mp4" autoplay muted loop playsinline></video>
+<pre id="s"></pre>
+<script>
+const v = document.getElementById("v"), s = document.getElementById("s");
+let loops = 0, last = 0;
+v.addEventListener("timeupdate", () => { if (v.currentTime < last) loops++; last = v.currentTime; });
+v.addEventListener("error", () => { document.title = "vxd error " + (v.error && v.error.code); });
+setInterval(() => {
+  const q = v.getVideoPlaybackQuality();
+  const line = `vxd t=${v.currentTime.toFixed(1)} loops=${loops} decoded=${q.totalVideoFrames} dropped=${q.droppedVideoFrames}`;
+  s.textContent = line;
+  document.title = line;
+}, 1000);
+</script>

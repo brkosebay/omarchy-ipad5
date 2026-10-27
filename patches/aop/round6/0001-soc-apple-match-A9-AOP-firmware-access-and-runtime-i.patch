@@ -1,0 +1,375 @@
+From 228f4e3a703192df9f78b0d5305164a110eb9d43 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 17:57:21 +0000
+Subject: [PATCH] soc: apple: match A9 AOP firmware access and runtime identity
+ contracts
+
+The saved runtime fingerprint was read with arm64 memcpy_fromio, which uses
+64-bit loads and byte tails. iOS instead reads the firmware aperture through
+RTBuddy_memcpy_from32, including aligned word reads for header, version and
+patchbay tails. Use bounded ordered readl copies for the existing AP region
+and IO-mapped reserved ext data. Match the stopped loader's writes/readback
+to the vendor's 32-bit contract too; its existing safety gates are unchanged.
+
+The 64-byte version window also includes runtime state. Startup copies the
+loader's STKG to offset 0x47474 and another function updates the word at
+0x47478. Compare the exact 49-byte build string plus NUL, and separately
+require runtime guard consistency with the validated pinned-layout STKG.
+Retain the full diagnostic window and report the distinct identity result.
+
+Preserve all unknown-image, loader/tag/ext/reservation/ping/ownership refusals.
+Do not follow alternate IOP/DRAM addresses, expand the region on unvalidated
+remap readback, reset the AOP, force power or add running-state writes.
+Document the actual V2 loader/mapping and the absence of a demonstrated
+permitted stateless stop/reload route. Device confirmation is still required.
+
+Offline ASan/UBSan copy/policy tests and W=1 AOP builds pass. No device access.
+---
+ Documentation/driver-api/apple-a9-aop.rst | 44 +++++++++++
+ drivers/soc/apple/a9-aop-memory.h         | 52 +++++++++++++
+ drivers/soc/apple/a9-aop-takeover.h       | 12 ++-
+ drivers/soc/apple/apple-a9-aop-active.c   | 93 ++++++++++++++++++++---
+ 4 files changed, 188 insertions(+), 13 deletions(-)
+ create mode 100644 drivers/soc/apple/a9-aop-memory.h
+
+diff --git a/Documentation/driver-api/apple-a9-aop.rst b/Documentation/driver-api/apple-a9-aop.rst
+index 77a28d64fe..00328437c1 100644
+--- a/Documentation/driver-api/apple-a9-aop.rst
++++ b/Documentation/driver-api/apple-a9-aop.rst
+@@ -192,3 +192,47 @@ The acceptance rules, fixed offsets and one-shot attach policy are unchanged.
+ A different build string cannot authorize attachment. Support for another
+ image or a relocated runtime layout needs its own verified image/layout,
+ tag and ext-buffer contract plus the same reservation and handshake proofs.
++
++Runtime identity and aperture width (Round 6)
++===========================================
++
++The iOS reader for this firmware is RTBuddy_memcpy_from32, not generic memcpy.
++UUID, TLV and version-string reads use aligned 32-bit transactions, including
++an aligned final word copied into local RAM for a short tail. The previous
++arm64 memcpy_fromio path used 64-bit transactions and byte tail accesses.
++The driver now uses ordered readl transactions in the same allowlisted region.
++The declared 0x1df-byte table needs 0x1e0 bytes of bus coverage; the extra byte
++must fit the mapped resource and is discarded in RAM. IO-mapped ext reads use
++the same helper after the existing reservation proof. Normal mapped reserved
++DRAM retains its WB mapping and ordinary memory reads.
++
++The old 64-byte build window is still dumped, but is not all immutable version
++text: the pinned string is 49 bytes plus NUL, then padding/runtime globals.
++Firmware startup copies STKG to +0x47474, and +0x47478 is a mutable cursor.
++Identity compares exactly the string including NUL; the guard must separately
++match the four-byte STKG in the validated, exact-layout tag table. This avoids
++classifying normal firmware initialization as a foreign image. Every unknown
++identity, inconsistent loader/tag/guard, stale or unreserved ext, bad ping or
++owned handshake still refuses with the existing distinct result strings.
++
++The existing stopped-CPU loader also now uses aligned writel/readl copies, as
++iOS does. Its stopped/empty/domain/fault gates are unchanged. Running attach
++has no path to that writer and gains no reset, CPU control, auto-boot, remap,
++mask, image/tag or power-domain writes.
++
++The observed remap AP target remains 0x210e00000; the readback +28=0x1ff000
++does not by itself locate another image. iOS writes descriptor length there,
++but the hardware readback interpretation is unestablished. No larger resource
++is mapped and no guessed DRAM or IOP address is followed. The firmware's
++linked VA0x01000000 maps onto its PC-derived execution backing; it is not a
++second AP physical address. Non-default split-data/header layouts remain
++refused rather than following unvalidated pointers.
++
++Correct-width identification must be measured on the device before declaring
++its current image known. Attaching to an already-handshaked iOS instance is
++still unproven and remains refused. AP power-off/AFK shutdown do not establish
++a stopped unknown-owned core. The supported iOS provider stop writes CPU
++control/auto-boot and changes power state, which this attach path may not do.
++A real AON power cycle (or a separately validated clean stop by the original
++owner) is the fallback; domains OFF still require separately designed
++legitimate provider startup, not forcing a domain here.
+diff --git a/drivers/soc/apple/a9-aop-memory.h b/drivers/soc/apple/a9-aop-memory.h
+new file mode 100644
+index 0000000000..c5cab0f211
+--- /dev/null
++++ b/drivers/soc/apple/a9-aop-memory.h
+@@ -0,0 +1,52 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* RTBuddy's firmware aperture contract is aligned 32-bit MMIO, not memcpy. */
++#ifndef _A9_AOP_MEMORY_H
++#define _A9_AOP_MEMORY_H
++
++#include <linux/errno.h>
++#include <linux/types.h>
++#include <linux/unaligned.h>
++
++typedef u32 (*a9_aop_read32_fn)(void *context, size_t offset);
++typedef void (*a9_aop_write32_fn)(void *context, size_t offset, u32 value);
++
++/*
++ * Read whole words, copying only requested bytes to RAM. The padded final
++ * read must still fit the allowlisted aperture. In particular the 0x1df-byte
++ * tag table needs a 0x1e0-byte bus read, exactly as RTBuddy does.
++ */
++static inline int a9_aop_copy_from32(void *context, a9_aop_read32_fn read32,
++				     u8 *destination, size_t offset, size_t size,
++				     size_t aperture_size)
++{
++	size_t at, i, n, padding = (4 - (size & 3)) & 3;
++	u32 value;
++
++	if ((offset & 3) || offset > aperture_size ||
++	    size > aperture_size - offset || padding > aperture_size - offset - size)
++		return -ERANGE;
++	for (at = 0; at < size; at += n) {
++		value = read32(context, offset + at);
++		n = size - at < 4 ? size - at : 4;
++		for (i = 0; i < n; i++)
++			destination[at + i] = value >> (8 * i);
++	}
++	return 0;
++}
++
++/* Cold load only: reject partial words instead of read/modify/write. */
++static inline int a9_aop_copy_to32(void *context, a9_aop_write32_fn write32,
++				   const u8 *source, size_t offset, size_t size,
++				   size_t aperture_size)
++{
++	size_t at;
++
++	if ((offset & 3) || (size & 3) || offset > aperture_size ||
++	    size > aperture_size - offset)
++		return -ERANGE;
++	for (at = 0; at < size; at += 4)
++		write32(context, offset + at, get_unaligned_le32(source + at));
++	return 0;
++}
++
++#endif
+diff --git a/drivers/soc/apple/a9-aop-takeover.h b/drivers/soc/apple/a9-aop-takeover.h
+index a4f95cc66e..829971ecad 100644
+--- a/drivers/soc/apple/a9-aop-takeover.h
++++ b/drivers/soc/apple/a9-aop-takeover.h
+@@ -10,6 +10,8 @@
+ #define A9_ATTACH_HEAD_SIZE	0x60
+ #define A9_ATTACH_BUILD_OFFSET	0x47440
+ #define A9_ATTACH_BUILD_SIZE	0x40
++#define A9_ATTACH_BUILD_ID_SIZE	50 /* 49-byte string plus terminating NUL */
++#define A9_ATTACH_GUARD_OFFSET	0x34 /* runtime global, NOT build identity */
+ #define A9_ATTACH_TABLE_OFFSET	0x389b8
+ #define A9_ATTACH_TABLE_SIZE	0x1df
+ #define A9_ATTACH_PAGE_SIZE	0x4000
+@@ -85,7 +87,7 @@ a9_attach_fingerprint(const struct a9_attach_fingerprint *live,
+ 	    table != A9_ATTACH_TABLE_OFFSET || length != A9_ATTACH_TABLE_SIZE ||
+ 	    memcmp(live->head, reference, sizeof(live->head)) ||
+ 	    memcmp(live->build, reference + A9_ATTACH_BUILD_OFFSET,
+-		   sizeof(live->build)))
++		   A9_ATTACH_BUILD_ID_SIZE))
+ 		return A9_ATTACH_FOREIGN_IMAGE;
+ 	if (!memcmp(live->table, reference + table, length))
+ 		return A9_ATTACH_NO_LOADER_TAGS;
+@@ -131,6 +133,14 @@ a9_attach_fingerprint(const struct a9_attach_fingerprint *live,
+ 			*ext_pa = get_unaligned_le64(live->table + cursor);
+ 			goto next;
+ 		case A9_FW_TAG('S', 'T', 'K', 'G'):
++			/*
++			 * Firmware 0x01000b5c copies the patched tag into +0x47474.
++			 * Check consistency instead of comparing to file entropy.
++			 */
++			if (memcmp(live->build + A9_ATTACH_GUARD_OFFSET,
++				   live->table + cursor, n))
++				return A9_ATTACH_TAG_MISMATCH;
++			goto next;
+ 		case A9_FW_TAG('P', 'R', 'N', 'G'):
+ 		case A9_FW_TAG('N', 'O', 'N', 'C'):
+ 		case A9_FW_TAG('E', 'C', 'I', 'D'):
+diff --git a/drivers/soc/apple/apple-a9-aop-active.c b/drivers/soc/apple/apple-a9-aop-active.c
+index 08b68c6130..da82ef26fb 100644
+--- a/drivers/soc/apple/apple-a9-aop-active.c
++++ b/drivers/soc/apple/apple-a9-aop-active.c
+@@ -50,6 +50,7 @@
+ #include "a9-aop.h"
+ #include "a9-aop-takeover.h"
+ #include "a9-aop-diagnostics.h"
++#include "a9-aop-memory.h"
+ 
+ /* Shares the observer's parameter namespace: apple_a9_aop.active=1. */
+ #undef MODULE_PARAM_PREFIX
+@@ -266,6 +267,7 @@ struct a9_aop {
+ 		u32 remap[7];
+ 		bool captured, reference_pinned;
+ 		int reference_errno;
++		int read_errno;
+ 	} diagnostics;
+ 	bool fingerprint_read, image_verified, tags_verified, ext_reserved, ext_verified;
+ 	u32 snapshot[6];
+@@ -318,6 +320,34 @@ static inline void aop_wr(struct a9_aop *aop, u32 offset, u32 value)
+ 	writel(value, aop->wrapper + offset);
+ }
+ 
++struct a9_aop_io32 {
++	void __iomem *base;
++};
++
++static u32 a9_aop_io_read32(void *context, size_t offset)
++{
++	struct a9_aop_io32 *io = context;
++
++	return readl(io->base + offset);
++}
++
++/* Used only by the existing stopped-CPU loader, never by running attach. */
++static void a9_aop_io_write32(void *context, size_t offset, u32 value)
++{
++	struct a9_aop_io32 *io = context;
++
++	writel(value, io->base + offset);
++}
++
++static int a9_aop_fromio32(void __iomem *base, size_t aperture_size,
++			   u8 *destination, size_t offset, size_t size)
++{
++	struct a9_aop_io32 io = { .base = base };
++
++	return a9_aop_copy_from32(&io, a9_aop_io_read32, destination,
++				  offset, size, aperture_size);
++}
++
+ static void a9_aop_trace(struct a9_aop *aop, char dir, u64 word, int status)
+ {
+ 	struct a9_aop_trace *t;
+@@ -1183,6 +1213,7 @@ struct a9_aop_regs {
+ 	struct a9_aop *aop;
+ 	u32 values[6];
+ 	bool fingerprint;
++	int read_errno;
+ };
+ 
+ static void a9_aop_read_regs(void *data)
+@@ -1193,6 +1224,7 @@ static void a9_aop_read_regs(void *data)
+ 		AOP_OUTBOX_CONTROL, AOP_IDLE_STATUS,
+ 	};
+ 	unsigned int i;
++	int ret;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(offsets); i++)
+ 		regs->values[i] = aop_rd(regs->aop, offsets[i]);
+@@ -1208,22 +1240,36 @@ static void a9_aop_read_regs(void *data)
+ 		};
+ 
+ 		if (apple_a9_aop_debug()) {
+-			memcpy_fromio(regs->aop->diagnostics.prefix, regs->aop->region,
+-				      A9_DIAG_PREFIX_SIZE);
++			ret = a9_aop_fromio32(regs->aop->region, regs->aop->region_size,
++					      regs->aop->diagnostics.prefix, 0,
++					      A9_DIAG_PREFIX_SIZE);
++			if (ret)
++				goto read_error;
+ 			memcpy(fp->head, regs->aop->diagnostics.prefix, sizeof(fp->head));
+ 			for (i = 0; i < ARRAY_SIZE(remap_offsets); i++)
+ 				regs->aop->diagnostics.remap[i] =
+ 					aop_rd(regs->aop, remap_offsets[i]);
+-			regs->aop->diagnostics.captured = true;
+ 		} else {
+-			memcpy_fromio(fp->head, regs->aop->region, sizeof(fp->head));
++			ret = a9_aop_fromio32(regs->aop->region, regs->aop->region_size,
++					      fp->head, 0, sizeof(fp->head));
++			if (ret)
++				goto read_error;
+ 		}
+-		memcpy_fromio(fp->build, regs->aop->region + A9_ATTACH_BUILD_OFFSET,
+-			      sizeof(fp->build));
+-		memcpy_fromio(fp->table, regs->aop->region + A9_ATTACH_TABLE_OFFSET,
+-			      sizeof(fp->table));
++		ret = a9_aop_fromio32(regs->aop->region, regs->aop->region_size,
++				      fp->build, A9_ATTACH_BUILD_OFFSET, sizeof(fp->build));
++		if (ret)
++			goto read_error;
++		ret = a9_aop_fromio32(regs->aop->region, regs->aop->region_size,
++				      fp->table, A9_ATTACH_TABLE_OFFSET, sizeof(fp->table));
++		if (ret)
++			goto read_error;
+ 		regs->aop->fingerprint_read = true;
++		regs->aop->diagnostics.captured = apple_a9_aop_debug();
+ 	}
++	return;
++read_error:
++	regs->read_errno = ret;
++	regs->aop->diagnostics.read_errno = ret;
+ }
+ 
+ static int a9_aop_wait_firmware(struct a9_aop *aop, const char *name,
+@@ -1331,13 +1377,19 @@ static int a9_aop_prepare_image(struct a9_aop *aop, const struct firmware *fw,
+ 
+ static int a9_aop_copy_verify(void __iomem *dst, const u8 *src, size_t size)
+ {
++	struct a9_aop_io32 io = { .base = dst };
+ 	u8 chunk[256];
+ 	size_t done, n;
++	int ret;
+ 
+-	memcpy_toio(dst, src, size);
++	ret = a9_aop_copy_to32(&io, a9_aop_io_write32, src, 0, size, size);
++	if (ret)
++		return ret;
+ 	for (done = 0; done < size; done += n) {
+ 		n = min(size - done, sizeof(chunk));
+-		memcpy_fromio(chunk, dst + done, n);
++		ret = a9_aop_fromio32(dst, size, chunk, done, n);
++		if (ret)
++			return ret;
+ 		if (memcmp(chunk, src + done, n))
+ 			return -EIO;
+ 	}
+@@ -1538,8 +1590,8 @@ static enum a9_attach_result a9_aop_check_ext(struct a9_aop *aop,
+ 			return A9_ATTACH_STALE_EXT;
+ 		for (done = 0; done < ext->size; done += n) {
+ 			n = min(ext->size - done, sizeof(chunk));
+-			memcpy_fromio(chunk, mapping + done, n);
+-			if (memcmp(chunk, ext->data + done, n)) {
++			if (a9_aop_fromio32(mapping, ext->size, chunk, done, n) ||
++			    memcmp(chunk, ext->data + done, n)) {
+ 				mismatch = 1;
+ 				break;
+ 			}
+@@ -1591,6 +1643,8 @@ static bool a9_aop_attach_preflight(struct a9_aop *aop)
+ 		goto out;
+ 	}
+ 	memcpy(aop->snapshot, regs.values, sizeof(aop->snapshot));
++	if (regs.read_errno)
++		goto out;
+ 	if ((regs.values[2] | regs.values[3]) & AOP_MBOX_FAULTS) {
+ 		a9_aop_refuse(aop, "refused-mailbox-fault");
+ 		goto out;
+@@ -2105,11 +2159,15 @@ static int a9_aop_fingerprint_show(struct seq_file *s, void *unused)
+ 	struct a9_aop *aop = s->private;
+ 	const struct a9_attach_fingerprint *expected = &aop->diagnostics.expected;
+ 	const struct a9_attach_fingerprint *actual = &aop->fingerprint;
++	struct a9_diag_diff identity;
+ 	bool pinned;
+ 
+ 	mutex_lock(&aop->lock);
+ 	pinned = aop->diagnostics.reference_pinned;
+ 	seq_puts(s, "format=1 source=phase-A-frozen-snapshot hardware_reads=none hardware_writes=none\n");
++	seq_printf(s, "snapshot_access=aligned-readl32 stride=4 tag_bus_bytes=0x1e0 read_errno=%d build_identity_bytes=%u runtime_guard_offset=0x47474\n",
++		   aop->diagnostics.read_errno, A9_ATTACH_BUILD_ID_SIZE);
++	seq_puts(s, "build_window_tail=runtime-data (guard/cursor are not build text); guard must match pinned-layout STKG; no alternate AP base is followed\n");
+ 	seq_printf(s, "reference=%s size=%u sha256=af5d51a368ceb89dc5c359e7c84e54cb6082e308956be742c17622eb4a6047c8 pinned=%d errno=%d\n",
+ 		   AOP_MAIN_FW, A9_ATTACH_MAIN_SIZE, pinned, aop->diagnostics.reference_errno);
+ 	seq_printf(s, "region pa=0x%llx size=0x%llx snapshot_available=%d\n",
+@@ -2137,8 +2195,19 @@ static int a9_aop_fingerprint_show(struct seq_file *s, void *unused)
+ 		   get_unaligned_le32(actual->head + 0x48),
+ 		   get_unaligned_le32(actual->head + 0x4c));
+ 	seq_puts(s, "uuid expected magic=0x64697575 version=5 table_offset=0x389b8 table_size=0x1df\n");
++	seq_printf(s, "runtime_header data_backing_word=0x%08x expected=0 (IOP-side metadata, not an AP address; non-default header is refused)\n",
++		   get_unaligned_le32(actual->head + 0x58));
+ 	a9_aop_fingerprint_window(s, "build-string", A9_ATTACH_BUILD_OFFSET,
+ 				  actual->build, expected->build, A9_ATTACH_BUILD_SIZE, pinned);
++	if (pinned) {
++		identity = a9_diag_compare(actual->build, expected->build, A9_ATTACH_BUILD_ID_SIZE);
++		seq_printf(s, "build_identity comparison=%s bytes=%u mismatched_bytes=%zu (raw 64-byte window above includes mutable globals)\n",
++			   identity.count ? "different" : "equal", A9_ATTACH_BUILD_ID_SIZE,
++			   identity.count);
++	}
++	seq_printf(s, "runtime_data guard=0x%08x cursor=0x%08x tags_and_guard_verified=%d\n",
++		   get_unaligned_le32(actual->build + A9_ATTACH_GUARD_OFFSET),
++		   get_unaligned_le32(actual->build + 0x38), aop->tags_verified);
+ 	a9_aop_fingerprint_window(s, "tag-table-unpatched-template", A9_ATTACH_TABLE_OFFSET,
+ 				  actual->table, expected->table, A9_ATTACH_TABLE_SIZE, pinned);
+ 	a9_aop_fingerprint_tags(s, aop);

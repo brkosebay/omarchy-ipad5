@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 12:40:11 +0000
+Subject: [PATCH 18/21] media: apple: vxd: size the bitstream buffer from the coded
+ size
+
+GStreamer's v4l2codecs leaves sizeimage to the driver and refuses an
+access unit that does not fit.  The OUTPUT sizeimage is now at least
+one byte per pixel (page aligned, still at least 1 MiB): about 2 MiB for
+1920x1088, enough for a level 4.2 intra picture.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ drivers/media/platform/apple/vxd/apple-vxd-v4l2.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-v4l2.c b/drivers/media/platform/apple/vxd/apple-vxd-v4l2.c
+index 9a348ff862f83b57bd209c1f767691b4c081cdef..622fb1f96788a94faf2e5d57546b2b0aad571124 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-v4l2.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-v4l2.c
+@@ -327,8 +327,15 @@ static int apple_vxd_do_try_output_fmt(struct apple_vxd_ctx *ctx,
+ 			return ret;
+ 	}
+ 
++	/*
++	 * One access unit per buffer (frame-based decode): one byte per
++	 * pixel covers a level 4.2 1080p intra picture (about 2 MiB),
++	 * userspace such as GStreamer leaves sizeimage to the driver.
++	 */
+ 	pix_mp->plane_fmt[0].sizeimage =
+-		max(pix_mp->plane_fmt[0].sizeimage, APPLE_VXD_MIN_BITSTREAM_SIZE);
++		max3(pix_mp->plane_fmt[0].sizeimage,
++		     (u32)APPLE_VXD_MIN_BITSTREAM_SIZE,
++		     (u32)PAGE_ALIGN(pix_mp->width * pix_mp->height));
+ 	return 0;
+ }
+ 

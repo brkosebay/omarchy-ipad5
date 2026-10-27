@@ -1,0 +1,53 @@
+From e9fce91b895f0b631191a081bf0d044adbef231a Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 02:36:17 +0000
+Subject: [PATCH 1/5] dt-bindings: sound: apple,s8000-mca: add the capture DMA
+ channel
+
+MCA0 receives through its own SmartIO endpoint (0x29, next to TX on
+0x28). Allow a second "dmas" entry named "rx". The ADT dma-channels
+words of the RX endpoint are the same as for TX, so apple,sio-dma-config
+covers both directions.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ .../devicetree/bindings/sound/apple,s8000-mca.yaml | 14 ++++++++++----
+ 1 file changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/sound/apple,s8000-mca.yaml b/Documentation/devicetree/bindings/sound/apple,s8000-mca.yaml
+index bf0a2ef4e6..ad2e3a6f38 100644
+--- a/Documentation/devicetree/bindings/sound/apple,s8000-mca.yaml
++++ b/Documentation/devicetree/bindings/sound/apple,s8000-mca.yaml
+@@ -38,10 +38,16 @@ properties:
+     maxItems: 1
+ 
+   dmas:
+-    maxItems: 1
++    minItems: 1
++    items:
++      - description: SmartIO transmit (playback) endpoint
++      - description: SmartIO receive (capture) endpoint
+ 
+   dma-names:
+-    const: tx
++    minItems: 1
++    items:
++      - const: tx
++      - const: rx
+ 
+   '#sound-dai-cells':
+     const: 0
+@@ -80,8 +86,8 @@ properties:
+       - description: shim FIFO size, bytes
+       - description: shim trigger level, bytes
+     description:
+-      The SmartIO shim words of this MCA's DMA endpoint (Apple ADT
+-      dma-channels).
++      The SmartIO shim words of this MCA's DMA endpoints (Apple ADT
++      dma-channels; the transmit and receive entries carry the same words).
+ 
+   apple,pio-fifo-offset:
+     $ref: /schemas/types.yaml#/definitions/uint32
+-- 
+2.56.0
+

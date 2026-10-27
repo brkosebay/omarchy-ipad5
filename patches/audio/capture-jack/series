@@ -1,0 +1,5 @@
+0001-dt-bindings-sound-apple-s8000-mca-add-the-capture-DM.patch
+0002-dt-bindings-sound-cirrus-cs42l81-add-headset-switch-.patch
+0003-ASoC-cs42l81-add-DMIC-capture-headphone-output-and-j.patch
+0004-ASoC-apple-s8000-mca-add-capture-over-SmartIO-MCA0-R.patch
+0005-arm64-dts-apple-j71t-add-mics-headphones-and-MCA0-RX.patch

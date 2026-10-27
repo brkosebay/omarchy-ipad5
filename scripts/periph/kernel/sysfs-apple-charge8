@@ -1,0 +1,23 @@
+What:		/sys/bus/i2c/devices/*-001a/lightning_state
+Date:		October 2026
+Contact:	linux-a9 maintainers
+Description:
+		The charger_detect line adds cached diagnostics to the existing
+		Lightning snapshot. Reading it never starts a pin conversion.
+		stage/pin identify the last detection operation; error is its errno,
+		monitor_error is the role-monitor callback result (including a
+		refused callback), attempts/failures count this physical source,
+		retry_ms is the failure backoff (1000..60000 ms), poisoned means
+		ADC completion was uncertain and further triggers are prohibited
+		until reboot. Detach does not clear that poison; poison_stage and
+		poison_attach retain the operation and source epoch that latched it.
+
+		route is the last pre-monitor DX_CONTROL byte, adc_status the last
+		0x156 read. Negative values indicate errno or unavailable (-ENODATA).
+		dp_mv/dm_mv are passive divider samples, cc_mv the last opposite-pair
+		D+ sample for verified DigitalID 10 09 08 00 00 00. These are pin
+		voltages, never VBUS. sampled means classification completed.
+		Type C budgets come from stable CC advertisement (1500/3000 mA),
+		3 A requires BC1.2 charging-port evidence; otherwise it is capped
+		at 1500 mA. All budgets are bounded by the charger's board ceiling and supported current ladder.
+		Classification does not negotiate USB Power Delivery or change VBUS.

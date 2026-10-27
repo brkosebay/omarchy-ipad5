@@ -1,0 +1,220 @@
+From c20e3fe6c4b7850044e85091ebe52413f861179d Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 10:07:08 +0000
+Subject: [PATCH 09/43] nvme-pci: Add a read-only mode for Apple iDevice
+ bring-up
+
+The internal NVMe of the A9/A10 iDevices this tree targets holds the
+user's iOS installation. Add CONFIG_NVME_PCI_READ_ONLY (default y on
+ARCH_APPLE), which makes every nvme-pci controller read-only with no
+runtime override:
+
+- nvme_prep_rq() refuses, before anything reaches the submission
+  queue, any command outside an allowlist: Read and Flush on I/O
+  queues; on the admin queue Identify, Get Log Page, Get Features,
+  queue create/delete, Abort, AER, Keep Alive and Set Features for
+  a few volatile feature IDs without the Save bit. This covers block
+  I/O, discard, write-zeroes and all passthrough paths.
+- nvme_sq_copy_cmd() repeats the check as a backstop and replaces a
+  refused command with a harmless one (with a WARN), since it is the
+  only place commands enter the SQ.
+- NVME_CTRL_FORCE_RO makes nvme_ns_is_readonly() true, so the
+  gendisks stay read-only across revalidation and opens for write fail
+  with EACCES. bio_check_ro() alone only warns.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ drivers/nvme/host/Kconfig |  15 ++++++
+ drivers/nvme/host/core.c  |   3 +-
+ drivers/nvme/host/nvme.h  |   1 +
+ drivers/nvme/host/pci.c   | 104 ++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 122 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/nvme/host/Kconfig b/drivers/nvme/host/Kconfig
+index 31974c7dd2..85be74a909 100644
+--- a/drivers/nvme/host/Kconfig
++++ b/drivers/nvme/host/Kconfig
+@@ -14,6 +14,21 @@ config BLK_DEV_NVME
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called nvme.
+ 
++config NVME_PCI_READ_ONLY
++	bool "Refuse writes to NVMe PCI devices"
++	depends on BLK_DEV_NVME
++	default y if ARCH_APPLE
++	help
++	  Make every NVMe PCI controller read-only. Namespaces are always
++	  marked read-only and the driver refuses, before submission, every
++	  command that could modify the medium or the controller's persistent
++	  state: I/O queues may only read and flush, and the admin queue only
++	  accepts identify, log/feature reads, queue management and a short
++	  list of volatile Set Features. There is no runtime override.
++
++	  This exists for bring-up on Apple A9/A10 iDevices, whose internal
++	  NVMe disk holds the iOS installation. Say N on any other system.
++
+ config NVME_MULTIPATH
+ 	bool "NVMe multipath support"
+ 	depends on NVME_CORE
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index 1322c678f4..3598579cfc 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -2194,7 +2194,8 @@ static bool nvme_update_disk_info(struct nvme_ns *ns, struct nvme_id_ns *id,
+ 
+ static bool nvme_ns_is_readonly(struct nvme_ns *ns, struct nvme_ns_info *info)
+ {
+-	return info->is_readonly || test_bit(NVME_NS_FORCE_RO, &ns->flags);
++	return info->is_readonly || test_bit(NVME_NS_FORCE_RO, &ns->flags) ||
++		test_bit(NVME_CTRL_FORCE_RO, &ns->ctrl->flags);
+ }
+ 
+ static inline bool nvme_first_scan(struct gendisk *disk)
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 75e5d5a8a7..a3d1446eeb 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -336,6 +336,7 @@ enum nvme_ctrl_flags {
+ 	NVME_CTRL_SKIP_ID_CNS_CS	= 4,
+ 	NVME_CTRL_DIRTY_CAPABILITY	= 5,
+ 	NVME_CTRL_FROZEN		= 6,
++	NVME_CTRL_FORCE_RO		= 7,
+ };
+ 
+ struct nvme_ctrl {
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 348be3283b..4cb72adc35 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -591,10 +591,97 @@ static inline void nvme_write_sq_db(struct nvme_queue *nvmeq, bool write_sq)
+ 	nvmeq->last_sq_tail = nvmeq->sq_tail;
+ }
+ 
++/*
++ * CONFIG_NVME_PCI_READ_ONLY: allowlist of the commands this kernel may send.
++ *
++ * I/O queues may only read and flush. The admin queue may only identify,
++ * read logs and features, manage its own queues, and set the few volatile
++ * features nvme-core configures at init. Everything else (write, write
++ * zeroes, DSM/trim, format, sanitize, firmware download/commit, namespace
++ * management, security send, directives, vendor-specific opcodes, saved
++ * features) is refused before it reaches the submission queue.
++ */
++static bool nvme_pci_cmd_allowed(const struct nvme_queue *nvmeq,
++				 const struct nvme_command *cmd)
++{
++	u32 cdw10;
++
++	if (!IS_ENABLED(CONFIG_NVME_PCI_READ_ONLY))
++		return true;
++
++	if (nvmeq->qid) {
++		switch (cmd->common.opcode) {
++		case nvme_cmd_flush:
++		case nvme_cmd_read:
++			return true;
++		default:
++			return false;
++		}
++	}
++
++	switch (cmd->common.opcode) {
++	case nvme_admin_delete_sq:
++	case nvme_admin_create_sq:
++	case nvme_admin_get_log_page:
++	case nvme_admin_delete_cq:
++	case nvme_admin_create_cq:
++	case nvme_admin_identify:
++	case nvme_admin_abort_cmd:
++	case nvme_admin_get_features:
++	case nvme_admin_async_event:
++	case nvme_admin_keep_alive:
++		return true;
++	case nvme_admin_set_features:
++		cdw10 = le32_to_cpu(cmd->features.fid);
++		/* SV: the feature would persist across power cycles */
++		if (cdw10 & BIT(31))
++			return false;
++		switch (cdw10 & 0xff) {
++		case NVME_FEAT_POWER_MGMT:
++		case NVME_FEAT_TEMP_THRESH:
++		case NVME_FEAT_NUM_QUEUES:
++		case NVME_FEAT_IRQ_COALESCE:
++		case NVME_FEAT_ASYNC_EVENT:
++		case NVME_FEAT_AUTO_PST:
++		case NVME_FEAT_TIMESTAMP:
++		case NVME_FEAT_KATO:
++		case NVME_FEAT_HOST_BEHAVIOR:
++			return true;
++		default:
++			return false;
++		}
++	default:
++		return false;
++	}
++}
++
+ static inline void nvme_sq_copy_cmd(struct nvme_queue *nvmeq,
+ 				    struct nvme_command *cmd)
+ 	__must_hold(&nvmeq->sq_lock)
+ {
++	struct nvme_command safe;
++
++	/*
++	 * Backstop for CONFIG_NVME_PCI_READ_ONLY: nvme_prep_rq() already
++	 * failed disallowed requests, so getting here is a bug. Never let the
++	 * command reach the device; queue a harmless one in its slot so the
++	 * SQ tail stays consistent.
++	 */
++	if (unlikely(!nvme_pci_cmd_allowed(nvmeq, cmd))) {
++		WARN_ONCE(1, "nvme: read-only: neutralized opcode %#x on qid %u\n",
++			  cmd->common.opcode, nvmeq->qid);
++		memset(&safe, 0, sizeof(safe));
++		safe.common.command_id = cmd->common.command_id;
++		if (nvmeq->qid) {
++			safe.common.opcode = nvme_cmd_flush;
++			safe.common.nsid = cmd->common.nsid;
++		} else {
++			safe.features.opcode = nvme_admin_get_features;
++			safe.features.fid = cpu_to_le32(NVME_FEAT_NUM_QUEUES);
++		}
++		cmd = &safe;
++	}
++
+ 	memcpy(nvmeq->sq_cmds + (nvmeq->sq_tail << nvmeq->sqes),
+ 		absolute_pointer(cmd), sizeof(*cmd));
+ 	if (++nvmeq->sq_tail == nvmeq->q_depth)
+@@ -1283,6 +1370,17 @@ static blk_status_t nvme_prep_rq(struct request *req)
+ 	if (ret)
+ 		return ret;
+ 
++	if (unlikely(!nvme_pci_cmd_allowed(req->mq_hctx->driver_data,
++					   &iod->cmd))) {
++		dev_err_ratelimited(nvme_req(req)->ctrl->device,
++				    "read-only: refused opcode %#x on %s queue\n",
++				    iod->cmd.common.opcode,
++				    nvme_req(req)->ctrl->admin_q == req->q ?
++				    "admin" : "I/O");
++		ret = BLK_STS_IOERR;
++		goto out_free_cmd;
++	}
++
+ 	if (blk_rq_nr_phys_segments(req)) {
+ 		ret = nvme_map_data(req);
+ 		if (ret)
+@@ -3625,6 +3723,12 @@ static struct nvme_dev *nvme_pci_alloc_dev(struct pci_dev *pdev,
+ 	if (ret)
+ 		goto out_put_device;
+ 
++	if (IS_ENABLED(CONFIG_NVME_PCI_READ_ONLY)) {
++		set_bit(NVME_CTRL_FORCE_RO, &dev->ctrl.flags);
++		dev_info(&pdev->dev,
++			 "read-only: media writes and destructive admin commands are refused (CONFIG_NVME_PCI_READ_ONLY)\n");
++	}
++
+ 	if (dev->ctrl.quirks & NVME_QUIRK_DMA_ADDRESS_BITS_48)
+ 		dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(48));
+ 	else
+-- 
+2.56.0
+

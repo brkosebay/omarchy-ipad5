@@ -1,0 +1,663 @@
+From dcc23b697e8e63e318cf3d746e4348faa28b5d1f Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 00:31:54 +0000
+Subject: [PATCH 2/3] power: supply: apple: keep J71t charging steady across
+ USB link PM
+
+Keep the owner budget through suspend and a five-second reset grace
+instead of revoking it with the instantaneous gadget budget. Tristar
+reports the enumerated 500 mA source while suspended, including when the
+gadget zeros current_ma. Preserve the analog detector's connected/host-
+grant guard.
+
+Apply battery then input limits directly, without an input-suspend
+ritual. Ramp 500/1000/2100/2400 mA at most once per second and retry
+elevation after 30 seconds following a step-down. Arm the validated
+owner limit at probe. Only explicit zero or confirmed VBUS loss revokes
+that authorization.
+
+Treat gauge presence/cache and transport errors as transient, preserving
+an active budget for at most 60 seconds without valid safety samples. A
+valid pack voltage proves presence when bq27xxx PRESENT is zero. Use a
+45 C trip and 42 C clear with a 500 mA thermal floor.
+Timeout/termination also step down. Only register-ownership mismatches
+latch, with a guarded 60-second retry.
+
+Validated with actual-function ASan/UBSan timing and fault injection
+tests, USB resume/ECM regressions, gadget budget assertions, and Tristar
+mux faults. No device access or syscfg/NVRAM writes.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ drivers/power/supply/apple_j71t_charger.c  | 435 ++++++++++++++-------
+ drivers/power/supply/apple_tristar_power.c |   2 +-
+ 2 files changed, 299 insertions(+), 138 deletions(-)
+
+diff --git a/drivers/power/supply/apple_j71t_charger.c b/drivers/power/supply/apple_j71t_charger.c
+index cb8669239b..ce93beb939 100644
+--- a/drivers/power/supply/apple_j71t_charger.c
++++ b/drivers/power/supply/apple_j71t_charger.c
+@@ -26,6 +26,12 @@
+ #define J71T_CHARGE_CODE 50 /* 2500 mA, still bounded by 0xa0c[5:0]. */
+ #define J71T_USB_CHARGE_CODE 8 /* Conservative 400 mA battery ceiling at 500 mA input. */
+ #define J71T_REQUEST_UA 2400000
++#define J71T_FLOOR_UA 500000
++#define J71T_EREGREADBACK (-EUCLEAN)
++#define J71T_LINK_GRACE_MS 5000
++#define J71T_SAMPLE_GRACE_MS 60000
++#define J71T_FAULT_RETRY_MS 60000
++#define J71T_OWNER_RETRY_MS 30000
+ 
+ static const int j71t_budgets_ua[] = { 500000, 1000000, 2100000, 2400000 };
+ 
+@@ -41,6 +47,15 @@ struct j71t_charger {
+ 	u8 charge_code;
+ 	int budget_ua;
+ 	int user_limit_ua;
++	int max_limit_ua;
++	bool thermal_limited;
++	bool holding;
++	bool sample_pending;
++	unsigned long hold_until;
++	unsigned long sample_until;
++	unsigned long fault_until;
++	unsigned long retry_after;
++	unsigned long ramp_after;
+ 	u8 old_control;
+ 	u8 old_input;
+ 	u8 old_charge;
+@@ -126,7 +141,7 @@ static int j71t_write_checked(struct j71t_charger *charger, unsigned int reg, u8
+ 	ret = j71t_read(charger, reg, &readback);
+ 	if (ret)
+ 		return ret;
+-	return readback == value ? 0 : -EIO;
++	return readback == value ? 0 : J71T_EREGREADBACK;
+ }
+ 
+ /* Own only bit 1; preserve every other current control-register bit. */
+@@ -138,6 +153,8 @@ static int j71t_set_suspend(struct j71t_charger *charger, u8 saved)
+ 	ret = j71t_read(charger, J71T_INPUT_CONTROL, &control);
+ 	if (ret)
+ 		return ret;
++	if ((control & J71T_INPUT_SUSPEND) == (saved & J71T_INPUT_SUSPEND))
++		return 0;
+ 	control = (control & ~J71T_INPUT_SUSPEND) | (saved & J71T_INPUT_SUSPEND);
+ 	return j71t_write_checked(charger, J71T_INPUT_CONTROL, control);
+ }
+@@ -166,15 +183,50 @@ static int j71t_source_limit(struct j71t_charger *charger)
+ 	return ret ? ret : value.intval;
+ }
+ 
+-/* A positive sysfs write authorizes this source, not a USB host grant. */
++/* An unknown DT ceiling must never grant an uncalibrated budget. */
++static int j71t_valid_limit(unsigned int limit)
++{
++	int index = j71t_choose_budget(limit);
++
++	return index >= 0 && (unsigned int)j71t_budgets_ua[index] == limit ? limit : J71T_FLOOR_UA;
++}
++
++static int j71t_source_eligible(struct j71t_charger *charger)
++{
++	union power_supply_propval value;
++	int ret;
++
++	ret = power_supply_get_property_from_supplier(charger->psy,
++						      POWER_SUPPLY_PROP_USB_TYPE, &value);
++	if (ret)
++		return -EAGAIN;
++	return value.intval == POWER_SUPPLY_USB_TYPE_SDP ||
++	       value.intval == POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID;
++}
++
++/* Link PM/reset is not source removal; only ONLINE=0 revokes the owner. */
+ static int j71t_policy_limit(struct j71t_charger *charger)
+ {
+ 	int source_ua = j71t_source_limit(charger);
++	int eligible;
+ 
+-	/* Require at least an ordinary source allowance, even for an override. */
+-	if (source_ua < 500000)
+-		return source_ua;
+-	return charger->user_limit_ua ?: source_ua;
++	if (source_ua < 0)
++		return -EAGAIN;
++	eligible = j71t_source_eligible(charger);
++	if (eligible < 0)
++		return eligible;
++	/* A reset can temporarily lose classification without losing VBUS. */
++	if (source_ua < J71T_FLOOR_UA || !eligible) {
++		if (!charger->holding) {
++			charger->holding = true;
++			charger->hold_until = jiffies + msecs_to_jiffies(J71T_LINK_GRACE_MS);
++		}
++		if (charger->active && time_before(jiffies, charger->hold_until))
++			return charger->budget_ua;
++		return J71T_FLOOR_UA;
++	}
++	charger->holding = false;
++	return min(charger->max_limit_ua, charger->user_limit_ua ?: source_ua);
+ }
+ 
+ static int j71t_charge_code(int budget_ua)
+@@ -189,7 +241,7 @@ static void j71t_revoke_override(struct j71t_charger *charger)
+ 	charger->user_limit_ua = 0;
+ }
+ 
+-static int j71t_battery_safe(void)
++static int j71t_battery_safe(struct j71t_charger *charger)
+ {
+ 	struct power_supply *battery;
+ 	union power_supply_propval value;
+@@ -199,49 +251,67 @@ static int j71t_battery_safe(void)
+ 	if (!battery)
+ 		return -EAGAIN;
+ 	ret = power_supply_get_property(battery, POWER_SUPPLY_PROP_PRESENT, &value);
+-	if (ret || value.intval != 1) {
+-		ret = ret ?: -ENODEV;
++	if (ret)
++		goto transient;
++	/* PRESENT=0 also means a failed cached flags read in bq27xxx. */
++	ret = power_supply_get_property(battery, POWER_SUPPLY_PROP_VOLTAGE_NOW, &value);
++	if (ret)
++		goto transient;
++	if (value.intval < 3000000 || value.intval > 4200000) {
++		ret = -ERANGE;
+ 		goto out;
+ 	}
+ 	ret = power_supply_get_property(battery, POWER_SUPPLY_PROP_TEMP, &value);
+-	if (ret || value.intval < 100 || value.intval > 400) {
+-		ret = ret ?: -ERANGE;
+-		goto out;
+-	}
+-	ret = power_supply_get_property(battery, POWER_SUPPLY_PROP_VOLTAGE_NOW, &value);
+-	if (!ret && (value.intval < 3000000 || value.intval > 4200000))
+-		ret = -ERANGE;
++	if (ret)
++		goto transient;
++	if (value.intval >= 450)
++		charger->thermal_limited = true;
++	else if (value.intval <= 420)
++		charger->thermal_limited = false;
++	ret = value.intval < 100 ? -ERANGE :
++		charger->thermal_limited ? -EOVERFLOW : 0;
++	goto out;
++transient:
++	ret = -EAGAIN;
+ out:
+ 	power_supply_put(battery);
+-	/* The first asynchronous gauge sample may not exist yet. */
+-	return ret == -ENODATA ? -EAGAIN : ret;
++	return ret;
++}
++
++/* Match the iOS order without using input suspend as a transaction lock. */
++static int j71t_apply(struct j71t_charger *charger, u8 charge, u8 input)
++{
++	int ret = j71t_write_checked(charger, J71T_CHARGE_CURRENT, charge);
++
++	if (!ret)
++		ret = j71t_write_checked(charger, J71T_INPUT_LIMIT, input);
++	return ret;
+ }
+ 
+-/* Restore the original handoff snapshot before changing policy ownership. */
+ static int j71t_restore(struct j71t_charger *charger)
+ {
+-	int ret, first = 0;
++	int ret;
+ 
+ 	charger->active = false;
+ 	if (!charger->saved)
+ 		return 0;
+-	/* Keep input suspended until BOTH saved budgets have been verified. */
+-	ret = j71t_set_suspend(charger, J71T_INPUT_SUSPEND);
+-	if (ret)
+-		return ret;
+-	ret = j71t_write_checked(charger, J71T_CHARGE_CURRENT, charger->old_charge);
+-	if (ret && !first)
+-		first = ret;
+-	ret = j71t_write_checked(charger, J71T_INPUT_LIMIT, charger->old_input);
+-	if (ret && !first)
+-		first = ret;
+-	if (!first)
+-		first = j71t_set_suspend(charger, charger->old_control);
+-	if (first)
+-		j71t_set_suspend(charger, J71T_INPUT_SUSPEND);
+-	if (!first)
++	ret = j71t_apply(charger, charger->old_charge, charger->old_input);
++	if (!ret)
+ 		charger->saved = false;
+-	return first;
++	return ret;
++}
++
++static bool j71t_is_fault(int error)
++{
++	return error == J71T_EREGREADBACK;
++}
++
++static void j71t_fault(struct j71t_charger *charger, int error)
++{
++	if (j71t_is_fault(error)) {
++		charger->faulted = true;
++		charger->fault_until = jiffies + msecs_to_jiffies(J71T_FAULT_RETRY_MS);
++	}
+ }
+ 
+ static int j71t_guard(struct j71t_charger *charger)
+@@ -254,20 +324,22 @@ static int j71t_guard(struct j71t_charger *charger)
+ 	ret = j71t_policy_limit(charger);
+ 	if (ret < charger->budget_ua)
+ 		return ret < 0 ? ret : -ERANGE;
+-	ret = j71t_battery_safe();
++	ret = j71t_battery_safe(charger);
++	if (ret == -EOVERFLOW && charger->budget_ua == J71T_FLOOR_UA)
++		ret = 0;
+ 	if (ret)
+ 		return ret;
+ 	ret = j71t_read(charger, J71T_STATUS, &status);
+ 	if (ret)
+ 		return ret;
+-	if (status & J71T_CHARGE_TIMEOUT)
+-		return -ETIME;
+-	if (status & J71T_CHARGE_END)
+-		return -EBUSY;
+ 	ret = j71t_read(charger, J71T_MAX_CHARGE_CURRENT, &cap);
+ 	if (ret)
+ 		return ret;
+-	return (cap & 0x3f) >= charger->charge_code ? 0 : -ERANGE;
++	if ((cap & 0x3f) < charger->charge_code)
++		return -ERANGE;
++	if (status & J71T_CHARGE_TIMEOUT)
++		return -ETIME;
++	return status & J71T_CHARGE_END ? -EBUSY : 0;
+ }
+ 
+ static int j71t_enable(struct j71t_charger *charger)
+@@ -277,43 +349,42 @@ static int j71t_enable(struct j71t_charger *charger)
+ 	if (!charger->calibrated)
+ 		return -ENODATA;
+ 	ret = j71t_guard(charger);
+-	if (ret) {
+-		if (ret != -ENOLINK && ret != -ERANGE && ret != -EBUSY && ret != -EAGAIN)
+-			charger->faulted = true;
+-		return ret;
+-	}
+-	if (charger->active)
+-		return 0;
+-	if (charger->saved)
+-		return -EBUSY;
+-	ret = j71t_read(charger, J71T_INPUT_CONTROL, &charger->old_control);
+-	if (ret)
+-		return ret;
+-	ret = j71t_read(charger, J71T_INPUT_LIMIT, &charger->old_input);
+-	if (ret)
+-		return ret;
+-	ret = j71t_read(charger, J71T_CHARGE_CURRENT, &charger->old_charge);
++	if (charger->budget_ua == J71T_FLOOR_UA && (ret == -ETIME || ret == -EBUSY))
++		ret = 0;
+ 	if (ret)
+ 		return ret;
+-	charger->saved = true;
+-	/* Same three controls as iOS; no voltage/watchdog/IRQ/cap writes. */
+-	ret = j71t_set_suspend(charger, J71T_INPUT_SUSPEND);
+-	if (!ret)
+-		ret = j71t_write_checked(charger, J71T_CHARGE_CURRENT, charger->charge_code);
+-	if (!ret)
+-		ret = j71t_write_checked(charger, J71T_INPUT_LIMIT, charger->input_code);
+-	if (!ret)
++	if (!charger->saved) {
++		ret = j71t_read(charger, J71T_INPUT_CONTROL, &charger->old_control);
++		if (!ret)
++			ret = j71t_read(charger, J71T_INPUT_LIMIT, &charger->old_input);
++		if (!ret)
++			ret = j71t_read(charger, J71T_CHARGE_CURRENT, &charger->old_charge);
++		if (ret)
++			return ret;
++		charger->saved = true;
++	}
++	ret = j71t_apply(charger, charger->charge_code, charger->input_code);
++	if (!ret) {
+ 		ret = j71t_guard(charger);
+-	if (!ret)
++		if (charger->budget_ua == J71T_FLOOR_UA && (ret == -ETIME || ret == -EBUSY))
++			ret = 0;
++	}
++	/* Clear a genuine handoff/owner disable only after the budgets are valid. */
++	if (!ret && (charger->old_control & J71T_INPUT_SUSPEND)) {
+ 		ret = j71t_set_suspend(charger, 0);
+-	if (!ret)
+-		ret = j71t_guard(charger);
++		if (!ret)
++			charger->old_control &= ~J71T_INPUT_SUSPEND;
++	}
+ 	if (ret) {
+-		charger->faulted = true;
+-		j71t_restore(charger);
++		int restore = j71t_restore(charger);
++
++		j71t_fault(charger, ret);
++		j71t_fault(charger, restore);
+ 		return ret;
+ 	}
+ 	charger->active = true;
++	charger->faulted = false;
++	charger->fault_until = 0;
+ 	dev_info(charger->dev, "%s budget %d mA: input 0x%02x, battery limit %d mA\n",
+ 		 charger->user_limit_ua ? "owner override" : "source",
+ 		 charger->budget_ua / 1000, charger->input_code, charger->charge_code * 50);
+@@ -330,7 +401,7 @@ static void j71t_policy_log(struct j71t_charger *charger, int error)
+ 	charger->policy_error = error;
+ 	charger->policy_log_after = jiffies + msecs_to_jiffies(30000);
+ 	if (charger->faulted)
+-		dev_info(charger->dev, "charging policy fault latched; guarded owner retry required\n");
++		dev_info(charger->dev, "charging policy ownership fault; automatic retry in 60 s\n");
+ 	else if (charger->disabled)
+ 		dev_info(charger->dev, "charging policy disabled by owner\n");
+ 	else if (!charger->calibrated)
+@@ -341,71 +412,166 @@ static void j71t_policy_log(struct j71t_charger *charger, int error)
+ 		dev_info(charger->dev, "charging policy deferred: %d; retry scheduled\n", error);
+ }
+ 
++static int j71t_check_owned(struct j71t_charger *charger)
++{
++	u8 input, control, charge;
++	int ret = j71t_read(charger, J71T_INPUT_LIMIT, &input);
++
++	if (!ret)
++		ret = j71t_read(charger, J71T_INPUT_CONTROL, &control);
++	if (!ret)
++		ret = j71t_read(charger, J71T_CHARGE_CURRENT, &charge);
++	if (!ret && (input != charger->input_code ||
++		     (control & J71T_INPUT_SUSPEND) || charge != charger->charge_code))
++		ret = J71T_EREGREADBACK;
++	return ret;
++}
++
++/* A readable hot pack must still trip while another supplier read fails. */
++static int j71t_thermal_floor(struct j71t_charger *charger)
++{
++	u8 cap;
++	int ret = j71t_read(charger, J71T_MAX_CHARGE_CURRENT, &cap);
++
++	if (ret)
++		return ret;
++	if ((cap & 0x3f) < J71T_USB_CHARGE_CODE)
++		return -ERANGE;
++	ret = j71t_apply(charger, J71T_USB_CHARGE_CODE, charger->input_codes[0]);
++	if (!ret) {
++		charger->budget_ua = J71T_FLOOR_UA;
++		charger->charge_code = J71T_USB_CHARGE_CODE;
++		charger->input_code = charger->input_codes[0];
++		charger->retry_after = jiffies + msecs_to_jiffies(J71T_OWNER_RETRY_MS);
++		dev_warn(charger->dev, "thermal floor while another safety sample is unavailable\n");
++	}
++	return ret;
++}
++
+ static void j71t_policy_work(struct work_struct *work)
+ {
+ 	struct j71t_charger *charger = container_of(to_delayed_work(work),
+ 							  struct j71t_charger, work);
+-	u8 input, control, charge;
+-	int ret = 0, source_ua, index;
++	int ret = 0, target, index, online, previous;
+ 
+ 	mutex_lock(&charger->lock);
+-	source_ua = j71t_policy_limit(charger);
+-	if (source_ua < 500000)
++	if (charger->stopping)
++		goto out;
++	if (charger->faulted && !time_before(jiffies, charger->fault_until))
++		charger->faulted = false;
++	online = j71t_online(charger);
++	if (!online) {
+ 		j71t_revoke_override(charger);
+-	index = j71t_choose_budget(source_ua);
+-	if (charger->active) {
+-		ret = j71t_guard(charger);
+-		if (!ret)
+-			ret = j71t_read(charger, J71T_INPUT_LIMIT, &input);
+-		if (!ret)
+-			ret = j71t_read(charger, J71T_INPUT_CONTROL, &control);
++		charger->holding = false;
++		charger->sample_pending = false;
++		ret = j71t_restore(charger);
+ 		if (!ret)
+-			ret = j71t_read(charger, J71T_CHARGE_CURRENT, &charge);
+-		if (!ret && (input != charger->input_code ||
+-			     (control & J71T_INPUT_SUSPEND) || charge != charger->charge_code)) {
+-			ret = -EIO;
+-			charger->faulted = true;
+-		}
+-		if (!ret && (index < 0 || charger->budget_ua != j71t_budgets_ua[index]))
+-			ret = -EAGAIN;
+-		if (ret) {
+-			if (ret != -ENOLINK && ret != -ERANGE && ret != -EBUSY && ret != -EAGAIN)
+-				charger->faulted = true;
+-			dev_warn(charger->dev, "charging request revoked: %d\n", ret);
+-			j71t_revoke_override(charger);
+-			charger->active = false;
+-			index = j71t_choose_budget(j71t_policy_limit(charger));
+-		}
++			ret = j71t_set_suspend(charger, J71T_INPUT_SUSPEND);
++		goto report;
+ 	}
+-	if (!charger->active && charger->saved) {
++	if (charger->disabled || charger->faulted || !charger->calibrated) {
+ 		ret = j71t_restore(charger);
++		goto report;
++	}
++	/* A failed rollback must finish before taking a fresh snapshot. */
++	if (charger->saved && !charger->active) {
++		ret = j71t_restore(charger);
++		if (ret)
++			goto report;
++	}
++	if (charger->active) {
++		ret = j71t_check_owned(charger);
++		if (j71t_is_fault(ret))
++			goto restore;
+ 		if (ret)
+-			dev_err_ratelimited(charger->dev, "charger restore pending: %d\n", ret);
++			goto transient;
++	}
++	if (online < 0)
++		goto transient;
++	target = j71t_policy_limit(charger);
++	if (target < 0)
++		goto transient;
++	ret = j71t_battery_safe(charger);
++	if (ret == -EAGAIN)
++		goto transient;
++	if (ret && ret != -EOVERFLOW)
++		goto restore;
++	if (ret == -EOVERFLOW)
++		target = J71T_FLOOR_UA;
++	/* Guard the existing budget before considering a new one. */
++	if (charger->active) {
++		ret = j71t_guard(charger);
++		if (ret == -EOVERFLOW || ret == -ETIME || ret == -EBUSY)
++			target = J71T_FLOOR_UA;
++		else if (ret == -ERANGE && target < charger->budget_ua)
++			ret = 0;
++		else if (ret == -EAGAIN || (ret && ret != -ERANGE && ret != -ENOLINK))
++			goto transient;
++		else if (ret)
++			goto restore;
+ 	}
+-	if (!charger->stopping && !charger->disabled && !charger->faulted &&
+-	    charger->calibrated && !charger->active && !charger->saved && index >= 0) {
++	charger->sample_pending = false;
++	previous = charger->active ? charger->budget_ua : 0;
++	if (target < previous)
++		charger->retry_after = jiffies + msecs_to_jiffies(J71T_OWNER_RETRY_MS);
++	else if (previous && target > previous &&
++		 time_before(jiffies, charger->retry_after))
++		target = previous;
++	index = j71t_choose_budget(target);
++	/* At most one upward step per second, including supplier notifications. */
++	if (index >= 0 && target > previous) {
++		int next = previous ? j71t_choose_budget(previous) + 1 : 0;
++
++		if (previous && time_before(jiffies, charger->ramp_after))
++			goto report;
++		index = min(index, next);
++	}
++	if (index >= 0 && (!charger->active || j71t_budgets_ua[index] != previous)) {
+ 		charger->budget_ua = j71t_budgets_ua[index];
+ 		charger->input_code = charger->input_codes[index];
+-		/* Input regulation still bounds the total USB draw. */
+ 		charger->charge_code = j71t_charge_code(charger->budget_ua);
+ 		ret = j71t_enable(charger);
+ 		if (ret)
+-			j71t_revoke_override(charger);
++			goto restore;
++		charger->ramp_after = jiffies + msecs_to_jiffies(1000);
++	}
++	goto report;
++transient:
++	/* Source/PMIC transport grace must not mask a valid pack guard. */
++	ret = j71t_battery_safe(charger);
++	if (ret == -ERANGE)
++		goto restore;
++	if (ret == -EOVERFLOW && charger->active && charger->budget_ua > J71T_FLOOR_UA) {
++		ret = j71t_thermal_floor(charger);
++		if (ret)
++			goto restore;
++	}
++	ret = -EAGAIN;
++	if (!charger->sample_pending) {
++		charger->sample_pending = true;
++		charger->sample_until = jiffies + msecs_to_jiffies(J71T_SAMPLE_GRACE_MS);
+ 	}
++	if (!charger->active || time_before(jiffies, charger->sample_until))
++		goto report;
++	dev_warn(charger->dev, "source/battery sample unavailable for 60 s; restoring handoff\n");
++restore:
++	j71t_fault(charger, ret);
++	if (charger->active)
++		dev_warn(charger->dev, "charging policy stepped down: %d\n", ret);
++	j71t_fault(charger, j71t_restore(charger));
++	charger->retry_after = jiffies + msecs_to_jiffies(J71T_OWNER_RETRY_MS);
++report:
++	j71t_fault(charger, ret);
+ 	if (charger->faulted)
+-		ret = -EIO;
++		ret = J71T_EREGREADBACK;
+ 	else if (charger->disabled)
+ 		ret = -ECANCELED;
+ 	else if (!charger->calibrated)
+ 		ret = -ENODATA;
+-	else if (charger->active)
+-		ret = 0;
+-	else if (!ret && index < 0)
+-		ret = source_ua < 0 ? source_ua : -ERANGE;
+ 	j71t_policy_log(charger, ret);
+-	if (!charger->stopping)
+-		mod_delayed_work(system_power_efficient_wq, &charger->work,
+-				 msecs_to_jiffies(charger->saved && !charger->active ? 100 : 1000));
++	mod_delayed_work(system_power_efficient_wq, &charger->work,
++			 msecs_to_jiffies(1000));
++out:
+ 	mutex_unlock(&charger->lock);
+ 	if (charger->psy)
+ 		power_supply_changed(charger->psy);
+@@ -464,42 +630,30 @@ static int j71t_set_property(struct power_supply *psy, enum power_supply_propert
+ 			     const union power_supply_propval *value)
+ {
+ 	struct j71t_charger *charger = power_supply_get_drvdata(psy);
+-	int ret, index, source_ua;
++	int ret = 0;
+ 
+-	index = j71t_choose_budget(value->intval);
+ 	if (prop != POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT || value->intval < 0 ||
+-	    (value->intval && (index < 0 || j71t_budgets_ua[index] != value->intval)))
++	    (value->intval && j71t_valid_limit(value->intval) != value->intval))
+ 		return -EINVAL;
+ 	mutex_lock(&charger->lock);
+-	source_ua = j71t_source_limit(charger);
+ 	if (charger->stopping) {
+ 		ret = -ESHUTDOWN;
++	} else if (value->intval > charger->max_limit_ua) {
++		ret = -EINVAL;
+ 	} else if (!value->intval) {
+ 		charger->disabled = true;
+ 		j71t_revoke_override(charger);
+ 		ret = j71t_restore(charger);
+-	} else if (source_ua < 500000) {
+-		j71t_revoke_override(charger);
+-		ret = j71t_restore(charger);
++		/* Target zero is a real disable, never a budget-change ritual. */
+ 		if (!ret)
+-			ret = source_ua < 0 ? source_ua : -ERANGE;
++			ret = j71t_set_suspend(charger, J71T_INPUT_SUSPEND);
+ 	} else {
+-		j71t_revoke_override(charger);
+-		ret = j71t_restore(charger);
+-		if (!ret) {
+-			charger->disabled = false;
+-			charger->faulted = false;
+-			charger->user_limit_ua = value->intval;
+-			charger->budget_ua = value->intval;
+-			charger->input_code = charger->input_codes[index];
+-			charger->charge_code = j71t_charge_code(value->intval);
+-			dev_info(charger->dev, "owner authorizes %d mA input; detected allowance %d mA\n",
+-				 value->intval / 1000, source_ua / 1000);
+-			ret = j71t_enable(charger);
+-			if (ret)
+-				j71t_revoke_override(charger);
+-		}
++		charger->disabled = false;
++		charger->user_limit_ua = value->intval;
++		/* Authorization persists across deferred guards; work applies it. */
++		dev_info(charger->dev, "owner authorizes %d mA input\n", value->intval / 1000);
+ 	}
++	j71t_fault(charger, ret);
+ 	if (!charger->stopping)
+ 		mod_delayed_work(system_power_efficient_wq, &charger->work, 0);
+ 	mutex_unlock(&charger->lock);
+@@ -549,6 +703,7 @@ static int j71t_probe(struct platform_device *pdev)
+ 	struct power_supply_config config = {};
+ 	const struct firmware *fw;
+ 	struct j71t_charger *charger;
++	u32 limit;
+ 	int ret, i;
+ 
+ 	charger = devm_kzalloc(&pdev->dev, sizeof(*charger), GFP_KERNEL);
+@@ -582,6 +737,13 @@ static int j71t_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		dev_warn(&pdev->dev,
+ 			 "CBAT unavailable/unsupported (%d): charging writes disabled\n", ret);
++	charger->max_limit_ua = J71T_FLOOR_UA;
++	if (!of_property_read_u32(pdev->dev.of_node,
++				  "apple,usb-input-limit-max-microamp", &limit))
++		charger->max_limit_ua = j71t_valid_limit(limit);
++	if (!of_property_read_u32(pdev->dev.of_node,
++				  "apple,owner-input-limit-microamp", &limit))
++		charger->user_limit_ua = min(charger->max_limit_ua, j71t_valid_limit(limit));
+ 	config.drv_data = charger;
+ 	config.fwnode = dev_fwnode(&pdev->dev);
+ 	charger->psy = devm_power_supply_register(&pdev->dev, &j71t_desc, &config);
+@@ -601,7 +763,6 @@ static int j71t_quiesce(struct device *dev)
+ 
+ 	mutex_lock(&charger->lock);
+ 	charger->stopping = true;
+-	j71t_revoke_override(charger);
+ 	mutex_unlock(&charger->lock);
+ 	cancel_delayed_work_sync(&charger->work);
+ 	for (attempt = 0; attempt < 3; attempt++) {
+diff --git a/drivers/power/supply/apple_tristar_power.c b/drivers/power/supply/apple_tristar_power.c
+index 71bd50147f..e429431b33 100644
+--- a/drivers/power/supply/apple_tristar_power.c
++++ b/drivers/power/supply/apple_tristar_power.c
+@@ -226,7 +226,7 @@ static int apple_tristar_budget(const struct usb_gadget_current_budget *budget,
+ 	if (budget->connected) {
+ 		*type = POWER_SUPPLY_USB_TYPE_SDP;
+ 		if (budget->suspended)
+-			return 0;
++			return 500000; /* Link PM does not remove the enumerated source. */
+ 		if (budget->host_grant)
+ 			return min(budget->current_ma, 2400U) * 1000;
+ 		if (budget->configured)

@@ -1,0 +1,164 @@
+From ede8790b3d492326ad91e93a8b39413d4ea61c76 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 12:42:42 +0000
+Subject: [PATCH 25/43] PCI: apple-h9p, nvme-pci: apple-ans: Log the DART walk
+ for the admin queues
+
+Before CC.EN, log Linux's own translation of the ASQ and ACQ IOVAs
+(iommu_iova_to_phys) and walk the port 0 DART's stream 0 tables from its
+TTBR registers: once with the window base (apple,dma-range) removed, as
+the hardware sees the address, and once raw. A missing or malformed STE
+or PTE then shows up before the controller ever fetches.
+
+h9p reads the DART's apple,dma-range base when it maps the DART for its
+read-only diagnostics.
+---
+ drivers/nvme/host/pci-apple-ans.c       | 15 +++++++++
+ drivers/pci/controller/pcie-apple-h9p.c | 45 +++++++++++++++++++++++++
+ include/linux/apple-ans.h               |  6 ++++
+ 3 files changed, 66 insertions(+)
+
+diff --git a/drivers/nvme/host/pci-apple-ans.c b/drivers/nvme/host/pci-apple-ans.c
+index cec348d26a..bd59ea1083 100644
+--- a/drivers/nvme/host/pci-apple-ans.c
++++ b/drivers/nvme/host/pci-apple-ans.c
+@@ -13,6 +13,7 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/gfp.h>
+ #include <linux/io-64-nonatomic-lo-hi.h>
++#include <linux/iommu.h>
+ #include <linux/iopoll.h>
+ #include <linux/log2.h>
+ #include <linux/mempool.h>
+@@ -467,6 +468,18 @@ static void nvme_pci_apple_ans_log_msi(struct nvme_dev *dev)
+ 		 msi, flags, hi, lo, data, msix, xflags, pci_irq_vector(pdev, 0));
+ }
+ 
++/* Linux's own mapping of a queue IOVA, then the DART table walk for it */
++static void nvme_pci_apple_ans_log_queue(struct nvme_dev *dev, const char *what,
++					 dma_addr_t iova)
++{
++	struct iommu_domain *dom = iommu_get_domain_for_dev(dev->dev);
++	phys_addr_t pa = dom ? iommu_iova_to_phys(dom, iova) : 0;
++
++	dev_info(dev->dev, "Apple ANS: %s IOVA %pad -> PA %pa (Linux view)\n",
++		 what, &iova, &pa);
++	apple_ans_dart_walk(dev->dev, what, iova);
++}
++
+ /*
+  * Stop short or wait for userspace before CC.EN. Runs in reset_work with
+  * shutdown_lock held, so a reboot during the hold waits for it to end.
+@@ -527,6 +540,8 @@ static int nvme_pci_apple_ans_prepare_enable(struct nvme_dev *dev)
+ 		 lo_hi_readq(dev->bar + NVME_REG_ACQ));
+ 	nvme_pci_apple_ans_log_msi(dev);
+ 	apple_ans_host_dump(dev->dev, "before CC.EN");
++	nvme_pci_apple_ans_log_queue(dev, "ASQ", dev->queues[0].sq_dma_addr);
++	nvme_pci_apple_ans_log_queue(dev, "ACQ", dev->queues[0].cq_dma_addr);
+ 	apple_ans_settle();
+ 
+ 	ret = nvme_pci_apple_ans_gate(dev);
+diff --git a/drivers/pci/controller/pcie-apple-h9p.c b/drivers/pci/controller/pcie-apple-h9p.c
+index f4d339db6b..c2f40712a8 100644
+--- a/drivers/pci/controller/pcie-apple-h9p.c
++++ b/drivers/pci/controller/pcie-apple-h9p.c
+@@ -24,6 +24,7 @@
+ #include <linux/io.h>
+ #include <linux/iopoll.h>
+ #include <linux/kernel.h>
++#include <linux/mm.h>
+ #include <linux/module.h>
+ #include <linux/msi.h>
+ #include <linux/of.h>
+@@ -246,6 +247,7 @@ struct apple_h9p_nvmmu {
+ 	 * bring-up diagnostics. apple-dart owns it.
+ 	 */
+ 	void __iomem *dart;
++	u64 dart_base;		/* its apple,dma-range start */
+ };
+ 
+ struct apple_h9p_pcie {
+@@ -699,6 +701,10 @@ static void apple_h9p_map_dart(struct apple_h9p_pcie *pcie)
+ 		return;
+ 	if (of_device_is_compatible(np, "apple,s5l8960x-dart") &&
+ 	    of_device_is_available(np)) {
++		u64 range[2];
++
++		if (!of_property_read_u64_array(np, "apple,dma-range", range, 2))
++			pcie->nvmmu.dart_base = range[0];
+ 		/* of_iomap: apple-dart already requested the region */
+ 		pcie->nvmmu.dart = of_iomap(np, 0);
+ 		if (pcie->nvmmu.dart &&
+@@ -1028,6 +1034,45 @@ void apple_ans_host_dump(struct device *dev, const char *when)
+ }
+ EXPORT_SYMBOL_GPL(apple_ans_host_dump);
+ 
++/* Port 0 DART, stream 0: what the hardware finds for DART-side @addr */
++static void apple_h9p_dart_walk(struct apple_h9p_pcie *pcie, struct device *dev,
++				const char *what, const char *view, u32 addr)
++{
++	u32 ttbr = readl(pcie->nvmmu.dart + H9P_DART_TTBR(addr >> 30));
++	phys_addr_t pa = (phys_addr_t)(ttbr & GENMASK(23, 0)) << 12;
++	u32 ste_idx = (addr >> 21) & 0x1ff, pte_idx = (addr >> 12) & 0x1ff;
++	u64 ste = 0, pte = 0;
++
++	if ((ttbr & BIT(31)) && pfn_valid(PHYS_PFN(pa))) {
++		ste = READ_ONCE(((u64 *)phys_to_virt(pa))[ste_idx]);
++		pa = ste & GENMASK_ULL(35, 12);
++		if ((ste & BIT(0)) && pfn_valid(PHYS_PFN(pa)))
++			pte = READ_ONCE(((u64 *)phys_to_virt(pa))[pte_idx]);
++	}
++	dev_info(dev, "dart walk %s, %s %#x: TTBR%u %#x -> STE[%#x] %#llx -> PTE[%#x] %#llx\n",
++		 what, view, addr, addr >> 30, ttbr, ste_idx, ste, pte_idx, pte);
++}
++
++/*
++ * Walk the port 0 DART's stream 0 tables for device IOVA @iova, both as the
++ * hardware sees it (window base removed) and raw, to show where Linux put
++ * the entry and where the DART will look.
++ */
++void apple_ans_dart_walk(struct device *dev, const char *what, u64 iova)
++{
++	struct apple_h9p_pcie *pcie = apple_ans_host(dev);
++
++	if (!pcie || !pcie->nvmmu.dart ||
++	    apple_h9p_pcie_device_port(pcie, dev) != 0)
++		return;
++
++	apple_h9p_dart_walk(pcie, dev, what, "dart-side",
++			    (u32)(iova - pcie->nvmmu.dart_base));
++	if (pcie->nvmmu.dart_base)
++		apple_h9p_dart_walk(pcie, dev, what, "raw", (u32)iova);
++}
++EXPORT_SYMBOL_GPL(apple_ans_dart_walk);
++
+ int apple_ans_nvmmu_map(struct device *dev, unsigned int tag,
+ 			const u64 *pages, unsigned int npages,
+ 			bool to_memory, dma_addr_t *iova)
+diff --git a/include/linux/apple-ans.h b/include/linux/apple-ans.h
+index 2e21195d5e..d2f0ffa82a 100644
+--- a/include/linux/apple-ans.h
++++ b/include/linux/apple-ans.h
+@@ -35,6 +35,7 @@ int apple_ans_nvmmu_map(struct device *dev, unsigned int tag,
+ int apple_ans_link_up(struct device *dev);
+ int apple_ans_host_state(struct device *dev, struct apple_ans_host_state *st);
+ void apple_ans_host_dump(struct device *dev, const char *when);
++void apple_ans_dart_walk(struct device *dev, const char *what, u64 iova);
+ #else
+ static inline int apple_ans_nvmmu_map(struct device *dev, unsigned int tag,
+ 				      const u64 *pages, unsigned int npages,
+@@ -57,6 +58,11 @@ static inline int apple_ans_host_state(struct device *dev,
+ static inline void apple_ans_host_dump(struct device *dev, const char *when)
+ {
+ }
++
++static inline void apple_ans_dart_walk(struct device *dev, const char *what,
++				       u64 iova)
++{
++}
+ #endif
+ 
+ #endif /* _LINUX_APPLE_ANS_H */
+-- 
+2.56.0
+

@@ -1,0 +1,9 @@
+# Compatibility unit for installed images. Charge7+ derives the board ceiling
+# in the kernel; automatic userspace writes would become a per-attach user cap.
+[Unit]
+Description=linux-a9: automatic kernel charging policy (compatibility no-op)
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/true

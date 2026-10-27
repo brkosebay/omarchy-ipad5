@@ -1,0 +1,7 @@
+{
+  "name": "apple-a9-aop-accel",
+  "board": "j71t",
+  "matrix": [[1, 0, 0], [0, 1, 0], [0, 0, -1]],
+  "matrix_string": "1,0,0;0,1,0;0,0,-1",
+  "note": "Board orientation only; factory calibration, per-unit samples and boot identity omitted. Validate other boards independently."
+}

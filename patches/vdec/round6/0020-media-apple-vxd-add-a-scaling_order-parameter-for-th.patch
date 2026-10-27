@@ -1,0 +1,152 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 12:48:49 +0000
+Subject: [PATCH 20/20] media: apple: vxd: add a scaling_order parameter for the
+ device check
+
+The scaling lists go to the core in raster order because that is what
+AppleD5500 uploads: its scaling_list() parser stores list[zigzag[j]]
+and its default tables are raster.  psb_video, the other public user of
+this block, takes VA-API lists whose order differs between VA clients,
+so it does not settle the question.  Until hp176q/hp176m (cqm=jvt and
+an asymmetric custom matrix) decode bit-exact on the device, the
+scaling_order module parameter (0644) can switch the upload to zig-zag
+(1) or transposed raster (2) without a rebuild.  The default stays 0.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ .../media/platform/apple/vxd/apple-vxd-h264-cmd.c  | 46 +++++++++++++++++++---
+ .../media/platform/apple/vxd/apple-vxd-h264-cmd.h  | 12 ++++++
+ drivers/media/platform/apple/vxd/apple-vxd-h264.c  |  8 ++++
+ 3 files changed, 61 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-h264-cmd.c b/drivers/media/platform/apple/vxd/apple-vxd-h264-cmd.c
+index fe66019a14f45dc34a71832db8b290f8e4a82447..597cfb7bc467a4475e7e7f68d1773a68bfff8e20 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-h264-cmd.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-h264-cmd.c
+@@ -104,6 +104,40 @@ static const u32 vxd_h264_vlc_addr_hi[] = {
+  */
+ static const u8 vxd_h264_scaling_4x4_order[6] = { 0, 3, 4, 1, 5, 2 };
+ 
++/* Raster position of the i-th coefficient in frame zig-zag scan. */
++static const u8 vxd_h264_zigzag4[16] = {
++	0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15,
++};
++
++static const u8 vxd_h264_zigzag8[64] = {
++	0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5,
++	12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28,
++	35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
++	58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
++};
++
++/* One raster list of @n x @n in the requested order. */
++static void vxd_h264_scaling_list(u8 *dst, const u8 *raster, unsigned int n,
++				  enum apple_vxd_h264_scaling_order order)
++{
++	const u8 *zz = n == 4 ? vxd_h264_zigzag4 : vxd_h264_zigzag8;
++	unsigned int i;
++
++	for (i = 0; i < n * n; i++) {
++		switch (order) {
++		case APPLE_VXD_H264_SCALING_ZIGZAG:
++			dst[i] = raster[zz[i]];
++			break;
++		case APPLE_VXD_H264_SCALING_TRANSPOSED:
++			dst[i] = raster[(i % n) * n + i / n];
++			break;
++		default:
++			dst[i] = raster[i];
++			break;
++		}
++	}
++}
++
+ static int vxd_h264_slice_code(u8 slice_type)
+ {
+ 	switch (slice_type) {
+@@ -224,13 +258,15 @@ static void vxd_h264_scaling_words(const struct apple_vxd_h264_frame *f,
+ 	if (vxd_h264_has_scaling(f->pps) && m) {
+ 		/* 8x8 lists only with the 8x8 transform (0x62be538 L33469). */
+ 		if (f->pps->flags & V4L2_H264_PPS_FLAG_TRANSFORM_8X8_MODE) {
+-			memcpy(&bytes[0], m->scaling_list_8x8[1], 64);
+-			memcpy(&bytes[64], m->scaling_list_8x8[0], 64);
++			vxd_h264_scaling_list(&bytes[0], m->scaling_list_8x8[1], 8,
++					      f->scaling_order);
++			vxd_h264_scaling_list(&bytes[64], m->scaling_list_8x8[0], 8,
++					      f->scaling_order);
+ 		}
+ 		for (i = 0; i < 6; i++)
+-			memcpy(&bytes[128 + 16 * i],
+-			       m->scaling_list_4x4[vxd_h264_scaling_4x4_order[i]],
+-			       16);
++			vxd_h264_scaling_list(&bytes[128 + 16 * i],
++					      m->scaling_list_4x4[vxd_h264_scaling_4x4_order[i]],
++					      4, f->scaling_order);
+ 	}
+ 	for (i = 0; i < VXD_H264_SCALING_WORDS; i++)
+ 		w[i] = bytes[4 * i] | bytes[4 * i + 1] << 8 |
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-h264-cmd.h b/drivers/media/platform/apple/vxd/apple-vxd-h264-cmd.h
+index 38c2c950a403532001914a9cac5684bd28f90217..0898953ffbb0af311fa630d057fc8b9b068c0fb1 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-h264-cmd.h
++++ b/drivers/media/platform/apple/vxd/apple-vxd-h264-cmd.h
+@@ -25,6 +25,17 @@
+ /* Operating mode for 8-bit 4:2:0 frames (CMDS 0x7008, payload +0x08). */
+ #define APPLE_VXD_H264_OPMODE_BASE	0x10010000
+ 
++/*
++ * Element order of the scaling lists in the 0xe000 block.  The kext
++ * uploads raster order (its parser stores list[zigzag[j]]); the others are
++ * a device-side check of that reading (module parameter scaling_order).
++ */
++enum apple_vxd_h264_scaling_order {
++	APPLE_VXD_H264_SCALING_RASTER = 0,
++	APPLE_VXD_H264_SCALING_ZIGZAG,
++	APPLE_VXD_H264_SCALING_TRANSPOSED,
++};
++
+ /* Device VAs of the decode context's own buffers (DecodeCreateH264VLD). */
+ struct apple_vxd_h264_bufs {
+ 	u32 cavlc;			/* 0x1000, the 0x440-byte VLC table */
+@@ -56,6 +67,7 @@ struct apple_vxd_h264_frame {
+ 	u32 dpb_colocated[V4L2_H264_NUM_DPB_ENTRIES];
+ 	struct apple_vxd_h264_bufs bufs;
+ 	bool first_picture;		/* first picture of the context */
++	enum apple_vxd_h264_scaling_order scaling_order;
+ };
+ 
+ int apple_vxd_h264_validate(const struct v4l2_ctrl_h264_sps *sps,
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-h264.c b/drivers/media/platform/apple/vxd/apple-vxd-h264.c
+index 9fa72ee19866e7a05ca99c595d917d87abaf64c8..04f3e5ce7f8968afae719cf9d386492d7ba0e5c1 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-h264.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-h264.c
+@@ -25,6 +25,7 @@
+  * parameter buffer (apple_vxd_buffer.aux).
+  */
+ #include <linux/crc32.h>
++#include <linux/moduleparam.h>
+ #include <linux/slab.h>
+ #include <linux/sizes.h>
+ 
+@@ -35,6 +36,11 @@
+ #include "apple-vxd-h264-parse.h"
+ #include "apple-vxd-h264-tables.h"
+ 
++static unsigned int apple_vxd_scaling_order;
++module_param_named(scaling_order, apple_vxd_scaling_order, uint, 0644);
++MODULE_PARM_DESC(scaling_order,
++		 "debug: scaling-list element order, 0 raster (AppleD5500, default), 1 zig-zag, 2 transposed");
++
+ /* DecodeCreateH264VLD sizes with Apple's multiplier M = 2. */
+ #define APPLE_VXD_H264_CAVLC_BUF	SZ_4K
+ #define APPLE_VXD_H264_INTRA_BUF	(2 << 16)
+@@ -401,6 +407,8 @@ static int apple_vxd_h264_run(struct apple_vxd_ctx *ctx)
+ 	f.bufs.intra = h->intra.va;
+ 	f.bufs.stream_state = h->stream_state.va;
+ 	f.first_picture = h->first_picture;
++	f.scaling_order = min_t(unsigned int, apple_vxd_scaling_order,
++				APPLE_VXD_H264_SCALING_TRANSPOSED);
+ 
+ 	cap_q = v4l2_m2m_get_vq(ctx->fh.m2m_ctx, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
+ 	for (i = 0; i < V4L2_H264_NUM_DPB_ENTRIES; i++) {

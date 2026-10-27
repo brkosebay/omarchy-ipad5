@@ -1,0 +1,6 @@
+3cb9a40738cd2b7bd18d6edfcdbd8f40f904eb9c117c1e7986a729c83231be0c  ./0001-dt-bindings-media-add-Apple-S8000-VXD-video-decoder.patch
+3795c7b821ad8acbded248b854585376df0a574242d39f33d0e3697695be705b  ./0002-arm64-dts-apple-s8000-s8003-add-the-VXD-video-decode.patch
+a40401823d1bbb0d689a90d22ed165e01c8714a414be0bc24ff30905384067b4  ./0003-media-apple-add-VXD-PowerVR-MSVDX-probe-and-bring-up.patch
+bc218641767e0f64bdc842c5a6db1df6e0be682d22a1255ef61d271a2ff7e766  ./0004-media-apple-vxd-add-the-V4L2-stateless-H.264-m2m-dev.patch
+79e0ca89f0bfa53714d764cc166341437d8db8fb15655be08fbbee11a86b7bf0  ./0005-media-apple-vxd-wire-the-V4L2-device-into-probe-make.patch
+02424ff26451cc5d164d3a1eda01cb47b2bc33b05938f093c8d10f996fc05f8f  ./0006-media-apple-vxd-fix-the-open-NULL-dereference-and-ha.patch

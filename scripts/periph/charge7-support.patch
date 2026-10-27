@@ -1,0 +1,150 @@
+diff --git a/drivers/usb/gadget/udc/core.c b/drivers/usb/gadget/udc/core.c
+index ea40ab612d..7d6d0e1661 100644
+--- a/drivers/usb/gadget/udc/core.c
++++ b/drivers/usb/gadget/udc/core.c
+@@ -164,6 +164,39 @@ int usb_gadget_get_current_budget(const struct device_node *node,
+ }
+ EXPORT_SYMBOL_GPL(usb_gadget_get_current_budget);
+ 
++/**
++ * usb_gadget_current_source_detached - forget accounting on measured VBUS loss
++ * @node: supplying controller node
++ *
++ * Sleepable; called only for a physical detach, never for USB link PM/reset.
++ * Does not disconnect or unbind the gadget and performs no controller I/O.
++ */
++void usb_gadget_current_source_detached(const struct device_node *node)
++{
++	struct usb_udc *udc;
++	unsigned long flags;
++
++	mutex_lock(&udc_lock);
++	list_for_each_entry(udc, &udc_list, list) {
++		struct usb_gadget *gadget = udc->gadget;
++
++		if (!gadget->current_budget_enabled ||
++		    dev_of_node(gadget->dev.parent) != node)
++			continue;
++		spin_lock_irqsave(&gadget->state_lock, flags);
++		gadget->current_extra_ma = 0;
++		gadget->current_host_grant = false;
++		gadget->current_base_ma = 0;
++		gadget->current_configured = false;
++		gadget->current_bus_connected = false;
++		gadget->current_suspended = false;
++		spin_unlock_irqrestore(&gadget->state_lock, flags);
++		gadget_current_notify(gadget);
++	}
++	mutex_unlock(&udc_lock);
++}
++EXPORT_SYMBOL_GPL(usb_gadget_current_source_detached);
++
+ static void gadget_current_set_base(struct usb_gadget *gadget, unsigned int ma)
+ {
+ 	unsigned long flags;
+diff --git a/drivers/usb/roles/apple-s8000-usb-role.c b/drivers/usb/roles/apple-s8000-usb-role.c
+index 4f58cea887..1cb31b3cbb 100644
+--- a/drivers/usb/roles/apple-s8000-usb-role.c
++++ b/drivers/usb/roles/apple-s8000-usb-role.c
+@@ -179,6 +179,7 @@ struct apple_usb_role {
+ 	/* The current host role is the accessory policy's: no revert */
+ 	bool accessory;
+ 	bool dying;
++	bool monitor_fault;
+ 	/* USB_CTL+0 readbacks at each step of the last host entry */
+ 	const char *ctl_trace_what[USB_CTL_TRACE_MAX];
+ 	u32 ctl_trace[USB_CTL_TRACE_MAX];
+@@ -593,6 +594,8 @@ static int apple_usb_role_set(struct usb_role_switch *sw, enum usb_role role)
+ 	mutex_lock(&ur->lock);
+ 	if (ur->dying) {
+ 		ret = -ESHUTDOWN;
++	} else if (role == USB_ROLE_HOST && ur->monitor_fault) {
++		ret = -EUCLEAN;
+ 	} else if (role == ur->role) {
+ 		if (role == USB_ROLE_HOST && ur->accessory_claim) {
+ 			/* The accessory takes over a manual host role. */
+@@ -693,6 +696,41 @@ bool apple_s8000_usb_role_accessory(struct usb_role_switch *sw)
+ }
+ EXPORT_SYMBOL_GPL(apple_s8000_usb_role_accessory);
+ 
++/**
++ * apple_s8000_usb_role_monitor - serialize an analog monitor with role changes
++ * @sw: the Lightning role switch
++ * @sample: sleepable callback; must not query or change the USB role
++ * @data: callback argument
++ *
++ * Lock order: instance, role hardware, consumer, gadget budget. The callback
++ * must restore DX_CONTROL before returning. EUCLEAN inhibits host entry until
++ * a subsequent callback repairs the route. No role transition can overlap it.
++ *
++ * Return: callback result, or an error without calling it outside device role.
++ */
++int apple_s8000_usb_role_monitor(struct usb_role_switch *sw,
++				 int (*sample)(void *data), void *data)
++{
++	struct apple_usb_role *ur;
++	int ret = -ENODEV;
++
++	mutex_lock(&apple_usb_role_instance_lock);
++	ur = apple_usb_role_from_switch(sw);
++	if (ur) {
++		mutex_lock(&ur->lock);
++		if (ur->dying || ur->role != USB_ROLE_DEVICE) {
++			ret = -EBUSY;
++		} else {
++			ret = sample(data);
++			ur->monitor_fault = ret == -EUCLEAN;
++		}
++		mutex_unlock(&ur->lock);
++	}
++	mutex_unlock(&apple_usb_role_instance_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(apple_s8000_usb_role_monitor);
++
+ static enum usb_role apple_usb_role_get(struct usb_role_switch *sw)
+ {
+ 	struct apple_usb_role *ur = usb_role_switch_get_drvdata(sw);
+diff --git a/include/linux/usb/apple-s8000-role.h b/include/linux/usb/apple-s8000-role.h
+index de3035e04a..7b6ebf193f 100644
+--- a/include/linux/usb/apple-s8000-role.h
++++ b/include/linux/usb/apple-s8000-role.h
+@@ -17,9 +17,17 @@
+ struct usb_role_switch;
+ 
+ #if IS_REACHABLE(CONFIG_USB_ROLES_APPLE_S8000)
++int apple_s8000_usb_role_monitor(struct usb_role_switch *sw,
++				 int (*sample)(void *data), void *data);
+ int apple_s8000_usb_role_claim(struct usb_role_switch *sw, bool claim);
+ bool apple_s8000_usb_role_accessory(struct usb_role_switch *sw);
+ #else
++static inline int apple_s8000_usb_role_monitor(struct usb_role_switch *sw,
++					       int (*sample)(void *data), void *data)
++{
++	return -EOPNOTSUPP;
++}
++
+ static inline int apple_s8000_usb_role_claim(struct usb_role_switch *sw, bool claim)
+ {
+ 	return -EOPNOTSUPP;
+diff --git a/include/linux/usb/gadget.h b/include/linux/usb/gadget.h
+index 2f1f036857..9878fd7326 100644
+--- a/include/linux/usb/gadget.h
++++ b/include/linux/usb/gadget.h
+@@ -675,6 +675,7 @@ static inline int gadget_is_otg(struct usb_gadget *g)
+ #if IS_ENABLED(CONFIG_USB_GADGET)
+ 
+ int usb_gadget_register_current_notifier(struct notifier_block *nb);
++void usb_gadget_current_source_detached(const struct device_node *node);
+ int usb_gadget_unregister_current_notifier(struct notifier_block *nb);
+ int usb_gadget_get_current_budget(const struct device_node *node,
+ 				  struct usb_gadget_current_budget *budget);
+@@ -702,6 +703,8 @@ static inline int usb_gadget_register_current_notifier(struct notifier_block *nb
+ { return -ENODEV; }
+ static inline int usb_gadget_unregister_current_notifier(struct notifier_block *nb)
+ { return 0; }
++static inline void usb_gadget_current_source_detached(const struct device_node *node)
++{ }
+ static inline int usb_gadget_get_current_budget(const struct device_node *node,
+ 						struct usb_gadget_current_budget *budget)
+ { return -ENODEV; }

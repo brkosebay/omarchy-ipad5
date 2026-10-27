@@ -1,0 +1,30 @@
+From bcc4784eee43684d2a48905a9cb6f7a30a627319 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 00:31:56 +0000
+Subject: [PATCH 3/3] arm64: dts: apple: arm the J71t owner's calibrated USB
+ input limit
+
+Mirror the J71t ADT usb-input-limit-max value of 2400 mA and authorize
+that ceiling for this development unit's measured Mac host. Probe-time
+policy removes the boot ordering dependency on a sysfs write from
+systemd/udev. The driver still requires host/brick classification and
+live battery guards.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ arch/arm64/boot/dts/apple/s8003-j71t-periph.dtsi | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/apple/s8003-j71t-periph.dtsi b/arch/arm64/boot/dts/apple/s8003-j71t-periph.dtsi
+index a2aaffa9e2..ccfb30d542 100644
+--- a/arch/arm64/boot/dts/apple/s8003-j71t-periph.dtsi
++++ b/arch/arm64/boot/dts/apple/s8003-j71t-periph.dtsi
+@@ -94,6 +94,8 @@ charger@180 {
+ 		reg = <0x180>, <0xa00>;
+ 		reg-names = "status", "control";
+ 		power-supplies = <&periph_tristar>;
++		apple,usb-input-limit-max-microamp = <2400000>;
++		apple,owner-input-limit-microamp = <2400000>;
+ 	};
+ };
+ 

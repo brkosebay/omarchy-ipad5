@@ -1,0 +1,181 @@
+From 54d3167021c5f721736a9df08c1fed76c78c4035 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 09:54:06 +0000
+Subject: [PATCH 33/55] power: supply: add J71t gauge profile and read-only
+ D2365 polling
+
+J71t and J172 both advertise bq27540 in ADT; retain the J172 BQ27545 register-map assumption under a board-specific experimental match. Refresh non-policy charger instances periodically and require gauge corroboration without a supplier. Do not expose USB ONLINE or run J172 input-current policy on the Tristar-equipped J71t.
+---
+ .../power/supply/apple,d2365-charger.yaml     | 18 ++++++--
+ .../bindings/power/supply/ti,bq27545-hdq.yaml |  4 +-
+ drivers/power/supply/apple_d2365_charger.c    | 46 +++++++++++++++++--
+ drivers/power/supply/bq27xxx_battery_hdq.c    |  2 +
+ 4 files changed, 62 insertions(+), 8 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/power/supply/apple,d2365-charger.yaml b/Documentation/devicetree/bindings/power/supply/apple,d2365-charger.yaml
+index b2bc18fd67..1d36bcdcc9 100644
+--- a/Documentation/devicetree/bindings/power/supply/apple,d2365-charger.yaml
++++ b/Documentation/devicetree/bindings/power/supply/apple,d2365-charger.yaml
+@@ -13,13 +13,11 @@ description: |
+   The Apple D2365 PMIC contains power-source status and charger-control banks.
+   The J172 variant uses a platform-calibrated, guarded input-current policy.
+ 
+-allOf:
+-  - $ref: power-supply.yaml#
+-
+ properties:
+   compatible:
+     oneOf:
+       - const: apple,d2365-charger
++      - const: apple,j71t-d2365-charger
+       - items:
+           - const: apple,j172-d2365-charger
+           - const: apple,d2365-charger
+@@ -43,7 +41,19 @@ required:
+   - compatible
+   - reg
+   - reg-names
+-  - power-supplies
++
++allOf:
++  - $ref: power-supply.yaml#
++  - if:
++      properties:
++        compatible:
++          const: apple,j71t-d2365-charger
++    then:
++      properties:
++        power-supplies: false
++    else:
++      required:
++        - power-supplies
+ 
+ additionalProperties: false
+ 
+diff --git a/Documentation/devicetree/bindings/power/supply/ti,bq27545-hdq.yaml b/Documentation/devicetree/bindings/power/supply/ti,bq27545-hdq.yaml
+index 9d442d10c9..e95ee04ee0 100644
+--- a/Documentation/devicetree/bindings/power/supply/ti,bq27545-hdq.yaml
++++ b/Documentation/devicetree/bindings/power/supply/ti,bq27545-hdq.yaml
+@@ -19,7 +19,9 @@ allOf:
+ 
+ properties:
+   compatible:
+-    const: ti,bq27545-hdq
++    enum:
++      - ti,bq27545-hdq
++      - apple,j71t-bq27540
+ 
+   power-supplies:
+     maxItems: 1
+diff --git a/drivers/power/supply/apple_d2365_charger.c b/drivers/power/supply/apple_d2365_charger.c
+index be21ebdaf5..1ffcae2523 100644
+--- a/drivers/power/supply/apple_d2365_charger.c
++++ b/drivers/power/supply/apple_d2365_charger.c
+@@ -323,6 +323,18 @@ static void apple_d2365_charge_policy_work(struct work_struct *work)
+ 		goto out_reschedule;
+ 	}
+ 
++	if (!charger->config) {
++		ret = regmap_read(charger->regmap,
++				  charger->status_base + D2365_STATUS_CHARGE,
++				  &status);
++		apple_d2365_cache_status(charger, ret, ret ? 0 : status);
++		ret = regmap_read(charger->regmap,
++				  charger->control_base + D2365_CONTROL_INPUT_LIMIT,
++				  &input_limit);
++		apple_d2365_cache_input_limit(charger, ret, ret ? 0 : input_limit);
++		goto out_reschedule;
++	}
++
+ 	ret = apple_d2365_charger_online(charger->psy, &online);
+ 	if (ret || online.intval != 1) {
+ 		reject_reason = "supplier offline";
+@@ -466,6 +478,17 @@ static int apple_d2365_charger_status(struct power_supply *psy,
+ 		return 0;
+ 	}
+ 
++	/* No Tristar supplier yet: require the HDQ gauge to corroborate. */
++	if (ret && !charger->config && !battery_ret) {
++		if (battery_status.intval == POWER_SUPPLY_STATUS_FULL ||
++		    battery_status.intval == POWER_SUPPLY_STATUS_DISCHARGING ||
++		    (charge_state &&
++		     battery_status.intval == POWER_SUPPLY_STATUS_CHARGING)) {
++			val->intval = battery_status.intval;
++			return 0;
++		}
++	}
++
+ 	/*
+ 	 * Apple uses the non-zero D2365 field as IsCharging, but live data shows
+ 	 * it can remain set while Bellatrix reports USB offline. Require both
+@@ -551,7 +574,7 @@ apple_d2365_charger_external_power_changed(struct power_supply *psy)
+ {
+ 	struct apple_d2365_charger *charger = power_supply_get_drvdata(psy);
+ 
+-	if (charger->config && !READ_ONCE(charger->shutting_down))
++	if (!READ_ONCE(charger->shutting_down))
+ 		mod_delayed_work(system_power_efficient_wq,
+ 				 &charger->charge_policy_work, 0);
+ 
+@@ -574,6 +597,20 @@ static const struct power_supply_desc apple_d2365_charger_desc = {
+ 	.external_power_changed = apple_d2365_charger_external_power_changed,
+ };
+ 
++static const enum power_supply_property apple_d2365_readonly_properties[] = {
++	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_CHARGE_TYPE,
++	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
++};
++
++static const struct power_supply_desc apple_d2365_readonly_desc = {
++	.name = "charger",
++	.type = POWER_SUPPLY_TYPE_UNKNOWN,
++	.properties = apple_d2365_readonly_properties,
++	.num_properties = ARRAY_SIZE(apple_d2365_readonly_properties),
++	.get_property = apple_d2365_charger_get_property,
++};
++
+ static int apple_d2365_charger_probe(struct platform_device *pdev)
+ {
+ 	struct power_supply_config config = {};
+@@ -628,7 +665,9 @@ static int apple_d2365_charger_probe(struct platform_device *pdev)
+ 	config.fwnode = dev_fwnode(dev);
+ 	config.no_wakeup_source = true;
+ 
+-	psy = devm_power_supply_register(dev, &apple_d2365_charger_desc,
++	psy = devm_power_supply_register(dev,
++		charger->config ? &apple_d2365_charger_desc :
++		&apple_d2365_readonly_desc,
+ 					 &config);
+ 	if (IS_ERR(psy))
+ 		return dev_err_probe(dev, PTR_ERR(psy),
+@@ -653,7 +692,7 @@ static int apple_d2365_charger_probe(struct platform_device *pdev)
+ 		return dev_err_probe(dev, ret,
+ 				     "failed to read input-current limit\n");
+ 
+-	if (charger->config) {
++	{
+ 		mod_delayed_work(system_power_efficient_wq,
+ 				 &charger->charge_policy_work, 0);
+ 	}
+@@ -711,6 +750,7 @@ static const struct of_device_id apple_d2365_charger_of_match[] = {
+ 		.compatible = "apple,j172-d2365-charger",
+ 		.data = &apple_d2365_j172_config,
+ 	},
++	{ .compatible = "apple,j71t-d2365-charger" },
+ 	{ .compatible = "apple,d2365-charger" },
+ 	{ }
+ };
+diff --git a/drivers/power/supply/bq27xxx_battery_hdq.c b/drivers/power/supply/bq27xxx_battery_hdq.c
+index ced755aa1e..888b443ee4 100644
+--- a/drivers/power/supply/bq27xxx_battery_hdq.c
++++ b/drivers/power/supply/bq27xxx_battery_hdq.c
+@@ -145,6 +145,8 @@ static const struct w1_family_ops bq27xxx_battery_hdq_fops = {
+ 
+ static const struct of_device_id bq27xxx_battery_hdq_of_match[] = {
+ 	{ .compatible = "apple,d111-bq27545", .data = (void *)BQ27545 },
++	/* J71t ADT says bq27540; validate this J172 register-map profile. */
++	{ .compatible = "apple,j71t-bq27540", .data = (void *)BQ27545 },
+ 	{ .compatible = "ti,bq27545-hdq", .data = (void *)BQ27545 },
+ 	{ }
+ };

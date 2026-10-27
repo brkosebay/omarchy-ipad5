@@ -1,0 +1,20 @@
+# linux-a9: turn the screen with the accelerometer (ipad-autorotate --help).
+# Skipped where there is no IIO accelerometer (the case until the A9's always-on
+# coprocessor driver exists), so it is harmless today. Either the sensor's raw
+# channels or its buffer channels are enough ("|" makes the two alternatives).
+# A condition that fails at login isn't retried: after loading an accelerometer
+# driver by hand, `systemctl --user start ipad-autorotate`.
+[Unit]
+Description=linux-a9 iPad auto-rotate
+PartOf=graphical-session.target
+After=graphical-session.target
+ConditionPathExistsGlob=|/sys/bus/iio/devices/iio:device*/in_accel_x_raw
+ConditionPathExistsGlob=|/sys/bus/iio/devices/iio:device*/scan_elements/in_accel_x_en
+
+[Service]
+ExecStart=/usr/local/bin/ipad-autorotate
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

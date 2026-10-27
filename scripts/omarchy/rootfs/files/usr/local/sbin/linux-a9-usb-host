@@ -1,0 +1,620 @@
+#!/usr/bin/python3
+"""Guarded Lightning host trials and an indefinite iAP role-switch listener.
+
+--identify runs the kernel's Tristar ID-bus GetID. Trials run it after their
+delay; ``listen`` runs it on each VBUS attach and polls GetID for cable changes
+which do not produce a VBUS edge. It also accepts an explicit
+``listen-identify`` request. The listener keeps the gadget and Mac-tether
+configuration available without a plug-in deadline; its duration starts only
+after iAP 0x51.
+`recover reorient|idbus_reset|fault_ack` runs one volatile link recovery step
+(usb-host3 or later) when the Mac link stays dead after an identify session.
+"""
+import argparse
+import datetime
+import fcntl
+import importlib.machinery
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+ROLE = Path('/sys/class/usb_role/lightning-role-switch/role')
+CONTROL = Path('/sys/bus/platform/devices/20e0d8000.usb-role-switch')
+RUNTIME = Path('/run/linux-a9-usb-host')
+LOGS = Path('/var/log/linux-a9-usb-host')
+SELF = '/usr/local/sbin/linux-a9-usb-host'
+IAP_DAEMON = '/usr/local/sbin/linux-a9-iap-roleswitch'
+IDBUS = Path('/sys/kernel/debug/apple-tristar')
+PH_PARAM = Path('/sys/module/apple_tristar_power/parameters/allow_power_handshake')
+POWER_ONLINE = Path('/sys/class/power_supply/usb/online')
+LISTEN_IDENTIFY_REQUEST = RUNTIME / 'listen-identify'
+LISTEN_DIR = RUNTIME / 'listen-dir'
+ROLE_REGS = Path('/sys/kernel/debug/apple-usb-role/regs')
+CAMERA_ADAPTER_ID = '11 f0 00 00 00 00'
+ID_PROBE_INTERVAL = 2.0
+IDENTIFY_MODES = {'default': 'identify', 'swap': 'identify swap',
+                  'noreorient': 'identify noreorient',
+                  'swap-noreorient': 'identify swap noreorient'}
+IDBUS_RESULTS = ('digital_id', 'digital_id_decoded', 'idbus_frame', 'reg_05', 'reg_0d', 'reg_0a')
+RECOVER_STEPS = ('reorient', 'idbus_reset', 'fault_ack')
+
+
+def command(*args, timeout=15):
+    try:
+        result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, timeout=timeout, check=False)
+        return result.returncode, result.stdout
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return 124, str(error) + '\n'
+
+
+def read(path):
+    try:
+        return path.read_text().strip()
+    except OSError as error:
+        return str(error)
+
+
+def preflight():
+    if os.geteuid() != 0:
+        raise RuntimeError('run with sudo')
+    compatibles = Path('/proc/device-tree/compatible').read_bytes().split(b'\0')
+    if b'apple,j71t' not in compatibles:
+        raise RuntimeError('this procedure is for J71t only')
+    rc, source = command('findmnt', '-n', '-o', 'SOURCE', '/')
+    if rc or not re.fullmatch(r'/dev/nvme\d+n\d+p\d+', source.strip()):
+        raise RuntimeError('NVMe partition root required; never disconnect an NBD root')
+    if not ROLE.is_file() or not (CONTROL / 'revert_timeout').is_file():
+        raise RuntimeError('missing Lightning role driver; boot the USB host entry first')
+    RUNTIME.mkdir(mode=0o700, parents=True, exist_ok=True)
+    LOGS.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+
+def preflight_idbus(power_handshake=False, recover=False, attachment_monitor=False):
+    if not (IDBUS / 'identify').exists():
+        raise RuntimeError(f'missing {IDBUS}/identify; boot the usb-host3 entry '
+                           '(and mount debugfs)')
+    if recover and not (IDBUS / 'recover').exists():
+        raise RuntimeError(f'missing {IDBUS}/recover; boot the usb-host3 entry')
+    if power_handshake and not PH_PARAM.is_file():
+        raise RuntimeError(f'missing {PH_PARAM}')
+    if attachment_monitor and not POWER_ONLINE.is_file():
+        raise RuntimeError(f'missing live VBUS state {POWER_ONLINE}')
+
+
+def trigger(path, text):
+    """Write one debugfs trigger; the kernel runs it synchronously."""
+    try:
+        with path.open('w') as handle:
+            handle.write(text + '\n')
+        return 0, 'ok'
+    except OSError as error:
+        return error.errno or 1, f'failed: {error.strerror or error}'
+
+
+def idbus_report(header, log_name):
+    lines = [datetime.datetime.now(datetime.timezone.utc).isoformat(), header]
+    for name in IDBUS_RESULTS:
+        lines.append(f'{name}: {read(IDBUS / name)}')
+    lines.append(f'\n{log_name}:\n{read(IDBUS / log_name)}')
+    return '\n'.join(lines) + '\n'
+
+
+def save_report(dest, label, text, latest=None):
+    (dest / f'{label}.txt').write_text(text)
+    (LOGS / f'latest-{latest or label}.txt').write_text(text)
+    os.sync()
+
+
+def identify(dest, mode, label='identify'):
+    """GetID with the accessory attached. A failure is recorded, never fatal."""
+    command_text = IDENTIFY_MODES[mode]
+    rc, result = trigger(IDBUS / 'identify', command_text)
+    text = idbus_report(f"$ echo '{command_text}' > {IDBUS}/identify: {result}", 'identify_log')
+    save_report(dest, label, text, latest='identify')
+    if rc:
+        print(f'IDENTIFY {result}; transcript in {dest}/{label}.txt', flush=True)
+    else:
+        print(f'IDENTIFY ok: ID {read(IDBUS / "digital_id")}; '
+              f'{read(IDBUS / "digital_id_decoded")}', flush=True)
+    return rc == 0
+
+
+def digital_id():
+    """Return the normalized six-byte GetID result, or None if it is invalid."""
+    value = read(IDBUS / 'digital_id').lower()
+    if re.fullmatch(r'(?:[0-9a-f]{2} ){5}[0-9a-f]{2}', value):
+        return value
+    return None
+
+
+def probe_digital_id(mode):
+    """Lightweight live GetID used only to notice a cable replacement."""
+    rc, _result = trigger(IDBUS / 'identify', IDENTIFY_MODES[mode])
+    return digital_id() if rc == 0 else None
+
+
+def power_handshake(dest, label='power-handshake'):
+    """Optional 0x72/0x70 exchange. The kernel gate is re-closed afterwards."""
+    PH_PARAM.write_text('Y\n')
+    try:
+        rc, result = trigger(IDBUS / 'power_handshake', '1')
+    finally:
+        PH_PARAM.write_text('N\n')
+    text = idbus_report(f'$ echo 1 > {IDBUS}/power_handshake: {result}', 'power_handshake_log')
+    save_report(dest, label, text, latest='power-handshake')
+    print(f'POWER HANDSHAKE {result}; transcript in {dest}/{label}.txt', flush=True)
+    return rc == 0
+
+
+def recover(dest, step):
+    """One link recovery step (ds-lightning-host-idbus.md 9.6). Volatile, logged."""
+    rc, result = trigger(IDBUS / 'recover', step)
+    text = idbus_report(f'$ echo {step} > {IDBUS}/recover: {result}', 'recover_log')
+    save_report(dest, 'recover', text)
+    print(f'RECOVER {step} {result}; transcript in {dest}/recover.txt', flush=True)
+    return rc == 0
+
+
+def recover_main(argv):
+    parser = argparse.ArgumentParser(
+        prog='linux-a9-usb-host recover',
+        description='Lightning link recovery: reorient (0x05 |= 0x02, RX read only), '
+                    'idbus_reset (500 ms ID-bus reset pulse) or fault_ack (0x0a echo). '
+                    'A reorient can drop the tether: run it over Wi-Fi.')
+    parser.add_argument('step', choices=RECOVER_STEPS)
+    args = parser.parse_args(argv)
+    preflight()
+    preflight_idbus(recover=True)
+    with (RUNTIME / 'lock').open('w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        dest = LOGS / f'{stamp}-recover-{args.step}'
+        dest.mkdir(mode=0o700)
+        ok = recover(dest, args.step)
+        print((dest / 'recover.txt').read_text(), end='')
+        if not ok:
+            sys.exit(1)
+
+
+def mounted_usb_devices():
+    rc, output = command('lsblk', '--json', '--paths', '--output', 'NAME,TRAN,MOUNTPOINTS')
+    if rc:
+        raise RuntimeError('cannot check USB mounts: ' + output)
+    mounts = []
+
+    def walk(devices, usb=False):
+        for device in devices:
+            is_usb = usb or device.get('tran') == 'usb'
+            if is_usb and any(device.get('mountpoints') or []):
+                mounts.append(device['name'])
+            walk(device.get('children', []), is_usb)
+    walk(json.loads(output)['blockdevices'])
+    return list(dict.fromkeys(reversed(mounts)))
+
+
+def return_device():
+    """Flush/unmount first. Preserve host mode if a busy filesystem refuses."""
+    try:
+        for device in mounted_usb_devices():
+            rc, output = command('udisksctl', 'unmount', '--no-user-interaction', '-b', device, timeout=30)
+            print(output, end='', flush=True)
+            if rc:
+                raise RuntimeError(f'{device} is busy; close files and unmount it')
+    except (RuntimeError, ValueError, KeyError):
+        # A failed mount check must not lead to removing a busy filesystem.
+        if read(ROLE) == 'host':
+            (CONTROL / 'confirm').write_text('1\n')
+        print('Keeping host mode to protect data. Close files, unmount, then run device.',
+              file=sys.stderr, flush=True)
+        raise
+    os.sync()
+    ROLE.write_text('device\n')
+    print('Returned to gadget mode; reconnect the Mac cable.', flush=True)
+
+
+def snapshot(destination, label):
+    lines = [datetime.datetime.now(datetime.timezone.utc).isoformat(),
+             f'role={read(ROLE)} revert_pending={read(CONTROL / "revert_pending")}',
+             f'gates={read(CONTROL / "vbus_gates")}', read(Path('/proc/cmdline'))]
+    commands = [('uname', '-a'), ('ip', '-br', 'address'), ('lsusb',), ('lsusb', '-t'),
+                ('lsblk', '-o', 'NAME,TRAN,SIZE,FSTYPE,LABEL,MOUNTPOINTS'),
+                ('findmnt', '-r', '-o', 'SOURCE,TARGET,FSTYPE,OPTIONS'),
+                ('systemctl', 'is-active', 'udisks2'),
+                ('journalctl', '-k', '-b', '-n', '160', '--no-pager')]
+    if IDBUS.is_dir():
+        # Cached results of the last identify; reading them never touches I2C.
+        lines.append(' '.join(f'{name}=[{read(IDBUS / name)}]' for name in IDBUS_RESULTS[:2]))
+    if ROLE_REGS.is_file():
+        lines.append(f'\n$ cat {ROLE_REGS}\n{read(ROLE_REGS)}')
+    for args in commands:
+        rc, output = command(*args)
+        lines.append(f'\n$ {" ".join(args)} [exit {rc}]\n{output}')
+    text = '\n'.join(lines) + '\n'
+    (destination / f'{label}.txt').write_text(text)
+    (LOGS / 'latest-status.txt').write_text(text)
+    os.sync()
+
+
+def host_window(gate, duration, dest):
+    """Use the same guarded role/gate/timer path for trials and iAP requests."""
+    switched = False
+    try:
+        # Kernel fallback outlives userspace cleanup by two minutes.
+        (CONTROL / 'revert_timeout').write_text(str(duration + 120) + '\n')
+        (CONTROL / 'vbus_gates').write_text(gate + '\n')
+        switched = True
+        ROLE.write_text('host\n')
+        print('HOST active; automatic mount is handled by the desktop user service.', flush=True)
+        start = time.monotonic()
+        number = 0
+        while time.monotonic() - start < duration:
+            snapshot(dest, f'host-{number:03d}')
+            number += 1
+            if (RUNTIME / 'keep').exists():
+                print('Host confirmed explicitly; timer cancelled. Use device after unmounting.',
+                      flush=True)
+                return
+            if read(ROLE) != 'host':
+                print('Kernel returned to device mode.', flush=True)
+                switched = False
+                return
+            time.sleep(min(10, max(0, duration - (time.monotonic() - start))))
+    finally:
+        if switched and not (RUNTIME / 'keep').exists():
+            return_device()
+
+
+def new_log_dir(suffix=''):
+    boot_id = read(Path('/proc/sys/kernel/random/boot_id'))[:8]
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    dest = LOGS / f'{stamp}-{boot_id}{suffix}'
+    dest.mkdir(mode=0o700)
+    # Bound log retention without deleting the running session.
+    import shutil
+    old_logs = sorted(p for p in LOGS.iterdir() if p.is_dir() and p.name != dest.name)
+    for old in old_logs[:-9]:
+        shutil.rmtree(old)
+    return dest
+
+
+def trial(gate, delay, duration, identify_mode=None, handshake=False):
+    preflight()
+    if identify_mode:
+        preflight_idbus(handshake)
+    with (RUNTIME / 'lock').open('w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if read(ROLE) != 'device':
+            raise RuntimeError('start a trial from device mode')
+        keep = RUNTIME / 'keep'
+        keep.unlink(missing_ok=True)
+        dest = new_log_dir()
+        steps = (f'identify ({identify_mode})' + (' + power handshake' if handshake else '')
+                 + ', then ') if identify_mode else ''
+        print(f'Logs: {dest}; unplug Mac and attach adapter in {delay}s. '
+              f'Then {steps}host for {duration}s, gates={gate}.', flush=True)
+        command('wall', f'USB host trial in {delay}s. Unplug Mac, connect Camera Adapter + USB device. '
+                f'Return to tether after {duration}s. Logs: {dest}')
+        snapshot(dest, 'before')
+        time.sleep(delay)
+        try:
+            if identify_mode:
+                # The adapter is attached now; host mode follows immediately.
+                identified = identify(dest, identify_mode)
+                if handshake:
+                    if identified:
+                        power_handshake(dest)
+                    else:
+                        print('POWER HANDSHAKE skipped: identify failed', flush=True)
+                if not identified:
+                    print('Arming host anyway to record the unidentified state.', flush=True)
+            host_window(gate, duration, dest)
+        finally:
+            snapshot(dest, 'after')
+            rc, output = command('journalctl', '-b', '-k', '--no-pager', timeout=30)
+            (dest / 'kernel-journal.txt').write_text(output)
+            rc, output = command('journalctl', '-b', '-u', 'udisks2', '--no-pager')
+            (dest / 'udisks-journal.txt').write_text(output)
+            os.sync()
+
+
+def load_iap_daemon():
+    return importlib.machinery.SourceFileLoader('linux_a9_iap_roleswitch',
+                                                IAP_DAEMON).load_module()
+
+
+def listen_service(gate, duration, identify_mode=None, handshake=False):
+    """Listen indefinitely in gadget mode; host duration begins only on 0x51."""
+    preflight()
+    if identify_mode:
+        preflight_idbus(handshake, attachment_monitor=True)
+    with (RUNTIME / 'lock').open('w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if read(ROLE) != 'device':
+            raise RuntimeError('start listen from device mode')
+        (RUNTIME / 'keep').unlink(missing_ok=True)
+        dest = new_log_dir('-iap-listen')
+        control_log = dest / 'control.log'
+        latest = LOGS / 'latest-iap-control.txt'
+        latest.unlink(missing_ok=True)
+        latest.symlink_to(control_log)
+        snapshot(dest, 'listening')
+        print(f'Listening without a plug-in deadline; gates={gate}, host safety '
+              f'window={duration}s. Requests: {control_log}', flush=True)
+
+        identify_lock = threading.Lock()
+        stop_monitor = threading.Event()
+        monitor_thread = None
+        identify_count = 0
+        last_id = None
+
+        def identify_attachment(reason, requested_mode=None):
+            nonlocal identify_count, last_id
+            mode = requested_mode or identify_mode
+            if not mode or not identify_lock.acquire(blocking=False):
+                return
+            try:
+                identify_count += 1
+                label = f'identify-{identify_count:03d}'
+                # A Lightning cable replacement may leave both VBUS and the
+                # UDC's configured state asserted. Drop the stale address and
+                # expose a fresh address-zero device before doing the sideband
+                # transactions that make the accessory retry USB.
+                daemon.soft_reconnect()
+                print(f'Attachment event ({reason}): clean gadget reconnect; '
+                      f'running {mode} GetID', flush=True)
+                identified = identify(dest, mode, label)
+                observed_id = digital_id() if identified else None
+                last_id = observed_id
+                handshake_complete = False
+                if handshake and identified:
+                    if observed_id == CAMERA_ADAPTER_ID:
+                        handshake_complete = power_handshake(
+                            dest, f'power-handshake-{identify_count:03d}')
+                    else:
+                        print(f'POWER HANDSHAKE skipped for ID {observed_id}', flush=True)
+                if identified and not stop_monitor.is_set():
+                    if handshake_complete:
+                        # The clean reconnect was completed before GetID. Keep
+                        # EP0 live across the 0x71 reply and the adapter's retry.
+                        print('Power handshake complete; preserving the gadget '
+                              'connection for post-handshake enumeration.', flush=True)
+                    else:
+                        print('GetID complete; preserving the freshly reconnected '
+                              'gadget for enumeration.', flush=True)
+            finally:
+                identify_lock.release()
+
+        def monitor_attachments():
+            nonlocal last_id
+            previous = None
+            next_probe = time.monotonic()
+            while not stop_monitor.is_set():
+                online = read(POWER_ONLINE)
+                requested = LISTEN_IDENTIFY_REQUEST.exists()
+                if requested:
+                    LISTEN_IDENTIFY_REQUEST.unlink(missing_ok=True)
+                    identify_attachment('owner request', 'default')
+                    next_probe = time.monotonic() + ID_PROBE_INTERVAL
+                elif identify_mode and online == '1' and previous != '1':
+                    identify_attachment('VBUS attach')
+                    next_probe = time.monotonic() + ID_PROBE_INTERVAL
+                elif (identify_mode and online == '1' and
+                      last_id != CAMERA_ADAPTER_ID and read(ROLE) == 'device' and
+                      time.monotonic() >= next_probe):
+                    observed_id = probe_digital_id(identify_mode)
+                    next_probe = time.monotonic() + ID_PROBE_INTERVAL
+                    if observed_id is None:
+                        if last_id is not None:
+                            print(f'Live GetID lost previous ID {last_id}; waiting for '
+                                  'an attachment to answer.', flush=True)
+                        last_id = None
+                    elif observed_id != last_id:
+                        old_id = last_id or 'none'
+                        print(f'Live GetID changed {old_id} -> {observed_id}', flush=True)
+                        identify_attachment('GetID cable change')
+                if online != '1' and previous == '1':
+                    last_id = None
+                previous = online
+                stop_monitor.wait(0.1)
+
+        def listener_ready():
+            nonlocal monitor_thread
+            LISTEN_DIR.write_text(str(dest) + '\n')
+            monitor_thread = threading.Thread(target=monitor_attachments,
+                                              name='iap-attachment-monitor', daemon=True)
+            monitor_thread.start()
+
+        count = 0
+
+        def role_switch():
+            nonlocal count
+            count += 1
+            snapshot(dest, f'roleswitch-{count:03d}-before')
+            try:
+                host_window(gate, duration, dest)
+            finally:
+                snapshot(dest, f'roleswitch-{count:03d}-after')
+
+        daemon = load_iap_daemon()
+        try:
+            daemon.serve(control_log, role_switch=role_switch, ready=listener_ready)
+        finally:
+            stop_monitor.set()
+            if monitor_thread is not None:
+                monitor_thread.join(timeout=10)
+            LISTEN_IDENTIFY_REQUEST.unlink(missing_ok=True)
+            LISTEN_DIR.unlink(missing_ok=True)
+
+
+def listen_main(argv, internal=False):
+    parser = argparse.ArgumentParser(
+        prog='linux-a9-usb-host ' + ('listen-service' if internal else 'listen'),
+        description='Expose the iOS iAP HID function and wait indefinitely for role switch 0x51.')
+    parser.add_argument('gate', nargs='?', default='none',
+                        choices=['none', 'pmu', 'tristar', 'both'])
+    parser.add_argument('duration', nargs='?', default=180, type=int,
+                        help='host safety window after 0x51 (listening itself has no timeout)')
+    parser.add_argument('--identify', nargs='?', const='default', choices=sorted(IDENTIFY_MODES),
+                        help='run GetID on each VBUS attachment and accept on-demand requests')
+    parser.add_argument('--power-handshake', action='store_true',
+                        help='after Camera Adapter GetID, run its optional 0x72/0x70 exchange')
+    args = parser.parse_args(argv)
+    if not 30 <= args.duration <= 600:
+        parser.error('duration must be 30..600 s')
+    preflight()
+    if args.identify:
+        preflight_idbus(args.power_handshake, attachment_monitor=True)
+    elif args.power_handshake:
+        parser.error('--power-handshake needs --identify')
+    if internal:
+        def stop(_signum, _frame):
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGTERM, stop)
+        listen_service(args.gate, args.duration, args.identify, args.power_handshake)
+        return
+    rc, _ = command('systemctl', 'is-active', '--quiet',
+                    'linux-a9-usb-host-listen.service')
+    if rc == 0:
+        raise RuntimeError('the iAP listener is already running')
+    extra = [f'--identify={args.identify}'] if args.identify else []
+    extra += ['--power-handshake'] if args.power_handshake else []
+    rc, output = command('systemd-run', '--unit=linux-a9-usb-host-listen', '--collect',
+                         '--property=Type=exec', '/usr/bin/systemd-inhibit', '--what=sleep',
+                         '--mode=block', '--why=Lightning iAP role-switch listener',
+                         SELF, 'listen-service', args.gate, str(args.duration), *extra)
+    print(output, end='')
+    if rc:
+        raise RuntimeError('failed to start iAP listener')
+    print('Listener is active with no plug-in deadline. Run device to stop it.', flush=True)
+
+
+def listen_identify_main():
+    """Queue GetID in the running listener without contending for its owner lock."""
+    preflight()
+    preflight_idbus()
+    rc, state = command('systemctl', 'is-active',
+                        'linux-a9-usb-host-listen.service')
+    if rc or state.strip() != 'active':
+        raise RuntimeError('the iAP listener is not active')
+    LISTEN_IDENTIFY_REQUEST.touch(mode=0o600)
+    print('GetID queued; the listener will log it without a plug-in deadline.', flush=True)
+
+
+def main():
+    # `recover STEP` has its own arguments; the trial positionals do not apply.
+    if sys.argv[1:2] == ['recover']:
+        recover_main(sys.argv[2:])
+        return
+    if sys.argv[1:2] == ['listen']:
+        listen_main(sys.argv[2:])
+        return
+    if sys.argv[1:2] == ['listen-service']:
+        listen_main(sys.argv[2:], internal=True)
+        return
+    if sys.argv[1:2] == ['listen-identify']:
+        listen_identify_main()
+        return
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=['arm', 'trial', 'listen', 'status', 'confirm',
+                                           'device', 'identify'])
+    parser.add_argument('gate', nargs='?', default='none', choices=['none', 'pmu', 'tristar', 'both'])
+    parser.add_argument('delay', nargs='?', default=20, type=int)
+    parser.add_argument('duration', nargs='?', default=180, type=int)
+    parser.add_argument('--identify', nargs='?', const='default', choices=sorted(IDENTIFY_MODES),
+                        help='Tristar GetID after the delay, right before host mode')
+    parser.add_argument('--power-handshake', action='store_true',
+                        help='optional 0x72/0x70 handshake after a successful identify')
+    args = parser.parse_args()
+    if not 5 <= args.delay <= 300 or not 30 <= args.duration <= 600:
+        parser.error('delay must be 5..300 s; duration 30..600 s')
+    if args.power_handshake and args.action in ('arm', 'trial') and not args.identify:
+        parser.error('--power-handshake needs --identify')
+    preflight()
+    if args.action == 'arm':
+        if args.identify:
+            preflight_idbus(args.power_handshake)
+        rc, _ = command('systemctl', 'is-active', '--quiet', 'linux-a9-usb-host-trial.service')
+        if rc == 0:
+            raise RuntimeError('a host trial is already running')
+        extra = [f'--identify={args.identify}'] if args.identify else []
+        extra += ['--power-handshake'] if args.power_handshake else []
+        rc, output = command('systemd-run', '--unit=linux-a9-usb-host-trial', '--collect',
+                             '--property=Type=exec',
+                             '/usr/bin/systemd-inhibit', '--what=sleep', '--mode=block',
+                             '--why=Lightning USB host trial', SELF, 'trial', args.gate,
+                             str(args.delay), str(args.duration), *extra)
+        print(output, end='')
+        if rc:
+            raise RuntimeError('failed to detach USB trial')
+        then = 'identify, then host' if args.identify else 'Host starts'
+        print(f'Unplug Mac now; connect adapter + drive. {then} in {args.delay}s; '
+              f'return to tether after {args.delay + args.duration + 20}s.')
+    elif args.action == 'trial':
+        # Stop/normal termination runs the same mount-safe cleanup.
+        def stop(_signum, _frame):
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGTERM, stop)
+        trial(args.gate, args.delay, args.duration, args.identify, args.power_handshake)
+    elif args.action == 'identify':
+        # Immediate, no role change. With VBUS present a timeout reorients the
+        # lanes: run it over Wi-Fi, or use --identify=noreorient on the tether.
+        mode = args.identify or 'default'
+        preflight_idbus(args.power_handshake)
+        with (RUNTIME / 'lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+            # Sorts with the trial directories for retention.
+            dest = LOGS / f'{stamp}-identify'
+            dest.mkdir(mode=0o700)
+            ok = identify(dest, mode)
+            if args.power_handshake and ok:
+                ok = power_handshake(dest)
+            for report in sorted(dest.glob('*.txt')):
+                print(report.read_text(), end='')
+            if not ok:
+                sys.exit(1)
+    elif args.action == 'confirm':
+        if read(ROLE) != 'host':
+            raise RuntimeError('role is not host')
+        (CONTROL / 'confirm').write_text('1\n')
+        (RUNTIME / 'keep').touch(mode=0o600)
+        print('Host kept until device is requested; unmount drives before unplugging.')
+    elif args.action == 'device':
+        rc, output = command('systemctl', 'stop', 'linux-a9-usb-host-listen.service',
+                             timeout=30)
+        print(output, end='')
+        if rc:
+            # A --collect transient unit disappears after it exits.  A missing
+            # or already-inactive unit must not prevent stale configfs repair.
+            active_rc, _ = command('systemctl', 'is-active', '--quiet',
+                                   'linux-a9-usb-host-listen.service')
+            if active_rc == 0:
+                raise RuntimeError('failed to stop active iAP listener')
+        return_device()
+        load_iap_daemon().repair_gadget()
+        print('Removed c.2/ffs.iap and rebound the normal c.1 gadget.', flush=True)
+    else:
+        listener = command('systemctl', 'is-active', 'linux-a9-usb-host-listen.service')[1].strip()
+        print(f'role={read(ROLE)}, gates={read(CONTROL / "vbus_gates")}, '
+              f'revert_pending={read(CONTROL / "revert_pending")}, listener={listener}, '
+              f'udc={read(Path("/sys/kernel/config/usb_gadget/g1/UDC"))}, '
+              f'iap_config={Path("/sys/kernel/config/usb_gadget/g1/configs/c.2").exists()}')
+        for args in [('lsusb', '-t'), ('lsblk', '-o', 'NAME,TRAN,FSTYPE,SIZE,MOUNTPOINTS')]:
+            print(command(*args)[1], end='')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        print('USB host: stopped', file=sys.stderr)
+    except (RuntimeError, OSError, ValueError) as error:
+        print(f'USB host: {error}', file=sys.stderr)
+        sys.exit(1)

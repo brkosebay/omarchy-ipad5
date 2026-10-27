@@ -1,0 +1,2962 @@
+From 217bed70c3276a47effd5a80d70a4b646bfb62e5 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 15:29:29 +0000
+Subject: [PATCH 2/2] soc: apple: add opt-in A9 AOP active driver and IIO
+ accelerometer
+
+Add a default-off driver (CONFIG_APPLE_A9_AOP_ACTIVE, plus the immutable
+boot parameter apple_a9_aop.active=1) that boots the J71t AOP and exposes
+its accelerometer through IIO. The passive observer is unchanged except
+for an accessor for its debug parameter.
+
+- Refuses unless all five AOP PMGR domains are on; never forces a domain,
+  never clears mailbox faults, never resets the AOP. A running AOP with an
+  empty outbox is refused; with pending words the first must be HELLO.
+- Cold load: the image goes to the AOP region at IOP 0x01000000, the ext
+  segment to a DRAM buffer whose address goes into the EC0p tag, the tags
+  iOS writes (AOPt, nCal, WrAd, McRA, SOC_, SOCR, DEVf, STKG, PRNG, RTTO)
+  are patched, then remap, mailbox masks, outbox enable and CPU release as
+  AppleA7IOPV2 does.
+- Own codec for the A7IOPV2 64-bit FIFO (endpoint in bits 63:56): Linux
+  RTKit carries the endpoint in a separate word and its management type
+  field overlaps this endpoint byte, so it cannot be reused.
+- RTBuddy management: HELLO 12, EPMAP replies, AP power, IOP power state
+  0x20, STARTEP for application endpoints, 1 s ping with a 5 s timeout.
+- SPU/AFK v8: waits for the device's 0x80, answers 0xa0, allocates 0x89
+  buffers with dma_alloc_coherent (48-bit physical reply), checks the
+  AOP-written v7 ring headers, sends 0xa3, reads rings on 0x85 and writes
+  commands with the channel in the entry and a conditional 0xa2 doorbell.
+- Binds the "accel" ready report, sends the optional per-device
+  calibration file, sets 100 ms batch/report intervals with a reply check
+  per property, and registers IIO after the first 0xc2 report: raw counts,
+  16.16 g scale, read-only 10 Hz, DT mount matrix and a triggered buffer
+  fed by the device's own trigger.
+- Shutdown/kexec stops the stream and sends AFK shutdown to every
+  endpoint so the AOP stops writing to memory the next kernel reuses.
+- Root-only debugfs (with apple_a9_aop.debug=1): state, mailbox
+  transcript, ring dumps and the patched tag table.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ Documentation/driver-api/apple-a9-aop.rst     |   92 +-
+ arch/arm64/boot/dts/apple/s8003-j71t-aop.dtsi |   32 +
+ arch/arm64/boot/dts/apple/s8003-j71t.dts      |    1 +
+ drivers/soc/apple/Kconfig                     |   21 +-
+ drivers/soc/apple/Makefile                    |    1 +
+ drivers/soc/apple/a9-aop-afk.h                |  495 +++++
+ drivers/soc/apple/a9-aop-iio.c                |  126 +-
+ drivers/soc/apple/a9-aop-iio.h                |   23 +-
+ drivers/soc/apple/a9-aop.h                    |   10 +
+ drivers/soc/apple/apple-a9-aop-active.c       | 1904 +++++++++++++++++
+ drivers/soc/apple/apple-a9-aop.c              |    8 +
+ 11 files changed, 2622 insertions(+), 91 deletions(-)
+ create mode 100644 arch/arm64/boot/dts/apple/s8003-j71t-aop.dtsi
+ create mode 100644 drivers/soc/apple/a9-aop-afk.h
+ create mode 100644 drivers/soc/apple/a9-aop.h
+ create mode 100644 drivers/soc/apple/apple-a9-aop-active.c
+
+diff --git a/Documentation/driver-api/apple-a9-aop.rst b/Documentation/driver-api/apple-a9-aop.rst
+index b8afc0d8d0..225d6c6930 100644
+--- a/Documentation/driver-api/apple-a9-aop.rst
++++ b/Documentation/driver-api/apple-a9-aop.rst
+@@ -40,33 +40,69 @@ without acknowledging or clearing them.
+ 
+ The old 56-bit-payload/8-bit-endpoint codec, management hello12, bounded SPU
+ queue descriptors, version2 subpackets, announcement32, subtype4 property
+-payloads/replies, and 22-byte motion decoder are isolated in a protocol header.
+-They are not connected to an MMIO mailbox. Queue header/block ownership,
+-cache policy, IOP address translation and takeover remain unresolved. Generic
+-96-bit ASC mailbox/RTKit clients are unchanged.
+-
+-CONFIG_APPLE_A9_AOP_IIO builds a dormant consumer; no code currently calls its
+-registration function. The future SPU core must supply a real first report,
+-verified 16.16-g scale, calibration, interval units/rate, and verified ARot
+-layout. Candidate ARot v1 decoding is explicit and strictly checked, but is
+-not established hardware behavior. If firmware already applied ARot, a measured
+-residual screen matrix is required to prevent double rotation. No private
+-calibration or guessed matrix is included in the board DTS. On registration
+-the direct IIO interface provides report counts, scale, read-only sampling
+-frequency and a mount matrix. Samples are invalidated on parse/transport
+-failure and become stale after max(1 second, five report intervals). AP receipt
+-time is used for freshness only; no unverified AOP timestamps are exported.
+-
+-No rate is advertised as available or programmed automatically. The stream
+-plan helper builds batch(0x16), raw(0x5c), report(0) property payloads only when
+-units have been verified; report=0 builds a stop plan. A negotiated transport
+-must correlate and check every reply before advancing and invalidate IIO on
+-any transport failure. The observer has no call path to these helpers.
+-
+-Future hardware implementation must separate retain/attach from cold load,
+-reserve the exact boot-described memory before writes, validate the external
+-image tag/address and patchbay, establish coherent bounded queues, and discover
+-the accel service/channel through actual endpoint and ready announcements.
+-The saved ADT service ID 0x10000007 is not a mailbox endpoint constant.
++payloads/replies, and the 22-byte motion decoder live in ``a9-aop-protocol.h``;
++rings, AFK words, the firmware tag table and the calibration file format in
++``a9-aop-afk.h``. Both headers are pure functions, compiled unchanged by the
++host test harness. The observer has no call path to them; only the active
++driver below uses them. Generic 96-bit ASC mailbox/RTKit clients are unchanged.
++
++CONFIG_APPLE_A9_AOP_IIO builds the IIO consumer registered by the active
++driver. Samples are invalidated on parse/transport failure and become stale
++after max(1 second, five report intervals). AP receipt time is used for
++freshness and buffer timestamps; no AOP timestamp is exported.
+ 
+ No part of this work writes syscfg, NVRAM or boot firmware storage.
++
++Active driver (CONFIG_APPLE_A9_AOP_ACTIVE)
++==========================================
++
++A separate built-in driver binds ``apple,j71t-aop`` only with the immutable
++boot parameter ``apple_a9_aop.active=1``; otherwise probe returns before any
++mapping. It shares the ``apple_a9_aop.`` parameter prefix with the observer,
++and with ``apple_a9_aop.debug=1`` adds root-only
++``/sys/kernel/debug/apple-a9-aop-active/{state,transcript,rings,patchbay}``.
++
++Linux RTKit is not reused: its mailbox carries the endpoint in a separate
++32-bit word and its management type field (bits 59:52) overlaps this
++transport's endpoint byte (bits 63:56). The driver keeps a small codec for
++the A7IOPV2 64-bit FIFO (inbox ``0x4010``, outbox ``0x4038``), the RTBuddy
++management protocol 12, and SPU/AFK v8.
++
++Bring-up runs from a work item once the root filesystem provides
++``/lib/firmware/apple/aop/``:
++
++* All five PMGR domains must already be ON (checked with the observer API);
++  a domain is never forced on. Mailbox fault bits stop everything and are
++  never cleared.
++* Running CPU with an empty outbox: refused (``refused-running-no-pending-hello``).
++  Running CPU with pending words: the first word must be the device HELLO,
++  otherwise refused and the outbox is no longer read.
++* Stopped CPU: the main image is copied to the AOP region (IOP link base
++  ``0x01000000``), the tag table is patched, the external segment staged, the
++  remap window and mailbox masks programmed, and the CPU released through CPU
++  control bit 4 plus the auto-boot register.
++* HELLO is answered with ``0x00200000000c000c``; EPMAP chunks are answered as
++  iOS does; after the last chunk AP power and STARTEP for every application
++  endpoint are sent, and a 1 s ping starts (5 s without an ack invalidates the
++  stream; the AOP is not reset).
++* Per endpoint the driver waits for the device's AFK ``0x80`` (version 8),
++  answers ``0xa0``, allocates each ``0x89`` buffer with dma_alloc_coherent()
++  (no IOMMU, 48-bit physical reply ``0xa1``), initialises the ``0x8a/0x8b/0x8c``
++  rings, sends ``0xa3`` and reads the IOP->AP ring on ``0x85``.
++* The ``accel`` ready report (service id ``0x10000007``) binds the stream.
++  The optional per-device ``apple/aop/accel-calibration.bin`` is sent in iOS
++  table order, then batch/raw/report intervals 100000/0/100000 us, each
++  waiting for its reply. The IIO device is registered after the first
++  ``0xc2`` report.
++
++IIO: ``in_accel_{x,y,z}_raw`` are AOP report counts, ``in_accel_scale`` is
++0.000149638 (16.16 g in m/s^2), ``in_accel_sampling_frequency`` is the
++acknowledged 10 Hz, ``in_accel_mount_matrix`` comes from the DT
++``mount-matrix`` (identity until measured; ARot is applied by the firmware and
++never again on the AP). A triggered buffer is fed by the device's own trigger
++``apple-a9-aop-accel-devN`` once per report. Raw reads return -ENODATA before
++the first report, after a transport failure, and when stale.
++
++On shutdown/kexec the stream is stopped (intervals 0) and every endpoint gets
++AFK shutdown ``0xa4``; the rings live in memory the next kernel reuses. If an
++endpoint does not acknowledge, do not kexec; cold boot instead.
+diff --git a/arch/arm64/boot/dts/apple/s8003-j71t-aop.dtsi b/arch/arm64/boot/dts/apple/s8003-j71t-aop.dtsi
+new file mode 100644
+index 0000000000..870b87a238
+--- /dev/null
++++ b/arch/arm64/boot/dts/apple/s8003-j71t-aop.dtsi
+@@ -0,0 +1,32 @@
++// SPDX-License-Identifier: GPL-2.0+ OR MIT
++/*
++ * J71t AOP for the active driver. Inert unless CONFIG_APPLE_A9_AOP_ACTIVE
++ * and apple_a9_aop.active=1. No power-domains: ps_aop is always-on and
++ * keeps busif/cpu/filter on; the driver only checks all five are ON.
++ * The region is the live ADT region-size (0x9b000), not the static 0xa0000.
++ * No mount-matrix until the six-pose residual is measured.
++ */
++#include <dt-bindings/interrupt-controller/apple-aic.h>
++#include <dt-bindings/interrupt-controller/irq.h>
++
++/ {
++	soc {
++		aop: aop@210800000 {
++			compatible = "apple,j71t-aop";
++			reg = <0x2 0x10800000 0x0 0x1c000>,
++			      <0x2 0x10e00000 0x0 0x9b000>,
++			      <0x2 0x10000600 0x0 0x4>;
++			reg-names = "wrapper", "region", "auto-boot";
++			interrupt-parent = <&aic>;
++			interrupts = <AIC_IRQ 133 IRQ_TYPE_LEVEL_HIGH>,
++				     <AIC_IRQ 130 IRQ_TYPE_LEVEL_HIGH>;
++			interrupt-names = "rx", "tx";
++			apple,observe-domains = <&ps_aop_gpio &ps_aop &ps_aop_busif
++						 &ps_aop_cpu &ps_aop_filter>;
++			/* Firmware tags AOPt, SOC_ and SOCR (live ADT values). */
++			apple,aop-target = <8>;
++			apple,chip-id = <0x8003>;
++			apple,chip-revision = <1>;
++		};
++	};
++};
+diff --git a/arch/arm64/boot/dts/apple/s8003-j71t.dts b/arch/arm64/boot/dts/apple/s8003-j71t.dts
+index 4a7b6c8da2..11bde06dc3 100644
+--- a/arch/arm64/boot/dts/apple/s8003-j71t.dts
++++ b/arch/arm64/boot/dts/apple/s8003-j71t.dts
+@@ -7,6 +7,7 @@
+ /dts-v1/;
+ 
+ #include "s8003-j71t-aop-observer.dtsi"
++#include "s8003-j71t-aop.dtsi"
+ #include "s8003.dtsi"
+ #include "s800x-ipad5.dtsi"
+ 
+diff --git a/drivers/soc/apple/Kconfig b/drivers/soc/apple/Kconfig
+index 0977184596..d2bda5a3e4 100644
+--- a/drivers/soc/apple/Kconfig
++++ b/drivers/soc/apple/Kconfig
+@@ -16,14 +16,25 @@ config APPLE_A9_AOP
+ 	  apple_a9_aop.debug=1. An optional attach preflight never starts RTKit.
+ 
+ config APPLE_A9_AOP_IIO
+-	bool "J71t AOP accelerometer consumer groundwork"
++	bool "J71t AOP accelerometer IIO consumer"
+ 	depends on APPLE_A9_AOP && IIO
++	select IIO_BUFFER
++	select IIO_TRIGGERED_BUFFER
+ 	default n
+ 	help
+-	  Compile the accelerometer consumer and old SPU packet helpers. No
+-	  transport currently calls it: no IIO device is registered by enabling
+-	  this option. Registration requires a negotiated service, a real first
+-	  report, and verified calibration, scale, interval and ARot evidence.
++	  IIO accelerometer for the AOP accel service. Registered only by the
++	  active driver after the firmware delivered a first report.
++
++config APPLE_A9_AOP_ACTIVE
++	bool "J71t AOP active driver (firmware boot, RTBuddy, SPU/AFK)"
++	depends on APPLE_A9_AOP_IIO && HAS_DMA
++	default n
++	help
++	  Load and start the AOP firmware from /lib/firmware/apple/aop, run
++	  the RTBuddy management and SPU/AFK v8 transport, bind the accel
++	  service and register its IIO device. Experimental; inert unless the
++	  boot parameter apple_a9_aop.active=1 is given. Never resets the AOP;
++	  refuses a running AOP without a pending HELLO.
+ 
+ config APPLE_MAILBOX
+ 	tristate "Apple SoC mailboxes"
+diff --git a/drivers/soc/apple/Makefile b/drivers/soc/apple/Makefile
+index 2a1e2f8900..ba7661d9b4 100644
+--- a/drivers/soc/apple/Makefile
++++ b/drivers/soc/apple/Makefile
+@@ -2,6 +2,7 @@
+ 
+ obj-$(CONFIG_APPLE_A9_AOP) += apple-a9-aop.o
+ obj-$(CONFIG_APPLE_A9_AOP_IIO) += a9-aop-iio.o
++obj-$(CONFIG_APPLE_A9_AOP_ACTIVE) += apple-a9-aop-active.o
+ 
+ obj-$(CONFIG_APPLE_MAILBOX) += apple-mailbox.o
+ apple-mailbox-y = mailbox.o
+diff --git a/drivers/soc/apple/a9-aop-afk.h b/drivers/soc/apple/a9-aop-afk.h
+new file mode 100644
+index 0000000000..cfc8ee17bd
+--- /dev/null
++++ b/drivers/soc/apple/a9-aop-afk.h
+@@ -0,0 +1,495 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * J71t AOP active transport helpers: old RTBuddy management words, SPU/AFK v8
++ * endpoint words, host-initialised shared rings, EPIC command packets and the
++ * firmware's tag ("patchbay") table. Pure functions on plain memory so the
++ * host harness compiles this header unchanged. MMIO, DMA ordering and
++ * locking stay in the kernel caller. See docs/periph/ds-aop-accel.md.
++ */
++#ifndef _A9_AOP_AFK_H
++#define _A9_AOP_AFK_H
++
++#include "a9-aop-protocol.h"
++
++/* Management (endpoint 0): type in payload bits 55:52. */
++#define A9_MGMT_HELLO		0x1
++#define A9_MGMT_HELLO_REPLY	0x2
++#define A9_MGMT_PING		0x3
++#define A9_MGMT_PING_ACK	0x4
++#define A9_MGMT_STARTEP		0x5
++#define A9_MGMT_IOP_POWER_ACK	0x7
++#define A9_MGMT_IOP_POWER_ON	0x20
++#define A9_MGMT_EPMAP		0x8
++#define A9_MGMT_AP_POWER	0xa
++#define A9_MGMT_AP_POWER_ACK	0xb
++
++/* SPU/AFK (application endpoints): type in payload bits 55:48. */
++#define A9_AFK_INIT		0x80
++#define A9_AFK_RX_NOTIFY	0x85
++#define A9_AFK_START_ACK	0x86
++#define A9_AFK_SHUTDOWN_ACK	0x87
++#define A9_AFK_GETBUF		0x89
++#define A9_AFK_TX_DESC		0x8a	/* AP->IOP ring, host writes */
++#define A9_AFK_RX_DESC		0x8b	/* IOP->AP ring, host reads */
++#define A9_AFK_HIST_DESC	0x8c
++#define A9_AFK_INIT_ACK		0xa0
++#define A9_AFK_GETBUF_ACK	0xa1
++#define A9_AFK_DOORBELL		0xa2
++#define A9_AFK_START		0xa3
++#define A9_AFK_SHUTDOWN		0xa4
++#define A9_AFK_HIBERNATE	0xc2
++#define A9_AFK_HIBERNATE_ACK	0xc3
++#define A9_AFK_VERSION		8
++#define A9_AFK_MAX_BUFFERS	16
++
++#define A9_AOP_PA_MASK		0x0000ffffffffffffULL
++
++static inline u8 a9_mgmt_type(u64 payload)
++{
++	return (payload >> 52) & 0xf;
++}
++
++static inline u64 a9_mgmt_word(u8 type, u64 low)
++{
++	return ((u64)type << 52) | low;
++}
++
++/* RTBuddy::createEndpoint: below 0x20 system, from 0x20 RTBuddyEndpointService. */
++static inline bool a9_aop_system_endpoint(unsigned int ep)
++{
++	return ep < 0x20;
++}
++
++struct a9_epmap {
++	u8 base;
++	bool last;
++	u32 bitmap;
++};
++
++static inline int a9_mgmt_epmap(u64 payload, struct a9_epmap *map)
++{
++	if (a9_mgmt_type(payload) != A9_MGMT_EPMAP)
++		return -EPROTO;
++	map->base = (payload >> 32) & 0x3f;
++	map->last = (payload >> 51) & 1;
++	map->bitmap = (u32)payload;
++	return 0;
++}
++
++/* iOS: low32 = 1 for the first chunk; later chunks mirror base and last. */
++static inline u64 a9_mgmt_epmap_reply(const struct a9_epmap *map)
++{
++	return a9_mgmt_word(A9_MGMT_EPMAP, ((u64)map->last << 51) |
++			    ((u64)map->base << 32) | (map->base == 0));
++}
++
++static inline u64 a9_mgmt_startep(u8 ep)
++{
++	return a9_mgmt_word(A9_MGMT_STARTEP, ((u64)ep << 32) | 2);
++}
++
++static inline u64 a9_mgmt_ping(u32 seq, u16 uptime)
++{
++	return a9_mgmt_word(A9_MGMT_PING, ((u64)uptime << 32) | seq);
++}
++
++static inline u64 a9_mgmt_ap_power(bool on)
++{
++	return a9_mgmt_word(A9_MGMT_AP_POWER, on);
++}
++
++static inline u8 a9_afk_type(u64 payload)
++{
++	return payload >> 48;
++}
++
++static inline u64 a9_afk_word(u8 type)
++{
++	return (u64)type << 48;
++}
++
++/* 0x89: size in 64-byte blocks at bits 31:16, tag at 15:0. */
++static inline int a9_afk_getbuf(u64 payload, u16 *tag, size_t *size)
++{
++	if (a9_afk_type(payload) != A9_AFK_GETBUF)
++		return -EPROTO;
++	*tag = payload & 0xffff;
++	*size = ((payload >> 16) & 0xffff) * 64;
++	return *size ? 0 : -EMSGSIZE;
++}
++
++static inline int a9_afk_getbuf_ack(u64 pa, u64 *payload)
++{
++	if (pa & ~A9_AOP_PA_MASK)
++		return -ERANGE;
++	*payload = a9_afk_word(A9_AFK_GETBUF_ACK) | pa;
++	return 0;
++}
++
++/*
++ * Shared ring (AppleSPU iop_ringbuffer, block A = 0x40). The AOP initialises
++ * the header (AppleSPU constructs the queue with init=0) and the AP only
++ * checks it: +0x00 bufsize (= size - 0xc0), +0x04 version word (v7 when the
++ * high half is 7), +0x40 rptr (consumer), +0x80 wptr (producer), entries
++ * from +0xc0. A v7 entry is +0 magic, +4 payload length (excluding this
++ * 16-byte header), +8 channel, +0xc word, then the whole EPIC packet at
++ * +0x10; stride = align(16 + length). An entry never wraps: the writer puts
++ * it at 0 and leaves a copy of its header at the old wptr, so the reader
++ * takes the length from that tail header and reads the entry at 0.
++ * Reader fffffff005baba00, writer fffffff005bab540 (docs/periph/aop-sensors.md).
++ */
++#define A9_RING_BLOCK		0x40
++#define A9_RING_HEADER		(3 * A9_RING_BLOCK)
++#define A9_RING_V7		0x00070000
++#define A9_RING_MAGIC_AOP	0x20504f41	/* "AOP ", host writer */
++#define A9_RING_MAGIC_IOP	0x20504f49	/* "IOP " */
++#define A9_RING_ENTRY_HEADER	16
++
++/* Kernel callers override these with READ_ONCE/WRITE_ONCE accessors. */
++#ifndef A9_RING_LOAD32
++#define A9_RING_LOAD32(p) get_unaligned_le32(p)
++#define A9_RING_STORE32(v, p) put_unaligned_le32(v, p)
++#endif
++
++struct a9_ring {
++	u8 *base;	/* ring start: header block 0 */
++	u32 size;	/* bytes from the descriptor, header included */
++	u32 bufsize;	/* entry area bytes, from the AOP-written header */
++	u32 version;
++	u32 cursor;	/* RX: local rptr */
++};
++
++struct a9_ring_entry {
++	u32 magic;
++	u32 length;	/* EPIC packet bytes */
++	u32 channel;
++	u32 word;
++	u32 offset;	/* entry-area offset actually read */
++};
++
++static inline u32 a9_ring_align(u32 value)
++{
++	return (value + A9_RING_BLOCK - 1) & ~(u32)(A9_RING_BLOCK - 1);
++}
++
++static inline u8 *a9_ring_entry(const struct a9_ring *ring, u32 index)
++{
++	return ring->base + A9_RING_HEADER + index;
++}
++
++static inline u32 a9_ring_rptr(const struct a9_ring *ring)
++{
++	return A9_RING_LOAD32(ring->base + A9_RING_BLOCK);
++}
++
++static inline u32 a9_ring_wptr(const struct a9_ring *ring)
++{
++	return A9_RING_LOAD32(ring->base + 2 * A9_RING_BLOCK);
++}
++
++static inline void a9_ring_set_rptr(struct a9_ring *ring, u32 value)
++{
++	A9_RING_STORE32(value, ring->base + A9_RING_BLOCK);
++}
++
++static inline void a9_ring_set_wptr(struct a9_ring *ring, u32 value)
++{
++	A9_RING_STORE32(value, ring->base + 2 * A9_RING_BLOCK);
++}
++
++static inline bool a9_ring_index_ok(const struct a9_ring *ring, u32 index)
++{
++	return index < ring->bufsize && !(index % A9_RING_BLOCK);
++}
++
++/*
++ * Check the AOP-written header of a ring the descriptor just announced;
++ * never writes it. The RX cursor starts at the header's rptr.
++ */
++static inline int a9_ring_attach(struct a9_ring *ring, u8 *base, u32 size)
++{
++	if (size % A9_RING_BLOCK || size < A9_RING_HEADER + A9_RING_BLOCK)
++		return -EINVAL;
++	ring->base = base;
++	ring->size = size;
++	ring->bufsize = A9_RING_LOAD32(base);
++	ring->version = A9_RING_LOAD32(base + 4);
++	if (ring->bufsize != size - A9_RING_HEADER)
++		return -EPROTO;
++	if ((ring->version & 0xffff0000) != A9_RING_V7)
++		return -EPROTONOSUPPORT;
++	ring->cursor = a9_ring_rptr(ring);
++	if (!a9_ring_index_ok(ring, ring->cursor) ||
++	    !a9_ring_index_ok(ring, a9_ring_wptr(ring)))
++		return -ERANGE;
++	return 0;
++}
++
++/*
++ * Read the entry at ring->cursor: copies min(length, cap) EPIC bytes to
++ * @packet, fills @entry and the cursor after it in *next (0 at the end).
++ * -EAGAIN when empty. Does not write rptr; the caller publishes *next.
++ */
++static inline int a9_ring_read(const struct a9_ring *ring, u32 wptr,
++			       u8 *packet, size_t cap,
++			       struct a9_ring_entry *entry, u32 *next)
++{
++	u32 rptr = ring->cursor, pos, length, stride;
++	const u8 *e;
++
++	if (!a9_ring_index_ok(ring, rptr) || !a9_ring_index_ok(ring, wptr))
++		return -ERANGE;
++	if (rptr == wptr)
++		return -EAGAIN;
++	pos = rptr + A9_RING_ENTRY_HEADER <= ring->bufsize ? rptr : 0;
++	length = A9_RING_LOAD32(a9_ring_entry(ring, pos) + 4);
++	stride = a9_ring_align(A9_RING_ENTRY_HEADER + length);
++	if (!length || length > ring->bufsize || stride > ring->bufsize)
++		return -EMSGSIZE;
++	if (pos + stride > ring->bufsize) {
++		/* Tail header copy; the entry itself was written at 0. */
++		if (pos <= wptr)
++			return -EPROTO;
++		pos = 0;
++	}
++	/* The entry must not run past the writer. */
++	if (pos < wptr && pos + stride > wptr)
++		return -EPROTO;
++	e = a9_ring_entry(ring, pos);
++	entry->magic = A9_RING_LOAD32(e);
++	entry->length = length;
++	entry->channel = A9_RING_LOAD32(e + 8);
++	entry->word = A9_RING_LOAD32(e + 12);
++	entry->offset = pos;
++	memcpy(packet, e + A9_RING_ENTRY_HEADER, length < cap ? length : cap);
++	*next = pos + stride == ring->bufsize ? 0 : pos + stride;
++	return 0;
++}
++
++/*
++ * Write one EPIC packet using the rptr/wptr just read from the header.
++ * On success *new_wptr is the value to publish (after a write barrier);
++ * the caller re-reads rptr and rings 0xa2 only if it equals @wptr.
++ */
++static inline int a9_ring_write(struct a9_ring *ring, u32 rptr, u32 wptr,
++				u32 channel, u32 word, const u8 *epic,
++				u32 length, u32 *new_wptr)
++{
++	u32 stride, pos, end;
++	u8 *e;
++
++	if (!a9_ring_index_ok(ring, rptr) || !a9_ring_index_ok(ring, wptr))
++		return -ERANGE;
++	if (!length || length > ring->bufsize)
++		return -EMSGSIZE;
++	stride = a9_ring_align(A9_RING_ENTRY_HEADER + length);
++	pos = wptr;
++	if (wptr >= rptr && wptr + stride > ring->bufsize && rptr)
++		pos = 0;
++	end = pos + stride;
++	if ((pos < rptr && end >= rptr) || end > ring->bufsize ||
++	    (end == ring->bufsize && !rptr))
++		return -ENOSPC;
++	e = a9_ring_entry(ring, pos);
++	put_unaligned_le32(A9_RING_MAGIC_AOP, e);
++	put_unaligned_le32(length, e + 4);
++	put_unaligned_le32(channel, e + 8);
++	put_unaligned_le32(word, e + 12);
++	memcpy(e + A9_RING_ENTRY_HEADER, epic, length);
++	memset(e + A9_RING_ENTRY_HEADER + length, 0,
++	       stride - A9_RING_ENTRY_HEADER - length);
++	if (pos != wptr && wptr + A9_RING_BLOCK <= ring->bufsize)
++		memcpy(a9_ring_entry(ring, wptr), e, A9_RING_ENTRY_HEADER);
++	*new_wptr = end == ring->bufsize ? 0 : end;
++	return 0;
++}
++
++static inline u16 a9_epic_sequence(const u8 *packet)
++{
++	return get_unaligned_le16(packet + 1);
++}
++
++/*
++ * Property notify: outer(16) + subheader(24) + 00000000 | key | value.
++ * Length field = 8 + n, capacity 0xe4 (fffffff005bae168). The outer header
++ * (fffffff005baf0fc) leaves +4 zero: the channel goes in the ring entry.
++ * Returns the packet length or a negative error.
++ */
++static inline int a9_epic_property(u8 *packet, size_t cap, u16 sequence,
++				   u16 tag, u32 key, const u8 *value, u32 n)
++{
++	size_t length = A9_SPU_OUTER_SIZE + A9_SPU_SUBHEADER_SIZE + 8 + n;
++	u8 *sub = packet + A9_SPU_OUTER_SIZE;
++
++	if (length > cap)
++		return -EMSGSIZE;
++	memset(packet, 0, length);
++	packet[0] = 2;
++	put_unaligned_le16(sequence, packet + 1);
++	put_unaligned_le32(8 + n, sub);
++	sub[4] = 2;
++	sub[5] = A9_SPU_NOTIFY;
++	put_unaligned_le16(4, sub + 6);
++	put_unaligned_le16(tag, sub + 8);
++	put_unaligned_le32(0xe4, sub + 20);
++	put_unaligned_le32(key, sub + 28);
++	memcpy(sub + 32, value, n);
++	return length;
++}
++
++struct a9_spu_service {
++	char name[33];
++	u32 service_id;
++	u32 flags;
++	u32 interface;
++	bool has_interface;
++};
++
++/* Ready report 0xc0: name32, service id, flags, interface if flags bit 3. */
++static inline int a9_spu_service(const struct a9_spu_subpacket *sub,
++				 struct a9_spu_service *service)
++{
++	int ret = a9_spu_announcement(sub, service->name, &service->service_id);
++
++	if (ret)
++		return ret;
++	service->flags = get_unaligned_le32(sub->payload + 36);
++	service->has_interface = service->flags & 8;
++	service->interface = 0;
++	if (service->has_interface) {
++		if (sub->size < 44)
++			return -EMSGSIZE;
++		service->interface = get_unaligned_le32(sub->payload + 40);
++	}
++	return 0;
++}
++
++/* Firmware image header and tag table (ipad6faop: "uuid" at +0x20). */
++#define A9_FW_TAG(a, b, c, d) \
++	(((u32)(a) << 24) | ((u32)(b) << 16) | ((u32)(c) << 8) | (u32)(d))
++#define A9_FW_UUID_MAGIC	A9_FW_TAG('d', 'i', 'u', 'u')
++#define A9_FW_HEADER_SIZE	0x50
++#define A9_FW_TABLE_MAX		0x1000
++
++/* Validate the whole tag table: [u32 tag][u32 len][len bytes], packed. */
++static inline int a9_fw_table(const u8 *fw, size_t size, size_t *offset,
++			      size_t *length)
++{
++	size_t cursor, end;
++	u32 value_size;
++
++	if (size < A9_FW_HEADER_SIZE ||
++	    get_unaligned_le32(fw + 0x20) != A9_FW_UUID_MAGIC)
++		return -EINVAL;
++	*offset = get_unaligned_le32(fw + 0x48);
++	*length = get_unaligned_le32(fw + 0x4c);
++	if (*offset < A9_FW_HEADER_SIZE || *length > A9_FW_TABLE_MAX ||
++	    *offset > size || *length > size - *offset)
++		return -EMSGSIZE;
++	end = *offset + *length;
++	for (cursor = *offset; cursor < end; cursor += 8 + value_size) {
++		if (end - cursor < 8)
++			return -EPROTO;
++		value_size = get_unaligned_le32(fw + cursor + 4);
++		if (value_size > end - cursor - 8)
++			return -EMSGSIZE;
++	}
++	return 0;
++}
++
++/* Find @tag in a table validated by a9_fw_table(). */
++static inline int a9_fw_tag(const u8 *fw, size_t offset, size_t length,
++			    u32 tag, size_t *value, u32 *value_size)
++{
++	size_t cursor, end = offset + length;
++
++	for (cursor = offset; cursor + 8 <= end;
++	     cursor += 8 + get_unaligned_le32(fw + cursor + 4)) {
++		if (get_unaligned_le32(fw + cursor) == tag) {
++			*value = cursor + 8;
++			*value_size = get_unaligned_le32(fw + cursor + 4);
++			return 0;
++		}
++	}
++	return -ENOENT;
++}
++
++/* Overwrite an existing tag of exactly @size bytes; absent tags are skipped. */
++static inline int a9_fw_patch(u8 *fw, size_t offset, size_t length, u32 tag,
++			      const void *data, u32 size)
++{
++	size_t value;
++	u32 value_size;
++
++	if (a9_fw_tag(fw, offset, length, tag, &value, &value_size))
++		return -ENOENT;
++	if (value_size != size)
++		return -EMSGSIZE;
++	memcpy(fw + value, data, size);
++	return 0;
++}
++
++/*
++ * Per-device accel calibration, generated on the host from the private
++ * IODeviceTree dump (scripts/periph/aop/make-calibration.py) and staged as
++ * a RAM/rootfs-only firmware file. Format: "A9AC", u32 version 1, u32
++ * count, then count x {u32 key, u32 length, bytes}. Keys must follow the
++ * iOS table order (fffffff006d5e7f8) restricted to unflagged entries.
++ */
++#define A9_CAL_MAGIC		A9_FW_TAG('C', 'A', '9', 'A')
++#define A9_CAL_MAX_SIZE		1024
++#define A9_CAL_MAX_BLOB		64
++
++static const u32 a9_cal_order[] = { 0x1a, 0x0b, 0x27, 0x18, 0x19 };
++
++static inline int a9_cal_rank(u32 key)
++{
++	unsigned int i;
++
++	for (i = 0; i < sizeof(a9_cal_order) / sizeof(a9_cal_order[0]); i++)
++		if (a9_cal_order[i] == key)
++			return i;
++	return -1;
++}
++
++struct a9_cal_entry {
++	u32 key;
++	u32 length;
++	const u8 *data;
++};
++
++/* Validate the file; fills up to @max entries in order, returns count. */
++static inline int a9_cal_parse(const u8 *blob, size_t size,
++			       struct a9_cal_entry *entries, unsigned int max)
++{
++	size_t cursor = 12;
++	u32 count, i;
++	int rank, last = -1;
++
++	if (size < 12 || size > A9_CAL_MAX_SIZE ||
++	    get_unaligned_le32(blob) != A9_CAL_MAGIC ||
++	    get_unaligned_le32(blob + 4) != 1)
++		return -EINVAL;
++	count = get_unaligned_le32(blob + 8);
++	if (count > max)
++		return -E2BIG;
++	for (i = 0; i < count; i++) {
++		if (size - cursor < 8)
++			return -EMSGSIZE;
++		entries[i].key = get_unaligned_le32(blob + cursor);
++		entries[i].length = get_unaligned_le32(blob + cursor + 4);
++		cursor += 8;
++		rank = a9_cal_rank(entries[i].key);
++		if (rank <= last || !entries[i].length ||
++		    entries[i].length > A9_CAL_MAX_BLOB)
++			return -EPROTO;
++		if (entries[i].length > size - cursor)
++			return -EMSGSIZE;
++		last = rank;
++		entries[i].data = blob + cursor;
++		cursor += entries[i].length;
++	}
++	return cursor == size ? (int)count : -EPROTO;
++}
++
++#endif
+diff --git a/drivers/soc/apple/a9-aop-iio.c b/drivers/soc/apple/a9-aop-iio.c
+index 65e713bf2a..5571b376af 100644
+--- a/drivers/soc/apple/a9-aop-iio.c
++++ b/drivers/soc/apple/a9-aop-iio.c
+@@ -1,7 +1,17 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+-/* Dormant IIO consumer for a future negotiated J71t SPU service. */
++/*
++ * IIO accelerometer for the J71t AOP "accel" service. Raw values are the AOP
++ * report counts (signed 16.16 g working interpretation, ds-aop-accel.md §8);
++ * scale converts them to m/s^2. Direct reads return the latest report and
++ * -ENODATA when stale; a triggered buffer is fed by the device's own trigger,
++ * fired once per report.
++ */
+ #include <linux/err.h>
++#include <linux/iio/buffer.h>
+ #include <linux/iio/iio.h>
++#include <linux/iio/trigger.h>
++#include <linux/iio/trigger_consumer.h>
++#include <linux/iio/triggered_buffer.h>
+ #include <linux/ktime.h>
+ #include <linux/module.h>
+ #include <linux/spinlock.h>
+@@ -17,6 +27,7 @@ struct a9_aop_accel {
+ 	bool valid;
+ 	u32 interval_us;
+ 	struct iio_mount_matrix matrix;
++	struct iio_trigger *trig;
+ };
+ 
+ static const struct iio_mount_matrix *
+@@ -34,15 +45,21 @@ static const struct iio_chan_spec_ext_info a9_aop_accel_ext[] = {
+ 
+ #define A9_ACCEL_CHANNEL(axis, index) { \
+ 	.type = IIO_ACCEL, .modified = 1, .channel2 = IIO_MOD_##axis, \
+-	.address = index, .info_mask_separate = BIT(IIO_CHAN_INFO_RAW), \
++	.address = index, .scan_index = index, \
++	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW), \
+ 	.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE) | \
+ 		BIT(IIO_CHAN_INFO_SAMP_FREQ), .ext_info = a9_aop_accel_ext, \
++	.scan_type = { .sign = 's', .realbits = 32, .storagebits = 32, \
++		       .endianness = IIO_CPU }, \
+ }
+ 
+ static const struct iio_chan_spec a9_aop_accel_channels[] = {
+ 	A9_ACCEL_CHANNEL(X, 0), A9_ACCEL_CHANNEL(Y, 1), A9_ACCEL_CHANNEL(Z, 2),
++	IIO_CHAN_SOFT_TIMESTAMP(3),
+ };
+ 
++static const unsigned long a9_aop_accel_scan_masks[] = { 0x7, 0 };
++
+ static int a9_aop_accel_read_raw(struct iio_dev *indio_dev,
+ 				 const struct iio_chan_spec *chan,
+ 				 int *val, int *val2, long mask)
+@@ -65,7 +82,7 @@ static int a9_aop_accel_read_raw(struct iio_dev *indio_dev,
+ 		spin_unlock_irqrestore(&accel->lock, flags);
+ 		return ret;
+ 	case IIO_CHAN_INFO_SCALE:
+-		/* Only registered after 16.16 g is verified. m/s^2 per count. */
++		/* 9.80665 / 65536 m/s^2 per count (16.16 g). */
+ 		*val = 0;
+ 		*val2 = 149638;
+ 		return IIO_VAL_INT_PLUS_NANO;
+@@ -80,8 +97,38 @@ static int a9_aop_accel_read_raw(struct iio_dev *indio_dev,
+ 
+ static const struct iio_info a9_aop_accel_info = {
+ 	.read_raw = a9_aop_accel_read_raw,
++	.validate_trigger = iio_validate_own_trigger,
++};
++
++static const struct iio_trigger_ops a9_aop_accel_trigger_ops = {
++	.validate_device = iio_trigger_validate_own_device,
+ };
+ 
++static irqreturn_t a9_aop_accel_trigger_handler(int irq, void *p)
++{
++	struct iio_poll_func *pf = p;
++	struct iio_dev *indio_dev = pf->indio_dev;
++	struct a9_aop_accel *accel = iio_priv(indio_dev);
++	struct {
++		s32 axes[3];
++		aligned_s64 timestamp;
++	} scan = {};
++	unsigned long flags;
++	bool valid;
++
++	spin_lock_irqsave(&accel->lock, flags);
++	valid = accel->valid;
++	memcpy(scan.axes, accel->latest.axes, sizeof(scan.axes));
++	spin_unlock_irqrestore(&accel->lock, flags);
++	/* AP receipt time: the AOP timestamp domain is not established. */
++	if (valid)
++		iio_push_to_buffers_with_ts(indio_dev, &scan, sizeof(scan),
++					    iio_get_time_ns(indio_dev));
++	iio_trigger_notify_done(indio_dev->trig);
++	return IRQ_HANDLED;
++}
++
++/* Process context only (fires the trigger synchronously). */
+ int a9_aop_accel_report(struct iio_dev *indio_dev, const struct a9_spu_subpacket *sub)
+ {
+ 	struct a9_aop_accel *accel = iio_priv(indio_dev);
+@@ -96,12 +143,12 @@ int a9_aop_accel_report(struct iio_dev *indio_dev, const struct a9_spu_subpacket
+ 	}
+ 	spin_lock_irqsave(&accel->lock, flags);
+ 	accel->latest = motion;
+-	/* AP receipt time is used only for freshness, never exported as the
+-	 * firmware sample timestamp. AOP timestamp conversion is unverified.
+-	 */
++	/* AP receipt time is used only for freshness and buffer timestamps. */
+ 	accel->received_ns = ktime_get_boottime_ns();
+ 	accel->valid = true;
+ 	spin_unlock_irqrestore(&accel->lock, flags);
++	if (iio_buffer_enabled(indio_dev))
++		iio_trigger_poll_nested(accel->trig);
+ 	return 0;
+ }
+ 
+@@ -120,43 +167,11 @@ struct iio_dev *a9_aop_accel_register(struct device *parent,
+ {
+ 	struct a9_aop_accel *accel;
+ 	struct iio_dev *indio_dev;
+-	s8 matrix[9];
+-	unsigned int i, row, col, nonzero;
+ 	int ret;
+ 
+-	if (!config->arot_layout_verified || !config->scale_verified ||
+-	    !config->calibration_verified || !config->interval_units_verified ||
+-	    !config->report_interval_us || config->report_interval_us > 10000000 ||
+-	    !config->first_report)
+-		return ERR_PTR(-EOPNOTSUPP);
+-	ret = a9_aop_arot_v1(config->arot, config->arot_size, matrix);
+-	if (ret)
+-		return ERR_PTR(ret);
+-	if (config->firmware_applied_arot) {
+-		if (!config->residual_matrix)
+-			return ERR_PTR(-EINVAL);
+-		memcpy(matrix, config->residual_matrix, sizeof(matrix));
+-		/* Reject malformed residual matrices as well. */
+-		for (row = 0; row < 3; row++) {
+-			nonzero = 0;
+-			for (col = 0; col < 3; col++) {
+-				s8 value = matrix[row * 3 + col];
+-
+-				if (value < -1 || value > 1)
+-					return ERR_PTR(-EINVAL);
+-				nonzero += value != 0;
+-			}
+-			if (nonzero != 1)
+-				return ERR_PTR(-EINVAL);
+-		}
+-		for (col = 0; col < 3; col++) {
+-			nonzero = 0;
+-			for (row = 0; row < 3; row++)
+-				nonzero += matrix[row * 3 + col] != 0;
+-			if (nonzero != 1)
+-				return ERR_PTR(-EINVAL);
+-		}
+-	}
++	if (!config->first_report || !config->report_interval_us ||
++	    config->report_interval_us > 10000000)
++		return ERR_PTR(-EINVAL);
+ 	indio_dev = devm_iio_device_alloc(parent, sizeof(*accel));
+ 	if (!indio_dev)
+ 		return ERR_PTR(-ENOMEM);
+@@ -164,21 +179,44 @@ struct iio_dev *a9_aop_accel_register(struct device *parent,
+ 	spin_lock_init(&accel->lock);
+ 	accel->interval_us = config->report_interval_us;
+ 	accel->stale_ns = max_t(u64, 1000000000ULL, (u64)accel->interval_us * 5000);
+-	for (i = 0; i < 9; i++)
+-		accel->matrix.rotation[i] = matrix[i] == -1 ? "-1" : matrix[i] ? "1" : "0";
++	/*
++	 * Residual screen matrix from the board DT after six poses; identity
++	 * (the AOP report frame) until measured. ARot is never applied here.
++	 */
++	ret = iio_read_mount_matrix(parent, &accel->matrix);
++	if (ret)
++		return ERR_PTR(ret);
++	if (!config->firmware_applied_arot)
++		dev_warn(parent, "ARot not sent to firmware: axes are the sensor frame, not the DT mount-matrix frame\n");
+ 	indio_dev->name = "apple-a9-aop-accel";
+ 	indio_dev->info = &a9_aop_accel_info;
+ 	indio_dev->modes = INDIO_DIRECT_MODE;
+ 	indio_dev->channels = a9_aop_accel_channels;
+ 	indio_dev->num_channels = ARRAY_SIZE(a9_aop_accel_channels);
++	indio_dev->available_scan_masks = a9_aop_accel_scan_masks;
+ 	ret = a9_aop_accel_report(indio_dev, config->first_report);
+ 	if (ret)
+ 		return ERR_PTR(ret);
++
++	accel->trig = devm_iio_trigger_alloc(parent, "%s-dev%d", indio_dev->name,
++					     iio_device_id(indio_dev));
++	if (!accel->trig)
++		return ERR_PTR(-ENOMEM);
++	accel->trig->ops = &a9_aop_accel_trigger_ops;
++	iio_trigger_set_drvdata(accel->trig, indio_dev);
++	ret = devm_iio_trigger_register(parent, accel->trig);
++	if (ret)
++		return ERR_PTR(ret);
++	indio_dev->trig = iio_trigger_get(accel->trig);
++	ret = devm_iio_triggered_buffer_setup(parent, indio_dev, NULL,
++					      a9_aop_accel_trigger_handler, NULL);
++	if (ret)
++		return ERR_PTR(ret);
+ 	ret = devm_iio_device_register(parent, indio_dev);
+ 	if (ret)
+ 		return ERR_PTR(ret);
+ 	return indio_dev;
+ }
+ 
+-MODULE_DESCRIPTION("Apple A9 AOP accelerometer consumer (requires negotiated SPU transport)");
++MODULE_DESCRIPTION("Apple A9 AOP accelerometer IIO consumer");
+ MODULE_LICENSE("GPL");
+diff --git a/drivers/soc/apple/a9-aop-iio.h b/drivers/soc/apple/a9-aop-iio.h
+index 0bfe54c5fc..b0208d791f 100644
+--- a/drivers/soc/apple/a9-aop-iio.h
++++ b/drivers/soc/apple/a9-aop-iio.h
+@@ -8,23 +8,18 @@ struct device;
+ struct iio_dev;
+ struct a9_spu_subpacket;
+ 
+-/* Future negotiated SPU core calls these, never the passive observer.
+- * Each verification bit represents evidence, not a user bypass parameter.
+- */
++/* Called by the active driver once the accel stream delivered a report. */
+ struct a9_aop_accel_config {
+-	const u8 *arot;
+-	size_t arot_size;
+-	bool arot_layout_verified;
+-	bool scale_verified;
+-	bool calibration_verified;
+-	bool firmware_applied_arot;
+-	/* When firmware already applied ARot, require a measured residual
+-	 * screen matrix. Otherwise the verified ARot matrix is exposed in IIO.
+-	 */
+-	const s8 *residual_matrix;
++	/* Report interval the firmware acknowledged (key 0), microseconds. */
+ 	u32 report_interval_us;
+-	bool interval_units_verified;
++	/* First 0xc2 report received after the rate was acknowledged. */
+ 	const struct a9_spu_subpacket *first_report;
++	/*
++	 * ARot (key 0x18) was sent: axes are already in the firmware's
++	 * device frame, and the DT mount-matrix is the residual. Never apply
++	 * ARot again on the AP.
++	 */
++	bool firmware_applied_arot;
+ };
+ 
+ struct iio_dev *a9_aop_accel_register(struct device *parent,
+diff --git a/drivers/soc/apple/a9-aop.h b/drivers/soc/apple/a9-aop.h
+new file mode 100644
+index 0000000000..274244cf30
+--- /dev/null
++++ b/drivers/soc/apple/a9-aop.h
+@@ -0,0 +1,10 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _A9_AOP_H
++#define _A9_AOP_H
++
++#include <linux/types.h>
++
++/* Immutable apple_a9_aop.debug value, owned by the passive observer. */
++bool apple_a9_aop_debug(void);
++
++#endif
+diff --git a/drivers/soc/apple/apple-a9-aop-active.c b/drivers/soc/apple/apple-a9-aop-active.c
+new file mode 100644
+index 0000000000..68ed183edf
+--- /dev/null
++++ b/drivers/soc/apple/apple-a9-aop-active.c
+@@ -0,0 +1,1904 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * J71t AOP active driver: loads and starts the AOP firmware, runs the old
++ * RTBuddy management protocol and the SPU/AFK v8 endpoint transport over the
++ * A7IOPV2 64-bit mailbox, binds the "accel" service and exposes it as an IIO
++ * accelerometer. Every message word follows docs/periph/ds-aop-accel.md.
++ *
++ * Default off twice: CONFIG_APPLE_A9_AOP_ACTIVE and the immutable boot
++ * parameter apple_a9_aop.active=1. Without the parameter probe returns
++ * before mapping anything. The passive observer is a separate driver.
++ *
++ * Linux RTKit (drivers/soc/apple/rtkit.c) is not reused: it carries the
++ * endpoint in a separate 32-bit mailbox word and its management type field
++ * (bits 59:52) overlaps this transport's endpoint byte (bits 63:56); the
++ * EPMAP base and AFK words also differ. This file keeps its own small codec.
++ *
++ * Never resets the AOP, never clears mailbox faults and never forces a power
++ * domain on. A running AOP without a pending HELLO is refused.
++ */
++#include <linux/bitfield.h>
++#include <linux/debugfs.h>
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/firmware.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/kfifo.h>
++#include <linux/ktime.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/random.h>
++#include <linux/seq_file.h>
++#include <linux/slab.h>
++#include <linux/soc/apple/pmgr-observe.h>
++#include <linux/vmalloc.h>
++#include <linux/wait.h>
++#include <linux/workqueue.h>
++
++#define A9_RING_LOAD32(p) le32_to_cpu(READ_ONCE(*(const __le32 *)(p)))
++#define A9_RING_STORE32(v, p) WRITE_ONCE(*(__le32 *)(p), cpu_to_le32(v))
++#include "a9-aop-afk.h"
++#include "a9-aop-iio.h"
++#include "a9-aop.h"
++
++/* Shares the observer's parameter namespace: apple_a9_aop.active=1. */
++#undef MODULE_PARAM_PREFIX
++#define MODULE_PARAM_PREFIX "apple_a9_aop."
++
++static bool active;
++module_param(active, bool, 0400);
++MODULE_PARM_DESC(active, "Boot the AOP and expose the accelerometer (default off)");
++
++#define AOP_MAIN_FW		"apple/aop/ipad6faop-20H350.bin"
++#define AOP_EXT_FW		"apple/aop/ipad6faop_ext-20H350.bin"
++#define AOP_CAL_FW		"apple/aop/accel-calibration.bin"
++
++/* Wrapper offsets (AppleA7IOPV2, docs/periph/aop-sensors.md §1). */
++#define AOP_REMAP_PA_LO		0x08
++#define AOP_REMAP_PA_HI		0x10
++#define AOP_REMAP_IOP_LO	0x18
++#define AOP_REMAP_IOP_HI	0x20
++#define AOP_REMAP_SIZE		0x28
++#define AOP_REMAP_RESERVED	0x30
++#define AOP_REMAP_ENABLE	0x38
++#define AOP_CPU_CONTROL		0x44
++#define AOP_CPU_START		BIT(4)
++#define AOP_CPU_STATUS		0xb88
++#define AOP_CPU_RUNNING		BIT(0)
++#define AOP_IRQ_MASK_SET	0x4000
++#define AOP_IRQ_MASK_CLEAR	0x4004
++#define AOP_IRQ_MIRROR_SET	0xc00
++#define AOP_IRQ_MIRROR_CLEAR	0xc04
++#define AOP_IRQ_ALL		0x1111
++#define AOP_IRQ_BIT0		0x0001
++#define AOP_IRQ_BIT12		0x1000
++#define AOP_INBOX_CONTROL	0x4008
++#define AOP_INBOX_DATA		0x4010
++#define AOP_OUTBOX_CONTROL	0x4020
++#define AOP_OUTBOX_DATA		0x4038
++#define AOP_IDLE_STATUS		0x4040
++#define AOP_WRAPPER_SIZE	0x1c000
++#define AOP_MBOX_FULL		BIT(16)
++#define AOP_MBOX_EMPTY		BIT(17)
++#define AOP_MBOX_FAULTS		GENMASK(19, 18)
++#define AOP_OUTBOX_ENABLE	BIT(0)
++
++/* Firmware: linked at IOP 0x01000000, main image at region + 0. */
++#define AOP_IOP_LINK_BASE	0x01000000
++#define AOP_TAG(a, b, c, d)	A9_FW_TAG(a, b, c, d)
++#define AOP_TAG_RTSZ		A9_FW_TAG('R', 'T', 'S', 'Z')
++
++#define AOP_DOMAINS		5
++#define AOP_MAX_EPS		8
++#define AOP_MAX_SERVICES	16
++#define AOP_TRACE		512
++#define AOP_RXQ			256
++#define AOP_PACKET_MAX		4096
++#define AOP_DRAIN_BUDGET	64
++#define AOP_GETBUF_MAX		SZ_1M
++#define AOP_FW_WAIT_S		180
++#define AOP_HELLO_MS		5000
++#define AOP_EPMAP_MS		2000
++#define AOP_IOP_READY_MS	2000
++#define AOP_SERVICE_MS		5000
++#define AOP_REPLY_MS		2000
++#define AOP_REPORT_MS		3000
++#define AOP_STOP_MS		200
++#define AOP_PING_MS		1000
++#define AOP_PING_TIMEOUT_MS	5000
++#define AOP_ACCEL_SERVICE_ID	0x10000007
++#define AOP_RATE_US		100000
++#define AOP_KEY_REPORT		0x00
++#define AOP_KEY_BATCH		0x16
++#define AOP_KEY_RAW		0x5c
++#define AOP_KEY_AROT		0x18
++#define AOP_IRQ_STORM		1000
++
++static const char * const domain_names[AOP_DOMAINS] = {
++	"aop_gpio", "aop", "aop_busif", "aop_cpu", "aop_filter",
++};
++
++enum a9_aop_phase {
++	PHASE_IDLE,
++	PHASE_PROBE,
++	PHASE_WAIT_FIRMWARE,
++	PHASE_WAIT_HELLO,
++	PHASE_WAIT_EPMAP,
++	PHASE_WAIT_SERVICE,
++	PHASE_CONFIGURE,
++	PHASE_WAIT_REPORT,
++	PHASE_STREAMING,
++	PHASE_STOPPED,
++	PHASE_REFUSED,
++	PHASE_FAILED,
++};
++
++static const char * const phase_names[] = {
++	"idle", "probe", "wait-firmware", "wait-hello", "wait-epmap",
++	"wait-service", "configure", "wait-report", "streaming", "stopped",
++	"refused", "failed",
++};
++
++enum a9_afk_state {
++	AFK_OFF,	/* in EPMAP, not started */
++	AFK_WAIT_INIT,	/* STARTEP sent, waiting 0x80 */
++	AFK_INIT,	/* 0xa0 sent, collecting buffers/rings */
++	AFK_STARTING,	/* 0xa3 sent */
++	AFK_RUNNING,	/* 0x86 received */
++	AFK_STOPPING,	/* 0xa4 sent */
++	AFK_STOPPED,	/* 0x87/0xc3 received */
++	AFK_FAILED,
++};
++
++static const char * const afk_names[] = {
++	"off", "wait-init", "init", "starting", "running", "stopping",
++	"stopped", "failed",
++};
++
++enum { RING_TX, RING_RX, RING_HIST, RING_COUNT };
++static const char * const ring_names[RING_COUNT] = { "tx", "rx", "hist" };
++
++struct a9_aop_buffer {
++	u16 tag;
++	size_t size;
++	void *va;
++	dma_addr_t dma;
++};
++
++struct a9_aop_ep {
++	u8 num;
++	enum a9_afk_state state;
++	struct a9_aop_buffer bufs[A9_AFK_MAX_BUFFERS];
++	unsigned int nbufs;
++	struct a9_ring rings[RING_COUNT];
++	bool ring_valid[RING_COUNT];
++	u16 ring_tag[RING_COUNT];
++	u32 ring_offset[RING_COUNT];
++	u32 ring_size[RING_COUNT];
++	u8 *ring_seen[RING_COUNT];	/* kept for debugfs even if invalid */
++	u64 magic_unexpected;
++	u32 last_word;
++	u16 outer_seq;
++	u64 dropped_before_init, unknown, rx_packets, rx_errors, tx_packets;
++	int last_rx_error;
++};
++
++struct a9_aop_service {
++	u8 ep;
++	u32 channel;
++	struct a9_spu_service info;
++};
++
++struct a9_aop_trace {
++	u64 ns;
++	u64 word;
++	char dir;
++	int status;
++};
++
++struct a9_aop {
++	struct device *dev;
++	void __iomem *wrapper;
++	void __iomem *region;
++	void __iomem *autoboot;
++	resource_size_t region_pa;
++	resource_size_t region_size;
++	resource_size_t wrapper_pa;
++	u32 chip_id, chip_revision, runtime_size;
++	void *ext;
++	dma_addr_t ext_dma;
++	size_t ext_size;
++	struct device_node *domains[AOP_DOMAINS];
++	u32 aop_target;
++	int irq;
++
++	spinlock_t tx_lock;	/* inbox FIFO */
++	spinlock_t rx_lock;	/* outbox FIFO, rxq, trace */
++	DECLARE_KFIFO(rxq, u64, AOP_RXQ);
++	struct a9_aop_trace trace[AOP_TRACE];
++	u64 trace_total;
++	u64 irq_count, irq_empty, irq_empty_run, rx_words, tx_words;
++	u64 rxq_full, fault_word;
++	bool irq_enabled, irq_storm;
++	bool rx_halt;		/* refused: stop consuming the outbox */
++	bool rx_backlog;	/* rxq was full with words left in the FIFO */
++	bool irq_paused;	/* IRQ disabled until rx_work drained rxq */
++	u32 fault_control;
++
++	struct workqueue_struct *wq;
++	struct work_struct rx_work;
++	struct work_struct boot_work;
++	struct delayed_work poll_work;
++	struct delayed_work ping_work;
++	wait_queue_head_t wait;
++	bool stopping;
++	bool inline_rx;		/* shutdown: drain and dispatch synchronously */
++	unsigned int poll_ms;
++
++	struct mutex lock;	/* protocol state below */
++	enum a9_aop_phase phase;
++	const char *result;
++	int error;
++	bool cold;
++	u32 snapshot[5];
++	bool hello, epmap_done;
++	u16 hello_min, hello_max;
++	unsigned int epmap_chunks;
++	DECLARE_BITMAP(present, 256);
++	struct a9_aop_ep eps[AOP_MAX_EPS];
++	unsigned int neps;
++	u32 ping_seq;
++	u64 ping_sent_ns, ping_ack_ns;
++	u64 ping_acks;
++	u32 ap_power_ack;
++	bool ap_power_acked;
++	u32 iop_power;
++	bool iop_ready;
++	u64 system_words, unknown_mgmt, unknown_ep;
++	struct a9_aop_service services[AOP_MAX_SERVICES];
++	unsigned int nservices;
++	int accel;		/* index into services, or -1 */
++	u16 cmd_tag;
++	bool cmd_pending;
++	int cmd_status;
++	unsigned int cal_sent;
++	bool arot_sent, rate_set;
++	u64 reports, report_errors, channel_mismatch, trailing, malformed;
++	u64 truncated, doorbells, replies_seen;
++	u8 reply_category;
++	u16 reply_subtype, reply_tag;
++	u32 reply_size, reply_word;
++	struct a9_aop_motion motion;
++	u8 first_report[64];
++	u32 first_report_size;
++	bool have_first_report;
++	struct iio_dev *iio;
++	u8 rx_packet[AOP_PACKET_MAX];
++	u8 tx_packet[AOP_PACKET_MAX];
++	u8 *table;		/* patched firmware tag table, for debugfs */
++	size_t table_size;
++	struct dentry *debugfs;
++};
++
++static inline u32 aop_rd(struct a9_aop *aop, u32 offset)
++{
++	return readl(aop->wrapper + offset);
++}
++
++static inline void aop_wr(struct a9_aop *aop, u32 offset, u32 value)
++{
++	writel(value, aop->wrapper + offset);
++}
++
++static void a9_aop_trace(struct a9_aop *aop, char dir, u64 word, int status)
++{
++	struct a9_aop_trace *t;
++
++	lockdep_assert_held(&aop->rx_lock);
++	t = &aop->trace[aop->trace_total++ % AOP_TRACE];
++	t->ns = ktime_get_boottime_ns();
++	t->word = word;
++	t->dir = dir;
++	t->status = status;
++	if (apple_a9_aop_debug())
++		dev_dbg(aop->dev, "%c %016llx %d\n", dir, word, status);
++}
++
++/* Must be called with aop->lock held; first result wins. */
++static void a9_aop_finish(struct a9_aop *aop, enum a9_aop_phase phase,
++			  const char *result, int error)
++{
++	if (aop->phase == PHASE_REFUSED || aop->phase == PHASE_FAILED)
++		return;
++	aop->phase = phase;
++	aop->result = result;
++	aop->error = error;
++	if (phase == PHASE_REFUSED)
++		WRITE_ONCE(aop->rx_halt, true);
++	if (aop->iio)
++		a9_aop_accel_invalidate(aop->iio);
++	dev_warn(aop->dev, "%s: %s (%d)\n", phase_names[phase], result, error);
++	wake_up_all(&aop->wait);
++}
++
++#define a9_aop_fail(aop, result, error) \
++	a9_aop_finish(aop, PHASE_FAILED, result, error)
++#define a9_aop_refuse(aop, result) \
++	a9_aop_finish(aop, PHASE_REFUSED, result, -EBUSY)
++
++static bool a9_aop_dead(struct a9_aop *aop)
++{
++	return READ_ONCE(aop->phase) == PHASE_FAILED ||
++	       READ_ONCE(aop->phase) == PHASE_REFUSED ||
++	       READ_ONCE(aop->stopping);
++}
++
++/* ---- mailbox ---------------------------------------------------------- */
++
++static int a9_aop_send(struct a9_aop *aop, u8 ep, u64 payload)
++{
++	unsigned long flags;
++	u64 wire;
++	u32 control;
++	int ret;
++
++	ret = a9_aop_pack(ep, payload, &wire);
++	if (ret)
++		return ret;
++	spin_lock_irqsave(&aop->tx_lock, flags);
++	ret = readl_poll_timeout_atomic(aop->wrapper + AOP_INBOX_CONTROL, control,
++					!(control & AOP_MBOX_FULL) ||
++					(control & AOP_MBOX_FAULTS), 10, 20000);
++	if (!ret && (control & AOP_MBOX_FAULTS))
++		ret = -EIO;
++	if (!ret) {
++		/* writeq() orders prior ring writes before the doorbell. */
++		writeq(wire, aop->wrapper + AOP_INBOX_DATA);
++		aop->tx_words++;
++	}
++	spin_unlock_irqrestore(&aop->tx_lock, flags);
++	spin_lock_irqsave(&aop->rx_lock, flags);
++	a9_aop_trace(aop, 'T', wire, ret);
++	spin_unlock_irqrestore(&aop->rx_lock, flags);
++	return ret;
++}
++
++/* Reading the outbox data register consumes the word; bounded per call. */
++static unsigned int a9_aop_drain(struct a9_aop *aop)
++{
++	unsigned long flags;
++	unsigned int count = 0;
++	u32 control;
++	u64 wire;
++
++	if (READ_ONCE(aop->rx_halt))
++		return 0;
++	spin_lock_irqsave(&aop->rx_lock, flags);
++	while (count < AOP_DRAIN_BUDGET) {
++		control = aop_rd(aop, AOP_OUTBOX_CONTROL);
++		if (control & AOP_MBOX_FAULTS) {
++			aop->fault_control = control;
++			break;
++		}
++		if (control & AOP_MBOX_EMPTY)
++			break;
++		if (kfifo_is_full(&aop->rxq)) {
++			aop->rxq_full++;
++			aop->rx_backlog = true;
++			break;
++		}
++		wire = readq(aop->wrapper + AOP_OUTBOX_DATA);
++		kfifo_put(&aop->rxq, wire);
++		aop->rx_words++;
++		a9_aop_trace(aop, 'R', wire, 0);
++		count++;
++	}
++	spin_unlock_irqrestore(&aop->rx_lock, flags);
++	return count;
++}
++
++static irqreturn_t a9_aop_irq(int irq, void *data)
++{
++	struct a9_aop *aop = data;
++	unsigned int count;
++
++	aop->irq_count++;
++	if (READ_ONCE(aop->rx_halt)) {
++		disable_irq_nosync(irq);
++		aop->irq_enabled = false;
++		return IRQ_HANDLED;
++	}
++	count = a9_aop_drain(aop);
++	if (aop->fault_control) {
++		/* A faulted FIFO is never drained: stop the level line. */
++		disable_irq_nosync(irq);
++		aop->irq_enabled = false;
++		queue_work(aop->wq, &aop->rx_work);
++		return IRQ_HANDLED;
++	}
++	if (aop->rx_backlog) {
++		/* Words left in the FIFO: resume once rx_work emptied the queue. */
++		aop->rx_backlog = false;
++		aop->irq_paused = true;
++		disable_irq_nosync(irq);
++		queue_work(aop->wq, &aop->rx_work);
++		return IRQ_HANDLED;
++	}
++	if (count) {
++		aop->irq_empty_run = 0;
++		queue_work(aop->wq, &aop->rx_work);
++		return IRQ_HANDLED;
++	}
++	aop->irq_empty++;
++	/* Unknown level/ack semantics: never storm, fall back to polling. */
++	if (++aop->irq_empty_run > AOP_IRQ_STORM) {
++		disable_irq_nosync(irq);
++		aop->irq_storm = true;
++		aop->irq_enabled = false;
++	}
++	return IRQ_HANDLED;
++}
++
++static void a9_aop_poll_work(struct work_struct *work)
++{
++	struct a9_aop *aop = container_of(to_delayed_work(work), struct a9_aop,
++					  poll_work);
++
++	if (a9_aop_drain(aop) || aop->fault_control || aop->rx_backlog)
++		queue_work(aop->wq, &aop->rx_work);
++	aop->rx_backlog = false;
++	if (!READ_ONCE(aop->stopping) && !READ_ONCE(aop->rx_halt))
++		queue_delayed_work(aop->wq, &aop->poll_work,
++				   msecs_to_jiffies(aop->irq_storm ? 5 : aop->poll_ms));
++}
++
++/* ---- management ------------------------------------------------------- */
++
++static struct a9_aop_ep *a9_aop_find_ep(struct a9_aop *aop, u8 num)
++{
++	unsigned int i;
++
++	for (i = 0; i < aop->neps; i++)
++		if (aop->eps[i].num == num)
++			return &aop->eps[i];
++	return NULL;
++}
++
++static void a9_aop_mgmt(struct a9_aop *aop, u64 payload)
++{
++	struct a9_epmap map;
++	unsigned int i, num;
++	u64 reply;
++	int ret;
++
++	if (!aop->hello) {
++		/* The first word on a fresh boot must be the device HELLO. */
++		if (a9_mgmt_type(payload) != A9_MGMT_HELLO) {
++			if (aop->cold)
++				a9_aop_fail(aop, "failed-first-word-not-hello", -EPROTO);
++			else
++				a9_aop_refuse(aop, "refused-running-transcript-not-hello");
++			return;
++		}
++		ret = a9_aop_hello_reply(payload, &reply);
++		aop->hello_min = payload & 0xffff;
++		aop->hello_max = (payload >> 16) & 0xffff;
++		if (ret) {
++			a9_aop_fail(aop, "failed-hello-version", ret);
++			return;
++		}
++		ret = a9_aop_send(aop, 0, reply);
++		if (ret) {
++			a9_aop_fail(aop, "failed-hello-reply", ret);
++			return;
++		}
++		aop->hello = true;
++		aop->phase = PHASE_WAIT_EPMAP;
++		wake_up_all(&aop->wait);
++		return;
++	}
++
++	switch (a9_mgmt_type(payload)) {
++	case A9_MGMT_EPMAP:
++		if (aop->epmap_done) {
++			aop->unknown_mgmt++;
++			return;
++		}
++		a9_mgmt_epmap(payload, &map);
++		aop->epmap_chunks++;
++		for (i = 0; i < 32; i++) {
++			if (!(map.bitmap & BIT(i)))
++				continue;
++			num = map.base * 32 + i;
++			if (num > 255) {
++				a9_aop_fail(aop, "failed-epmap-endpoint-range", -ERANGE);
++				return;
++			}
++			set_bit(num, aop->present);
++			if (!a9_aop_system_endpoint(num) && aop->neps < AOP_MAX_EPS) {
++				aop->eps[aop->neps].num = num;
++				aop->eps[aop->neps].state = AFK_OFF;
++				aop->neps++;
++			}
++		}
++		ret = a9_aop_send(aop, 0, a9_mgmt_epmap_reply(&map));
++		if (ret) {
++			a9_aop_fail(aop, "failed-epmap-reply", ret);
++			return;
++		}
++		if (!map.last)
++			return;
++		aop->epmap_done = true;
++		/*
++		 * AP power after the last chunk [I]. System endpoints are not
++		 * started: their buffer-request formats are unresolved.
++		 */
++		ret = a9_aop_send(aop, 0, a9_mgmt_ap_power(true));
++		if (ret) {
++			a9_aop_fail(aop, "failed-ap-power", ret);
++			return;
++		}
++		aop->ping_ack_ns = ktime_get_boottime_ns();
++		queue_delayed_work(aop->wq, &aop->ping_work, 0);
++		wake_up_all(&aop->wait);
++		return;
++	case A9_MGMT_IOP_POWER_ACK:
++		/* Boot completion: the firmware reports power state 0x20. */
++		aop->iop_power = (u32)payload;
++		if ((payload & 0xff) == A9_MGMT_IOP_POWER_ON)
++			aop->iop_ready = true;
++		wake_up_all(&aop->wait);
++		return;
++	case A9_MGMT_PING_ACK:
++		if ((u32)payload == aop->ping_seq) {
++			aop->ping_ack_ns = ktime_get_boottime_ns();
++			aop->ping_acks++;
++		}
++		return;
++	case A9_MGMT_AP_POWER_ACK:
++		aop->ap_power_ack = (u32)payload;
++		aop->ap_power_acked = true;
++		return;
++	default:
++		aop->unknown_mgmt++;
++		return;
++	}
++}
++
++static void a9_aop_ping_work(struct work_struct *work)
++{
++	struct a9_aop *aop = container_of(to_delayed_work(work), struct a9_aop,
++					  ping_work);
++	u64 now = ktime_get_boottime_ns();
++
++	if (READ_ONCE(aop->stopping))
++		return;
++	mutex_lock(&aop->lock);
++	if (aop->phase != PHASE_FAILED && aop->ping_sent_ns &&
++	    now - aop->ping_ack_ns > (u64)AOP_PING_TIMEOUT_MS * NSEC_PER_MSEC)
++		a9_aop_fail(aop, "failed-ping-timeout", -ETIMEDOUT);
++	/* Keep pinging even after a failure: the firmware has a watchdog. */
++	aop->ping_seq++;
++	aop->ping_sent_ns = now;
++	a9_aop_send(aop, 0, a9_mgmt_ping(aop->ping_seq,
++					 (u16)div_u64(now, NSEC_PER_SEC)));
++	mutex_unlock(&aop->lock);
++	queue_delayed_work(aop->wq, &aop->ping_work,
++			   msecs_to_jiffies(AOP_PING_MS));
++}
++
++/* ---- AFK endpoint ------------------------------------------------------ */
++
++static void a9_aop_ep_fail(struct a9_aop *aop, struct a9_aop_ep *e,
++			   const char *why, int error)
++{
++	e->state = AFK_FAILED;
++	dev_warn(aop->dev, "endpoint %u: %s (%d)\n", e->num, why, error);
++	if (aop->accel >= 0 && aop->services[aop->accel].ep == e->num)
++		a9_aop_fail(aop, why, error);
++}
++
++static void a9_aop_getbuf(struct a9_aop *aop, struct a9_aop_ep *e, u64 payload)
++{
++	struct a9_aop_buffer *buf;
++	u64 reply;
++	size_t size;
++	u16 tag;
++	int ret;
++
++	ret = a9_afk_getbuf(payload, &tag, &size);
++	if (ret || size > AOP_GETBUF_MAX || e->nbufs >= A9_AFK_MAX_BUFFERS) {
++		a9_aop_ep_fail(aop, e, "failed-getbuf-request", ret ?: -E2BIG);
++		return;
++	}
++	buf = &e->bufs[e->nbufs];
++	buf->va = dma_alloc_coherent(aop->dev, size, &buf->dma, GFP_KERNEL);
++	if (!buf->va) {
++		a9_aop_ep_fail(aop, e, "failed-getbuf-alloc", -ENOMEM);
++		return;
++	}
++	buf->tag = tag;
++	buf->size = size;
++	/* No IOMMU on this device: the DMA address is the AP physical one. */
++	ret = a9_afk_getbuf_ack(buf->dma, &reply);
++	if (ret || buf->dma + size - 1 > A9_AOP_PA_MASK) {
++		dma_free_coherent(aop->dev, size, buf->va, buf->dma);
++		buf->va = NULL;
++		a9_aop_ep_fail(aop, e, "failed-getbuf-address", -ERANGE);
++		return;
++	}
++	e->nbufs++;
++	ret = a9_aop_send(aop, e->num, reply);
++	if (ret)
++		a9_aop_ep_fail(aop, e, "failed-getbuf-reply", ret);
++}
++
++static void a9_aop_ring_desc(struct a9_aop *aop, struct a9_aop_ep *e,
++			     unsigned int which, u64 payload)
++{
++	struct a9_aop_buffer *buf = NULL;
++	size_t offset, size;
++	unsigned int i;
++	u16 tag = payload & 0xffff;
++	int ret;
++
++	for (i = 0; i < e->nbufs; i++)
++		if (e->bufs[i].tag == tag)
++			buf = &e->bufs[i];
++	if (!buf || e->ring_valid[which]) {
++		a9_aop_ep_fail(aop, e, "failed-ring-descriptor-tag", -EPROTO);
++		return;
++	}
++	ret = a9_spu_queue_descriptor(payload, buf->size, &tag, &offset, &size);
++	if (!ret && (offset % A9_RING_BLOCK || size % A9_RING_BLOCK ||
++		     size < A9_RING_HEADER + A9_RING_BLOCK))
++		ret = -EINVAL;
++	if (ret) {
++		a9_aop_ep_fail(aop, e, "failed-ring-descriptor", ret);
++		return;
++	}
++	e->ring_tag[which] = tag;
++	e->ring_offset[which] = offset;
++	e->ring_size[which] = size;
++	e->ring_seen[which] = (u8 *)buf->va + offset;
++	/* The AOP wrote the header before announcing the ring. */
++	dma_rmb();
++	ret = a9_ring_attach(&e->rings[which], e->ring_seen[which], size);
++	if (ret) {
++		a9_aop_ep_fail(aop, e, "failed-ring-header", ret);
++		return;
++	}
++	e->ring_valid[which] = true;
++	if (e->state == AFK_INIT && e->ring_valid[RING_TX] &&
++	    e->ring_valid[RING_RX]) {
++		ret = a9_aop_send(aop, e->num, a9_afk_word(A9_AFK_START));
++		if (ret)
++			a9_aop_ep_fail(aop, e, "failed-afk-start", ret);
++		else
++			e->state = AFK_STARTING;
++	}
++}
++
++static void a9_aop_record_service(struct a9_aop *aop, struct a9_aop_ep *e,
++				  u32 channel,
++				  const struct a9_spu_subpacket *sub)
++{
++	struct a9_aop_service *svc;
++	unsigned int i;
++
++	if (aop->nservices >= AOP_MAX_SERVICES)
++		return;
++	svc = &aop->services[aop->nservices];
++	if (a9_spu_service(sub, &svc->info)) {
++		aop->malformed++;
++		return;
++	}
++	/* The channel offset is [I]: deduplicate by endpoint and name. */
++	for (i = 0; i < aop->nservices; i++)
++		if (aop->services[i].ep == e->num &&
++		    !strcmp(aop->services[i].info.name, svc->info.name))
++			return;
++	svc->ep = e->num;
++	svc->channel = channel;
++	if (strcmp(svc->info.name, "accel")) {
++		aop->nservices++;
++		return;
++	}
++	aop->nservices++;
++	if (aop->accel >= 0)
++		return;
++	/* Name is the key; the ADT service id is the consistency check. */
++	if (svc->info.service_id != AOP_ACCEL_SERVICE_ID) {
++		a9_aop_fail(aop, "failed-accel-service-id", -EPROTO);
++		return;
++	}
++	aop->accel = aop->nservices - 1;
++	wake_up_all(&aop->wait);
++}
++
++static void a9_aop_report(struct a9_aop *aop, struct a9_aop_ep *e, u32 channel,
++			  const struct a9_spu_subpacket *sub)
++{
++	struct a9_aop_service *svc;
++	int ret;
++
++	if (aop->accel < 0)
++		return;
++	svc = &aop->services[aop->accel];
++	if (svc->ep != e->num)
++		return;
++	/* 0xc2 is accel-only; count but tolerate an unexpected channel. */
++	if (channel != svc->channel)
++		aop->channel_mismatch++;
++	ret = a9_spu_motion(sub, &aop->motion);
++	if (ret) {
++		aop->report_errors++;
++		if (aop->iio)
++			a9_aop_accel_invalidate(aop->iio);
++		return;
++	}
++	aop->reports++;
++	if (!aop->have_first_report && aop->rate_set) {
++		aop->first_report_size = min_t(u32, sub->size,
++					       sizeof(aop->first_report));
++		memcpy(aop->first_report, sub->payload, aop->first_report_size);
++		aop->have_first_report = true;
++		wake_up_all(&aop->wait);
++	}
++	if (aop->iio && aop->phase == PHASE_STREAMING)
++		a9_aop_accel_report(aop->iio, sub);
++}
++
++static void a9_aop_epic(struct a9_aop *aop, struct a9_aop_ep *e, u32 channel,
++			const u8 *packet, size_t length)
++{
++	struct a9_spu_subpacket subs[8];
++	size_t cursor = A9_SPU_OUTER_SIZE;
++	unsigned int n = 0, i;
++	int ret;
++
++	/* Validate the whole walk before acting on any subpacket. */
++	while (n < ARRAY_SIZE(subs)) {
++		ret = a9_spu_next(packet, length, &cursor, &subs[n]);
++		if (ret <= 0)
++			break;
++		n++;
++	}
++	if (!n) {
++		aop->malformed++;
++		e->rx_errors++;
++		return;
++	}
++	if (ret < 0)
++		aop->trailing++;	/* bytes after the last valid subpacket */
++	e->rx_packets++;
++	for (i = 0; i < n; i++) {
++		struct a9_spu_subpacket *sub = &subs[i];
++
++		if (sub->category < A9_SPU_NOTIFY && sub->subtype == 0xc0) {
++			a9_aop_record_service(aop, e, channel, sub);
++		} else if (sub->category < A9_SPU_NOTIFY &&
++			   sub->subtype == A9_SPU_ACCEL_REPORT) {
++			a9_aop_report(aop, e, channel, sub);
++		}
++		if (aop->cmd_tag && sub->tag == aop->cmd_tag && aop->accel >= 0 &&
++		    aop->services[aop->accel].ep == e->num &&
++		    sub->subtype != A9_SPU_ACCEL_REPORT && sub->subtype != 0xc0) {
++			/* Whatever answers our tag, for failed-configure diagnosis. */
++			aop->reply_category = sub->category;
++			aop->reply_subtype = sub->subtype;
++			aop->reply_tag = sub->tag;
++			aop->reply_size = sub->size;
++			aop->reply_word = sub->size >= 4 ?
++				get_unaligned_le32(sub->payload) : 0;
++			aop->replies_seen++;
++		}
++		if (sub->category == A9_SPU_REPLY && aop->cmd_pending &&
++		    aop->accel >= 0 && aop->services[aop->accel].ep == e->num &&
++		    sub->tag == aop->cmd_tag) {
++			aop->cmd_status = a9_spu_property_reply(sub, aop->cmd_tag);
++			aop->cmd_pending = false;
++			wake_up_all(&aop->wait);
++		}
++	}
++}
++
++static void a9_aop_rx_ring(struct a9_aop *aop, struct a9_aop_ep *e)
++{
++	struct a9_ring *ring = &e->rings[RING_RX];
++	struct a9_ring_entry entry;
++	unsigned int budget;
++	u32 wptr, next;
++	int ret;
++
++	if (!e->ring_valid[RING_RX])
++		return;
++	for (budget = 0; budget < 64; budget++) {
++		wptr = a9_ring_wptr(ring);
++		/* Entry contents only after the wptr that published them. */
++		dma_rmb();
++		ret = a9_ring_read(ring, wptr, aop->rx_packet,
++				   sizeof(aop->rx_packet), &entry, &next);
++		if (ret == -EAGAIN)
++			break;
++		if (ret) {
++			/* Drop to wptr; never reread a malformed entry. */
++			e->rx_errors++;
++			e->last_rx_error = ret;
++			if (!a9_ring_index_ok(ring, wptr))
++				break;
++			next = wptr;
++		} else {
++			/* iOS does not check the magic; only count surprises. */
++			if (entry.magic != A9_RING_MAGIC_AOP &&
++			    entry.magic != A9_RING_MAGIC_IOP)
++				e->magic_unexpected++;
++			e->last_word = entry.word;
++			if (entry.length > sizeof(aop->rx_packet))
++				aop->truncated++;
++			a9_aop_epic(aop, e, entry.channel, aop->rx_packet,
++				    min_t(size_t, entry.length,
++					  sizeof(aop->rx_packet)));
++		}
++		ring->cursor = next;
++		/* Finish reading the entry before releasing it to the AOP. */
++		dma_mb();
++		a9_ring_set_rptr(ring, next);
++		if (ret)
++			break;
++	}
++}
++
++static void a9_aop_afk(struct a9_aop *aop, struct a9_aop_ep *e, u64 payload)
++{
++	u8 type = a9_afk_type(payload);
++	int ret;
++
++	if (e->state == AFK_FAILED || e->state == AFK_OFF) {
++		e->unknown++;
++		return;
++	}
++	if (e->state == AFK_WAIT_INIT) {
++		/* iOS drops everything until the device's 0x80 arrives. */
++		if (type != A9_AFK_INIT) {
++			e->dropped_before_init++;
++			return;
++		}
++		if ((payload & A9_AOP_PA_MASK) != A9_AFK_VERSION) {
++			a9_aop_ep_fail(aop, e, "failed-afk-version", -EPROTONOSUPPORT);
++			return;
++		}
++		ret = a9_aop_send(aop, e->num, a9_afk_word(A9_AFK_INIT_ACK));
++		if (ret)
++			a9_aop_ep_fail(aop, e, "failed-afk-init-ack", ret);
++		else
++			e->state = AFK_INIT;
++		return;
++	}
++	switch (type) {
++	case A9_AFK_GETBUF:
++		a9_aop_getbuf(aop, e, payload);
++		return;
++	case A9_AFK_TX_DESC:
++		a9_aop_ring_desc(aop, e, RING_TX, payload);
++		return;
++	case A9_AFK_RX_DESC:
++		a9_aop_ring_desc(aop, e, RING_RX, payload);
++		return;
++	case A9_AFK_HIST_DESC:
++		/* Created when offered, never enabled for rotation. */
++		a9_aop_ring_desc(aop, e, RING_HIST, payload);
++		return;
++	case A9_AFK_START_ACK:
++		e->state = AFK_RUNNING;
++		wake_up_all(&aop->wait);
++		a9_aop_rx_ring(aop, e);
++		return;
++	case A9_AFK_RX_NOTIFY:
++		a9_aop_rx_ring(aop, e);
++		return;
++	case A9_AFK_SHUTDOWN_ACK:
++	case A9_AFK_HIBERNATE_ACK:
++		e->state = AFK_STOPPED;
++		wake_up_all(&aop->wait);
++		return;
++	case A9_AFK_INIT:
++		a9_aop_ep_fail(aop, e, "failed-afk-reinit", -EPROTO);
++		return;
++	default:
++		e->unknown++;
++		return;
++	}
++}
++
++static void a9_aop_dispatch(struct a9_aop *aop, u64 wire)
++{
++	u8 ep = a9_aop_endpoint(wire);
++	u64 payload = a9_aop_payload(wire);
++	struct a9_aop_ep *e;
++
++	lockdep_assert_held(&aop->lock);
++	if (aop->phase == PHASE_REFUSED)
++		return;
++	if (ep == 0) {
++		a9_aop_mgmt(aop, payload);
++		return;
++	}
++	if (!aop->hello) {
++		if (aop->cold)
++			a9_aop_fail(aop, "failed-first-word-not-hello", -EPROTO);
++		else
++			a9_aop_refuse(aop, "refused-running-transcript-not-hello");
++		return;
++	}
++	if (a9_aop_system_endpoint(ep)) {
++		/* System endpoints are not started; record, never answer. */
++		aop->system_words++;
++		return;
++	}
++	e = a9_aop_find_ep(aop, ep);
++	if (!e) {
++		aop->unknown_ep++;
++		return;
++	}
++	a9_aop_afk(aop, e, payload);
++}
++
++static void a9_aop_process(struct a9_aop *aop)
++{
++	u64 wire;
++
++	lockdep_assert_held(&aop->lock);
++	if (aop->fault_control && aop->phase != PHASE_FAILED &&
++	    aop->phase != PHASE_REFUSED) {
++		/* Faults are reported, never acknowledged or cleared. */
++		a9_aop_fail(aop, "failed-mailbox-fault", -EIO);
++	}
++	while (kfifo_out_spinlocked(&aop->rxq, &wire, 1, &aop->rx_lock))
++		a9_aop_dispatch(aop, wire);
++}
++
++static void a9_aop_rx_work(struct work_struct *work)
++{
++	struct a9_aop *aop = container_of(work, struct a9_aop, rx_work);
++
++	mutex_lock(&aop->lock);
++	a9_aop_process(aop);
++	mutex_unlock(&aop->lock);
++	wake_up_all(&aop->wait);
++	if (READ_ONCE(aop->irq_paused)) {
++		WRITE_ONCE(aop->irq_paused, false);
++		enable_irq(aop->irq);
++	}
++}
++
++/* Shutdown path: no workqueue, drain and dispatch in the caller. */
++static void a9_aop_inline_rx(struct a9_aop *aop)
++{
++	a9_aop_drain(aop);
++	mutex_lock(&aop->lock);
++	a9_aop_process(aop);
++	mutex_unlock(&aop->lock);
++}
++
++/* Waits without holding aop->lock; @cond is re-evaluated after wakeups. */
++#define a9_aop_wait(aop, cond, ms) ({					\
++	unsigned long __end = jiffies + msecs_to_jiffies(ms);		\
++	if ((aop)->inline_rx) {						\
++		while (!(cond) && time_before(jiffies, __end)) {	\
++			a9_aop_inline_rx(aop);				\
++			usleep_range(500, 1000);			\
++		}							\
++	} else {							\
++		wait_event_timeout((aop)->wait, (cond) ||		\
++				   a9_aop_dead(aop),			\
++				   msecs_to_jiffies(ms));		\
++	}								\
++	(cond);								\
++})
++
++/* ---- EPIC commands ------------------------------------------------------ */
++
++/* Called with aop->lock held; queues one notify on the accel channel. */
++static int a9_aop_queue_property(struct a9_aop *aop, u32 key, const u8 *value,
++				 u32 size)
++{
++	struct a9_aop_service *svc = &aop->services[aop->accel];
++	struct a9_aop_ep *e = a9_aop_find_ep(aop, svc->ep);
++	struct a9_ring *ring;
++	u32 rptr, wptr, next;
++	int length, ret;
++
++	if (!e || e->state != AFK_RUNNING || !e->ring_valid[RING_TX])
++		return -ENOTCONN;
++	ring = &e->rings[RING_TX];
++	if (!++aop->cmd_tag)
++		aop->cmd_tag = 1;
++	length = a9_epic_property(aop->tx_packet, sizeof(aop->tx_packet),
++				  e->outer_seq++, aop->cmd_tag, key, value, size);
++	if (length < 0)
++		return length;
++	/* Writer reads both pointers from the shared header (bab540). */
++	rptr = a9_ring_rptr(ring);
++	wptr = a9_ring_wptr(ring);
++	/* Observe the reader's progress before reusing its space. */
++	dma_mb();
++	ret = a9_ring_write(ring, rptr, wptr, svc->channel, 0, aop->tx_packet,
++			    length, &next);
++	if (ret)
++		return ret;
++	aop->cmd_pending = true;
++	aop->cmd_status = -ETIMEDOUT;
++	/* Entry before wptr, wptr before the rptr re-read. */
++	dma_wmb();
++	a9_ring_set_wptr(ring, next);
++	dma_mb();
++	e->tx_packets++;
++	/* iOS rings 0xa2 only when the AOP had drained the ring. */
++	if (a9_ring_rptr(ring) != wptr)
++		return 0;
++	aop->doorbells++;
++	ret = a9_aop_send(aop, e->num, a9_afk_word(A9_AFK_DOORBELL));
++	if (ret)
++		aop->cmd_pending = false;
++	return ret;
++}
++
++static int a9_aop_property(struct a9_aop *aop, u32 key, const u8 *value,
++			   u32 size)
++{
++	int ret;
++
++	mutex_lock(&aop->lock);
++	ret = aop->accel >= 0 ? a9_aop_queue_property(aop, key, value, size) :
++				-ENODEV;
++	mutex_unlock(&aop->lock);
++	if (ret)
++		return ret;
++	if (!a9_aop_wait(aop, !READ_ONCE(aop->cmd_pending), AOP_REPLY_MS)) {
++		mutex_lock(&aop->lock);
++		aop->cmd_pending = false;
++		mutex_unlock(&aop->lock);
++		return -ETIMEDOUT;
++	}
++	return READ_ONCE(aop->cmd_status);
++}
++
++static int a9_aop_property32(struct a9_aop *aop, u32 key, u32 value)
++{
++	u8 bytes[4];
++
++	put_unaligned_le32(value, bytes);
++	return a9_aop_property(aop, key, bytes, sizeof(bytes));
++}
++
++/* Batch 0x16, raw 0x5c, report 0 (fffffff005b99ef0); stop on any error. */
++static int a9_aop_set_rate(struct a9_aop *aop, u32 batch, u32 raw, u32 report)
++{
++	int ret;
++
++	ret = a9_aop_property32(aop, AOP_KEY_BATCH, batch);
++	if (!ret)
++		ret = a9_aop_property32(aop, AOP_KEY_RAW, raw);
++	if (!ret)
++		ret = a9_aop_property32(aop, AOP_KEY_REPORT, report);
++	return ret;
++}
++
++/* Optional per-device file; absent blobs are skipped, never zero-filled. */
++static int a9_aop_send_calibration(struct a9_aop *aop)
++{
++	struct a9_cal_entry entries[ARRAY_SIZE(a9_cal_order)];
++	const struct firmware *fw;
++	int count, i, ret;
++
++	ret = request_firmware_direct(&fw, AOP_CAL_FW, aop->dev);
++	if (ret) {
++		dev_warn(aop->dev, "no %s (%d): streaming without factory calibration\n",
++			 AOP_CAL_FW, ret);
++		return 0;
++	}
++	count = a9_cal_parse(fw->data, fw->size, entries, ARRAY_SIZE(entries));
++	if (count < 0) {
++		release_firmware(fw);
++		return count;
++	}
++	for (i = 0; i < count; i++) {
++		ret = a9_aop_property(aop, entries[i].key, entries[i].data,
++				      entries[i].length);
++		if (ret) {
++			dev_err(aop->dev, "calibration key 0x%x: %d\n",
++				entries[i].key, ret);
++			break;
++		}
++		mutex_lock(&aop->lock);
++		aop->cal_sent++;
++		if (entries[i].key == AOP_KEY_AROT)
++			aop->arot_sent = true;
++		mutex_unlock(&aop->lock);
++	}
++	release_firmware(fw);
++	return ret;
++}
++
++/* ---- firmware load and CPU start --------------------------------------- */
++
++struct a9_aop_regs {
++	struct a9_aop *aop;
++	u32 values[5];
++};
++
++static void a9_aop_read_regs(void *data)
++{
++	struct a9_aop_regs *regs = data;
++	static const u32 offsets[5] = {
++		AOP_CPU_CONTROL, AOP_CPU_STATUS, AOP_INBOX_CONTROL,
++		AOP_OUTBOX_CONTROL, AOP_IDLE_STATUS,
++	};
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(offsets); i++)
++		regs->values[i] = aop_rd(regs->aop, offsets[i]);
++}
++
++static int a9_aop_wait_firmware(struct a9_aop *aop, const char *name,
++				const struct firmware **fw)
++{
++	unsigned int i;
++	int ret;
++
++	/* Built in: /lib/firmware appears only after the root switch. */
++	for (i = 0; i < AOP_FW_WAIT_S; i++) {
++		ret = request_firmware_direct(fw, name, aop->dev);
++		if (ret != -ENOENT)
++			return ret;
++		if (wait_event_timeout(aop->wait, READ_ONCE(aop->stopping), HZ))
++			return -ESHUTDOWN;
++	}
++	return -ENOENT;
++}
++
++struct a9_aop_patch {
++	u32 tag;
++	const void *data;
++	u32 size;
++	bool required;
++};
++
++/*
++ * Validate the image and its tag table and build the patched copy with the
++ * tags iOS writes on a cold j71t load (AppleSPU table, RTBuddy b70290 and
++ * the segment loop b88238): AOPt, nCal, EC0p, WrAd, McRA, SOC_, SOCR, DEVf,
++ * STKG, PRNG and RTTO. NONC/ECID are written by iOS only when /chosen
++ * unique-chip-id is readable; Linux has none, so they keep their defaults,
++ * as does every other tag. The ext segment stays in DRAM (EC0p = its PA).
++ */
++static int a9_aop_prepare_image(struct a9_aop *aop, const struct firmware *fw,
++				u64 ext_pa, u8 **image)
++{
++	const struct a9_aop_patch *patch;
++	u8 stack_guard[4], prng[32], zero8 = 0, ncal = 0;
++	__le64 ext = cpu_to_le64(ext_pa), wrapper = cpu_to_le64(aop->wrapper_pa);
++	__le64 rtto = 0;
++	__le32 target = cpu_to_le32(aop->aop_target), mcra = cpu_to_le32(SZ_16K);
++	__le32 soc = cpu_to_le32(aop->chip_id), socr = cpu_to_le32(aop->chip_revision);
++	size_t table, length, value;
++	u32 value_size, runtime_size;
++	unsigned int i;
++	u8 *copy;
++	int ret;
++
++	ret = a9_fw_table(fw->data, fw->size, &table, &length);
++	if (ret)
++		return ret;
++	ret = a9_fw_tag(fw->data, table, length, AOP_TAG_RTSZ, &value, &value_size);
++	if (ret || value_size != 4)
++		return ret ?: -EPROTO;
++	/* b6f340: max(image, RTSZ) must fit the target; only the image is copied. */
++	runtime_size = get_unaligned_le32(fw->data + value);
++	if (max_t(size_t, fw->size, runtime_size) > aop->region_size)
++		return -EFBIG;
++	aop->runtime_size = runtime_size;
++
++	get_random_bytes(stack_guard, sizeof(stack_guard));
++	stack_guard[get_random_u32_below(sizeof(stack_guard))] = 0;
++	get_random_bytes(prng, sizeof(prng));
++	{
++		const struct a9_aop_patch patches[] = {
++			{ AOP_TAG('A', 'O', 'P', 't'), &target, 4, true },
++			{ AOP_TAG('n', 'C', 'a', 'l'), &ncal, 1, false },
++			{ AOP_TAG('E', 'C', '0', 'p'), &ext, 8, true },
++			{ AOP_TAG('W', 'r', 'A', 'd'), &wrapper, 8, false },
++			{ AOP_TAG('M', 'c', 'R', 'A'), &mcra, 4, false },
++			{ AOP_TAG('S', 'O', 'C', '_'), &soc, 4, false },
++			{ AOP_TAG('S', 'O', 'C', 'R'), &socr, 4, false },
++			{ AOP_TAG('D', 'E', 'V', 'f'), &zero8, 1, false },
++			{ AOP_TAG('S', 'T', 'K', 'G'), stack_guard, 4, false },
++			{ AOP_TAG('P', 'R', 'N', 'G'), prng, 32, false },
++			{ AOP_TAG('R', 'T', 'T', 'O'), &rtto, 8, false },
++		};
++
++		copy = vmalloc(fw->size);
++		if (!copy)
++			return -ENOMEM;
++		memcpy(copy, fw->data, fw->size);
++		for (i = 0; i < ARRAY_SIZE(patches); i++) {
++			patch = &patches[i];
++			ret = a9_fw_patch(copy, table, length, patch->tag,
++					  patch->data, patch->size);
++			/* iOS: a missing tag is a no-op, a wrong length fatal. */
++			if (ret == -ENOENT && !patch->required)
++				ret = 0;
++			if (ret)
++				break;
++		}
++	}
++	memzero_explicit(prng, sizeof(prng));
++	if (ret) {
++		vfree(copy);
++		return ret;
++	}
++	aop->table = devm_kmemdup(aop->dev, copy + table, length, GFP_KERNEL);
++	aop->table_size = aop->table ? length : 0;
++	*image = copy;
++	return 0;
++}
++
++static int a9_aop_copy_verify(void __iomem *dst, const u8 *src, size_t size)
++{
++	u8 chunk[256];
++	size_t done, n;
++
++	memcpy_toio(dst, src, size);
++	for (done = 0; done < size; done += n) {
++		n = min(size - done, sizeof(chunk));
++		memcpy_fromio(chunk, dst + done, n);
++		if (memcmp(chunk, src + done, n))
++			return -EIO;
++	}
++	return 0;
++}
++
++static int a9_aop_cold_start(struct a9_aop *aop)
++{
++	struct apple_pmgr_observation states[AOP_DOMAINS] = {};
++	struct a9_aop_regs regs = { .aop = aop };
++	const struct firmware *fw = NULL, *ext = NULL;
++	u64 pa = aop->region_pa;
++	u8 *image = NULL;
++	u32 control;
++	int ret;
++
++	mutex_lock(&aop->lock);
++	aop->phase = PHASE_WAIT_FIRMWARE;
++	mutex_unlock(&aop->lock);
++	ret = a9_aop_wait_firmware(aop, AOP_MAIN_FW, &fw);
++	if (!ret)
++		ret = request_firmware_direct(&ext, AOP_EXT_FW, aop->dev);
++	if (ret)
++		goto out;
++
++	/* b88090: the ext segment lives in its own page-aligned DRAM buffer. */
++	aop->ext_size = ext->size;
++	aop->ext = dmam_alloc_coherent(aop->dev, PAGE_ALIGN(ext->size),
++				       &aop->ext_dma, GFP_KERNEL);
++	if (!aop->ext) {
++		ret = -ENOMEM;
++		goto out;
++	}
++	if (aop->ext_dma + PAGE_ALIGN(ext->size) - 1 > A9_AOP_PA_MASK) {
++		ret = -ERANGE;
++		goto out;
++	}
++	memcpy(aop->ext, ext->data, ext->size);
++	ret = a9_aop_prepare_image(aop, fw, aop->ext_dma, &image);
++	if (ret)
++		goto out;
++	/* The firmware wait can be long: re-check before any write. */
++	ret = apple_pmgr_observe(aop->domains, AOP_DOMAINS, states,
++				 a9_aop_read_regs, &regs);
++	if (!ret && ((regs.values[1] & AOP_CPU_RUNNING) ||
++		     !(regs.values[3] & AOP_MBOX_EMPTY) ||
++		     ((regs.values[2] | regs.values[3]) & AOP_MBOX_FAULTS)))
++		ret = -EBUSY;
++	if (ret)
++		goto out;
++
++	/* b6f340 + b6f9b4: image (with patched tags) at region + 0, no BSS clear. */
++	wmb();	/* ext buffer contents before the AOP can be released */
++	ret = a9_aop_copy_verify(aop->region, image, fw->size);
++	if (ret)
++		goto out;
++
++	/* Remap (fffffff005b4e72c): IOP 0 -> region, length = region size. */
++	aop_wr(aop, AOP_REMAP_IOP_LO, 0);
++	aop_wr(aop, AOP_REMAP_IOP_HI, 0);
++	aop_wr(aop, AOP_REMAP_SIZE, aop->region_size & ~0xfffU);
++	aop_wr(aop, AOP_REMAP_RESERVED, 0);
++	aop_wr(aop, AOP_REMAP_PA_LO, lower_32_bits(pa));
++	aop_wr(aop, AOP_REMAP_PA_HI, upper_32_bits(pa));
++	aop_wr(aop, AOP_REMAP_ENABLE, 1);
++
++	/*
++	 * Mailbox masks as AppleA7IOP start (fffffff005b4b738): mask all, then
++	 * unmask bit 0 and bit 12 (+0x4000 sets, +0x4004 clears [I]), outbox
++	 * enable. Never toggled at runtime.
++	 */
++	aop_wr(aop, AOP_IRQ_MASK_SET, AOP_IRQ_ALL);
++	aop_wr(aop, AOP_IRQ_MIRROR_SET, AOP_IRQ_ALL);
++	aop_wr(aop, AOP_IRQ_MASK_CLEAR, AOP_IRQ_BIT0);
++	aop_wr(aop, AOP_IRQ_MIRROR_CLEAR, AOP_IRQ_BIT0);
++	aop_wr(aop, AOP_IRQ_MASK_CLEAR, AOP_IRQ_BIT12);
++	aop_wr(aop, AOP_IRQ_MIRROR_CLEAR, AOP_IRQ_BIT12);
++	aop->irq_enabled = true;
++	enable_irq(aop->irq);
++	control = aop_rd(aop, AOP_OUTBOX_CONTROL);
++	aop_wr(aop, AOP_OUTBOX_CONTROL, control | AOP_OUTBOX_ENABLE);
++
++	/* Release (b4e7c8): CPU control bit 4, then auto-boot = 1. No polling. */
++	mutex_lock(&aop->lock);
++	aop->phase = PHASE_WAIT_HELLO;
++	mutex_unlock(&aop->lock);
++	control = aop_rd(aop, AOP_CPU_CONTROL);
++	aop_wr(aop, AOP_CPU_CONTROL, control | AOP_CPU_START);
++	writel(1, aop->autoboot);
++	dev_info(aop->dev, "AOP released: image %zu B (RTSZ 0x%x) at %pa, ext %zu B at %pad\n",
++		 fw->size, aop->runtime_size, &aop->region_pa, ext->size,
++		 &aop->ext_dma);
++out:
++	vfree(image);
++	release_firmware(ext);
++	release_firmware(fw);
++	return ret;
++}
++
++/* ---- bring-up ------------------------------------------------------------ */
++
++static void a9_aop_boot_work(struct work_struct *work)
++{
++	struct a9_aop *aop = container_of(work, struct a9_aop, boot_work);
++	struct apple_pmgr_observation states[AOP_DOMAINS] = {};
++	struct a9_aop_regs regs = { .aop = aop };
++	struct a9_aop_accel_config config = {};
++	struct a9_spu_subpacket first = {};
++	struct iio_dev *iio;
++	unsigned int tries, i;
++	bool running, empty;
++	int ret;
++
++	/* PMGR providers are not fw_devlink suppliers of this node. */
++	for (tries = 0; tries < 100; tries++) {
++		ret = apple_pmgr_observe(aop->domains, AOP_DOMAINS, states,
++					 a9_aop_read_regs, &regs);
++		if (ret != -EPROBE_DEFER)
++			break;
++		msleep(100);
++	}
++	mutex_lock(&aop->lock);
++	memcpy(aop->snapshot, regs.values, sizeof(aop->snapshot));
++	if (ret) {
++		/* Never force a domain on. */
++		a9_aop_finish(aop, PHASE_REFUSED, "refused-domain-state", ret);
++		mutex_unlock(&aop->lock);
++		return;
++	}
++	if ((regs.values[2] | regs.values[3]) & AOP_MBOX_FAULTS) {
++		a9_aop_refuse(aop, "refused-mailbox-fault");
++		mutex_unlock(&aop->lock);
++		return;
++	}
++	running = regs.values[1] & AOP_CPU_RUNNING;
++	empty = regs.values[3] & AOP_MBOX_EMPTY;
++	if (running && empty) {
++		/* Owned by a previous AP; no takeover message exists. */
++		a9_aop_refuse(aop, "refused-running-no-pending-hello");
++		mutex_unlock(&aop->lock);
++		return;
++	}
++	if (!running && !empty) {
++		a9_aop_refuse(aop, "refused-stopped-outbox-not-empty");
++		mutex_unlock(&aop->lock);
++		return;
++	}
++	aop->cold = !running;
++	mutex_unlock(&aop->lock);
++
++	if (aop->cold) {
++		ret = a9_aop_cold_start(aop);
++		if (ret) {
++			mutex_lock(&aop->lock);
++			a9_aop_fail(aop, "failed-cold-load", ret);
++			mutex_unlock(&aop->lock);
++			return;
++		}
++	} else {
++		/* Warm first attach: the pending transcript must start with HELLO. */
++		mutex_lock(&aop->lock);
++		aop->phase = PHASE_WAIT_HELLO;
++		mutex_unlock(&aop->lock);
++		aop->irq_enabled = true;
++		enable_irq(aop->irq);
++	}
++	queue_delayed_work(aop->wq, &aop->poll_work, 0);
++
++	if (!a9_aop_wait(aop, READ_ONCE(aop->hello), AOP_HELLO_MS)) {
++		mutex_lock(&aop->lock);
++		a9_aop_fail(aop, "failed-no-hello", -ETIMEDOUT);
++		mutex_unlock(&aop->lock);
++		return;
++	}
++	if (!a9_aop_wait(aop, READ_ONCE(aop->epmap_done), AOP_EPMAP_MS)) {
++		mutex_lock(&aop->lock);
++		a9_aop_fail(aop, "failed-no-epmap", -ETIMEDOUT);
++		mutex_unlock(&aop->lock);
++		return;
++	}
++	/* iOS waits for power state 0x20; continue without it, but record it. */
++	if (!a9_aop_wait(aop, READ_ONCE(aop->iop_ready), AOP_IOP_READY_MS))
++		dev_warn(aop->dev, "no IOP power state 0x20 (last 0x%x); starting endpoints anyway\n",
++			 READ_ONCE(aop->iop_power));
++	ret = 0;
++	mutex_lock(&aop->lock);
++	for (i = 0; !ret && i < aop->neps; i++) {
++		ret = a9_aop_send(aop, 0, a9_mgmt_startep(aop->eps[i].num));
++		aop->eps[i].state = AFK_WAIT_INIT;
++	}
++	if (ret)
++		a9_aop_fail(aop, "failed-startep", ret);
++	else if (!aop->neps)
++		a9_aop_fail(aop, "failed-no-app-endpoint", -ENODEV);
++	else if (aop->phase == PHASE_WAIT_EPMAP)
++		aop->phase = PHASE_WAIT_SERVICE;
++	mutex_unlock(&aop->lock);
++	if (a9_aop_dead(aop))
++		return;
++	if (!a9_aop_wait(aop, READ_ONCE(aop->accel) >= 0, AOP_SERVICE_MS)) {
++		mutex_lock(&aop->lock);
++		a9_aop_fail(aop, "failed-no-accel-service", -ETIMEDOUT);
++		mutex_unlock(&aop->lock);
++		return;
++	}
++	mutex_lock(&aop->lock);
++	aop->phase = PHASE_CONFIGURE;
++	aop->poll_ms = 100;
++	mutex_unlock(&aop->lock);
++
++	ret = a9_aop_send_calibration(aop);
++	if (!ret) {
++		mutex_lock(&aop->lock);
++		aop->rate_set = true;	/* first report after this point */
++		aop->phase = PHASE_WAIT_REPORT;
++		mutex_unlock(&aop->lock);
++		ret = a9_aop_set_rate(aop, AOP_RATE_US, 0, AOP_RATE_US);
++	}
++	if (ret) {
++		mutex_lock(&aop->lock);
++		a9_aop_fail(aop, "failed-configure", ret);
++		mutex_unlock(&aop->lock);
++		return;
++	}
++	if (!a9_aop_wait(aop, READ_ONCE(aop->have_first_report), AOP_REPORT_MS)) {
++		mutex_lock(&aop->lock);
++		a9_aop_fail(aop, "failed-no-report", -ETIMEDOUT);
++		mutex_unlock(&aop->lock);
++		return;
++	}
++
++	mutex_lock(&aop->lock);
++	first.category = 0;
++	first.subtype = A9_SPU_ACCEL_REPORT;
++	first.payload = aop->first_report;
++	first.size = aop->first_report_size;
++	config.report_interval_us = AOP_RATE_US;
++	config.first_report = &first;
++	config.firmware_applied_arot = aop->arot_sent;
++	mutex_unlock(&aop->lock);
++	iio = a9_aop_accel_register(aop->dev, &config);
++	mutex_lock(&aop->lock);
++	if (IS_ERR(iio)) {
++		a9_aop_fail(aop, "failed-iio-register", PTR_ERR(iio));
++	} else if (aop->phase == PHASE_WAIT_REPORT) {
++		aop->iio = iio;
++		aop->phase = PHASE_STREAMING;
++		aop->result = "streaming";
++		dev_info(aop->dev, "accelerometer streaming at %u us, calibration blobs %u%s\n",
++			 AOP_RATE_US, aop->cal_sent,
++			 aop->arot_sent ? " (ARot applied in firmware)" : "");
++	} else {
++		a9_aop_accel_invalidate(iio);
++	}
++	mutex_unlock(&aop->lock);
++}
++
++/* ---- debugfs ------------------------------------------------------------- */
++
++static int a9_aop_state_show(struct seq_file *s, void *unused)
++{
++	struct a9_aop *aop = s->private;
++	unsigned int i, j;
++
++	mutex_lock(&aop->lock);
++	seq_printf(s, "format=1 phase=%s result=%s errno=%d path=%s\n",
++		   phase_names[aop->phase], aop->result ?: "none", aop->error,
++		   aop->phase <= PHASE_PROBE ? "undecided" : aop->cold ? "cold" : "warm");
++	seq_printf(s, "snapshot cpu_control=0x%08x cpu_status=0x%08x inbox=0x%08x outbox=0x%08x idle=0x%08x\n",
++		   aop->snapshot[0], aop->snapshot[1], aop->snapshot[2],
++		   aop->snapshot[3], aop->snapshot[4]);
++	seq_printf(s, "region pa=0x%llx size=0x%llx aop_target=%u\n",
++		   (unsigned long long)aop->region_pa,
++		   (unsigned long long)aop->region_size, aop->aop_target);
++	seq_printf(s, "mailbox rx_words=%llu tx_words=%llu irqs=%llu irq_empty=%llu irq_enabled=%d irq_storm=%d rxq_full=%llu fault_control=0x%08x\n",
++		   aop->rx_words, aop->tx_words, aop->irq_count, aop->irq_empty,
++		   aop->irq_enabled, aop->irq_storm, aop->rxq_full,
++		   aop->fault_control);
++	seq_printf(s, "mgmt hello=%d min=%u max=%u epmap_done=%d chunks=%u ap_power_ack=%d:0x%x iop_power=0x%x iop_ready=%d ping_seq=%u ping_acks=%llu system_words=%llu unknown_mgmt=%llu unknown_ep=%llu\n",
++		   aop->hello, aop->hello_min, aop->hello_max, aop->epmap_done,
++		   aop->epmap_chunks, aop->ap_power_acked, aop->ap_power_ack,
++		   aop->iop_power, aop->iop_ready, aop->ping_seq, aop->ping_acks,
++		   aop->system_words, aop->unknown_mgmt, aop->unknown_ep);
++	seq_printf(s, "firmware runtime_size=0x%x ext_pa=%pad ext_size=0x%zx\n",
++		   aop->runtime_size, &aop->ext_dma, aop->ext_size);
++	seq_printf(s, "endpoints=%*pbl\n", 256, aop->present);
++	for (i = 0; i < aop->neps; i++) {
++		struct a9_aop_ep *e = &aop->eps[i];
++
++		seq_printf(s, "ep %u state=%s bufs=%u dropped_before_init=%llu unknown=%llu rx_packets=%llu rx_errors=%llu last_rx_error=%d magic_unexpected=%llu last_word=0x%x tx_packets=%llu\n",
++			   e->num, afk_names[e->state], e->nbufs,
++			   e->dropped_before_init, e->unknown, e->rx_packets,
++			   e->rx_errors, e->last_rx_error, e->magic_unexpected,
++			   e->last_word, e->tx_packets);
++		for (j = 0; j < e->nbufs; j++)
++			seq_printf(s, "  buf tag=0x%04x pa=%pad size=0x%zx\n",
++				   e->bufs[j].tag, &e->bufs[j].dma, e->bufs[j].size);
++		for (j = 0; j < RING_COUNT; j++) {
++			struct a9_ring *r = &e->rings[j];
++
++			if (!e->ring_seen[j])
++				continue;
++			seq_printf(s, "  ring %s tag=0x%04x offset=0x%x size=0x%x valid=%d hdr_bufsize=0x%x hdr_version=0x%08x cursor=0x%x rptr=0x%x wptr=0x%x\n",
++				   ring_names[j], e->ring_tag[j], e->ring_offset[j],
++				   e->ring_size[j], e->ring_valid[j],
++				   get_unaligned_le32(e->ring_seen[j]),
++				   get_unaligned_le32(e->ring_seen[j] + 4),
++				   r->cursor,
++				   get_unaligned_le32(e->ring_seen[j] + A9_RING_BLOCK),
++				   get_unaligned_le32(e->ring_seen[j] + 2 * A9_RING_BLOCK));
++		}
++	}
++	for (i = 0; i < aop->nservices; i++) {
++		struct a9_aop_service *svc = &aop->services[i];
++
++		seq_printf(s, "service name=%s ep=%u channel=0x%x service_id=0x%08x flags=0x%x interface=%u%s\n",
++			   svc->info.name, svc->ep, svc->channel,
++			   svc->info.service_id, svc->info.flags,
++			   svc->info.interface,
++			   (int)i == aop->accel ? " bound=accel" : "");
++	}
++	seq_printf(s, "accel cal_sent=%u arot_sent=%d rate_set=%d reports=%llu report_errors=%llu channel_mismatch=%llu malformed=%llu trailing=%llu truncated=%llu doorbells=%llu iio=%d\n",
++		   aop->cal_sent, aop->arot_sent, aop->rate_set, aop->reports,
++		   aop->report_errors, aop->channel_mismatch, aop->malformed,
++		   aop->trailing, aop->truncated, aop->doorbells, !!aop->iio);
++	seq_printf(s, "command tag=0x%04x pending=%d status=%d last_reply category=0x%02x subtype=0x%x tag=0x%04x size=%u word0=0x%08x seen=%llu\n",
++		   aop->cmd_tag, aop->cmd_pending, aop->cmd_status,
++		   aop->reply_category, aop->reply_subtype, aop->reply_tag,
++		   aop->reply_size, aop->reply_word, aop->replies_seen);
++	if (aop->reports)
++		seq_printf(s, "accel last seq=%u status=0x%08x x=%d y=%d z=%d\n",
++			   aop->motion.sequence, aop->motion.status,
++			   aop->motion.axes[0], aop->motion.axes[1],
++			   aop->motion.axes[2]);
++	mutex_unlock(&aop->lock);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(a9_aop_state);
++
++static int a9_aop_transcript_show(struct seq_file *s, void *unused)
++{
++	struct a9_aop *aop = s->private;
++	struct a9_aop_trace *copy;
++	unsigned long flags;
++	u64 total, first, i;
++
++	copy = kmalloc_array(AOP_TRACE, sizeof(*copy), GFP_KERNEL);
++	if (!copy)
++		return -ENOMEM;
++	spin_lock_irqsave(&aop->rx_lock, flags);
++	memcpy(copy, aop->trace, sizeof(aop->trace));
++	total = aop->trace_total;
++	spin_unlock_irqrestore(&aop->rx_lock, flags);
++	first = total > AOP_TRACE ? total - AOP_TRACE : 0;
++	seq_printf(s, "# total=%llu shown_from=%llu  dir ep payload status\n",
++		   total, first);
++	for (i = first; i < total; i++) {
++		struct a9_aop_trace *t = &copy[i % AOP_TRACE];
++
++		seq_printf(s, "%llu %llu.%09llu %c ep=0x%02x %014llx %d\n", i,
++			   t->ns / NSEC_PER_SEC, t->ns % NSEC_PER_SEC, t->dir,
++			   a9_aop_endpoint(t->word), a9_aop_payload(t->word),
++			   t->status);
++	}
++	kfree(copy);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(a9_aop_transcript);
++
++static int a9_aop_rings_show(struct seq_file *s, void *unused)
++{
++	struct a9_aop *aop = s->private;
++	unsigned int i, j;
++	u32 at, n;
++
++	mutex_lock(&aop->lock);
++	for (i = 0; i < aop->neps; i++) {
++		struct a9_aop_ep *e = &aop->eps[i];
++
++		for (j = 0; j < RING_COUNT; j++) {
++			struct a9_ring *r = &e->rings[j];
++			u8 *base = e->ring_seen[j];
++
++			if (!base)
++				continue;
++			seq_printf(s, "ep %u ring %s size=0x%x valid=%d\n", e->num,
++				   ring_names[j], e->ring_size[j], e->ring_valid[j]);
++			seq_hex_dump(s, "  +00 ", DUMP_PREFIX_NONE, 16, 4, base, 16, false);
++			seq_hex_dump(s, "  +40 ", DUMP_PREFIX_NONE, 16, 4,
++				     base + A9_RING_BLOCK, 16, false);
++			seq_hex_dump(s, "  +80 ", DUMP_PREFIX_NONE, 16, 4,
++				     base + 2 * A9_RING_BLOCK, 16, false);
++			if (!e->ring_valid[j]) {
++				n = min_t(u32, 256, e->ring_size[j] - A9_RING_HEADER);
++				seq_hex_dump(s, "  ", DUMP_PREFIX_OFFSET, 16, 4,
++					     base + A9_RING_HEADER, n, false);
++				continue;
++			}
++			/* Up to 256 bytes before the RX cursor / TX wptr. */
++			at = j == RING_TX ? a9_ring_wptr(r) : r->cursor;
++			if (at >= r->bufsize)
++				at = 0;
++			n = min_t(u32, 256, r->bufsize);
++			at = at >= n ? at - n : 0;
++			seq_printf(s, "  entries from 0x%x:\n", at);
++			seq_hex_dump(s, "  ", DUMP_PREFIX_OFFSET, 16, 4,
++				     a9_ring_entry(r, at), min(n, r->bufsize - at), false);
++		}
++	}
++	mutex_unlock(&aop->lock);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(a9_aop_rings);
++
++static int a9_aop_patchbay_show(struct seq_file *s, void *unused)
++{
++	struct a9_aop *aop = s->private;
++	size_t cursor = 0;
++	u32 tag, size;
++
++	if (!aop->table) {
++		seq_puts(s, "not loaded by this driver\n");
++		return 0;
++	}
++	while (cursor + 8 <= aop->table_size) {
++		tag = get_unaligned_le32(aop->table + cursor);
++		size = get_unaligned_le32(aop->table + cursor + 4);
++		if (size > aop->table_size - cursor - 8)
++			break;
++		seq_printf(s, "%c%c%c%c %u ", tag >> 24, (tag >> 16) & 0xff,
++			   (tag >> 8) & 0xff, tag & 0xff, size);
++		seq_printf(s, "%*phN\n", (int)min_t(u32, size, 64),
++			   aop->table + cursor + 8);
++		cursor += 8 + size;
++	}
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(a9_aop_patchbay);
++
++/* ---- platform ------------------------------------------------------------- */
++
++static void a9_aop_put_node(void *node)
++{
++	of_node_put(node);
++}
++
++static void a9_aop_remove_debugfs(void *dir)
++{
++	debugfs_remove_recursive(dir);
++}
++
++static void a9_aop_destroy_wq(void *wq)
++{
++	destroy_workqueue(wq);
++}
++
++static void a9_aop_shutdown(struct platform_device *pdev)
++{
++	struct a9_aop *aop = platform_get_drvdata(pdev);
++	unsigned int i;
++	bool streaming;
++	int ret = 0;
++
++	if (!aop)
++		return;
++	WRITE_ONCE(aop->stopping, true);
++	wake_up_all(&aop->wait);
++	cancel_work_sync(&aop->boot_work);
++	if (aop->irq_enabled)
++		disable_irq(aop->irq);
++	cancel_delayed_work_sync(&aop->poll_work);
++	cancel_delayed_work_sync(&aop->ping_work);
++	flush_workqueue(aop->wq);
++	if (!aop->hello)
++		return;
++
++	/*
++	 * The rings live in memory the next (kexec) kernel will reuse: stop
++	 * the stream and the endpoints so the AOP stops writing to them.
++	 */
++	aop->inline_rx = true;
++	mutex_lock(&aop->lock);
++	streaming = aop->accel >= 0 && aop->rate_set;
++	aop->phase = PHASE_STOPPED;
++	mutex_unlock(&aop->lock);
++	if (streaming)
++		ret = a9_aop_set_rate(aop, 0, 0, 0);
++	mutex_lock(&aop->lock);
++	for (i = 0; i < aop->neps; i++) {
++		if (aop->eps[i].state < AFK_INIT || aop->eps[i].state > AFK_RUNNING)
++			continue;
++		if (!a9_aop_send(aop, aop->eps[i].num, a9_afk_word(A9_AFK_SHUTDOWN)))
++			aop->eps[i].state = AFK_STOPPING;
++	}
++	mutex_unlock(&aop->lock);
++	for (i = 0; i < aop->neps; i++) {
++		struct a9_aop_ep *e = &aop->eps[i];
++
++		if (e->state != AFK_STOPPING)
++			continue;
++		if (!a9_aop_wait(aop, READ_ONCE(e->state) == AFK_STOPPED, AOP_STOP_MS))
++			dev_warn(aop->dev, "ep %u: no shutdown ack; AOP may still own its rings\n",
++				 e->num);
++	}
++	dev_info(aop->dev, "stopped (rate stop %d)\n", ret);
++}
++
++static int a9_aop_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct a9_aop *aop;
++	struct resource *res;
++	const char *label;
++	unsigned int i;
++	int ret;
++
++	/* No resource is touched unless explicitly enabled on this board. */
++	if (!active || !of_machine_is_compatible("apple,j71t"))
++		return -ENODEV;
++	aop = devm_kzalloc(dev, sizeof(*aop), GFP_KERNEL);
++	if (!aop)
++		return -ENOMEM;
++	aop->dev = dev;
++	aop->accel = -1;
++	aop->poll_ms = 10;
++	aop->phase = PHASE_PROBE;
++	spin_lock_init(&aop->tx_lock);
++	spin_lock_init(&aop->rx_lock);
++	INIT_KFIFO(aop->rxq);
++	mutex_init(&aop->lock);
++	init_waitqueue_head(&aop->wait);
++	INIT_WORK(&aop->rx_work, a9_aop_rx_work);
++	INIT_WORK(&aop->boot_work, a9_aop_boot_work);
++	INIT_DELAYED_WORK(&aop->poll_work, a9_aop_poll_work);
++	INIT_DELAYED_WORK(&aop->ping_work, a9_aop_ping_work);
++
++	/* The observer owns 4-byte sub-ranges of the wrapper: map, don't claim. */
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "wrapper");
++	if (!res || resource_size(res) != AOP_WRAPPER_SIZE)
++		return -EINVAL;
++	aop->wrapper = devm_ioremap(dev, res->start, resource_size(res));
++	if (!aop->wrapper)
++		return -ENOMEM;
++	aop->wrapper_pa = res->start;
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "region");
++	if (!res)
++		return -EINVAL;
++	aop->region = devm_ioremap_resource(dev, res);
++	if (IS_ERR(aop->region))
++		return PTR_ERR(aop->region);
++	aop->region_pa = res->start;
++	aop->region_size = resource_size(res);
++	aop->autoboot = devm_platform_ioremap_resource_byname(pdev, "auto-boot");
++	if (IS_ERR(aop->autoboot))
++		return PTR_ERR(aop->autoboot);
++	if (of_property_read_u32(dev->of_node, "apple,aop-target", &aop->aop_target) ||
++	    of_property_read_u32(dev->of_node, "apple,chip-id", &aop->chip_id) ||
++	    of_property_read_u32(dev->of_node, "apple,chip-revision",
++				 &aop->chip_revision))
++		return -EINVAL;
++
++	if (of_count_phandle_with_args(dev->of_node, "apple,observe-domains",
++				       NULL) != AOP_DOMAINS)
++		return -EINVAL;
++	for (i = 0; i < AOP_DOMAINS; i++) {
++		aop->domains[i] = of_parse_phandle(dev->of_node,
++						   "apple,observe-domains", i);
++		if (!aop->domains[i])
++			return -EINVAL;
++		ret = devm_add_action_or_reset(dev, a9_aop_put_node, aop->domains[i]);
++		if (ret)
++			return ret;
++		if (of_property_read_string(aop->domains[i], "label", &label) ||
++		    strcmp(label, domain_names[i]))
++			return -EINVAL;
++	}
++
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(48));
++	if (ret)
++		return ret;
++	if (device_iommu_mapped(dev))
++		return -EINVAL;	/* 0xa1 carries an AP physical address */
++
++	/* Only the RX (outbox not empty) line; TX space is polled. */
++	aop->irq = platform_get_irq_byname(pdev, "rx");
++	if (aop->irq < 0)
++		return aop->irq;
++	ret = devm_request_irq(dev, aop->irq, a9_aop_irq, IRQF_NO_AUTOEN,
++			       dev_name(dev), aop);
++	if (ret)
++		return ret;
++
++	aop->wq = alloc_ordered_workqueue("apple-a9-aop", WQ_MEM_RECLAIM);
++	if (!aop->wq)
++		return -ENOMEM;
++	ret = devm_add_action_or_reset(dev, a9_aop_destroy_wq, aop->wq);
++	if (ret)
++		return ret;
++
++	if (apple_a9_aop_debug()) {
++		aop->debugfs = debugfs_create_dir("apple-a9-aop-active", NULL);
++		if (!IS_ERR(aop->debugfs)) {
++			ret = devm_add_action_or_reset(dev, a9_aop_remove_debugfs,
++						       aop->debugfs);
++			if (ret)
++				return ret;
++			debugfs_create_file("state", 0400, aop->debugfs, aop,
++					    &a9_aop_state_fops);
++			debugfs_create_file("transcript", 0400, aop->debugfs, aop,
++					    &a9_aop_transcript_fops);
++			debugfs_create_file("rings", 0400, aop->debugfs, aop,
++					    &a9_aop_rings_fops);
++			debugfs_create_file("patchbay", 0400, aop->debugfs, aop,
++					    &a9_aop_patchbay_fops);
++		}
++	}
++	platform_set_drvdata(pdev, aop);
++	/* Firmware lives on the root filesystem: decide and boot later. */
++	queue_work(system_long_wq, &aop->boot_work);
++	dev_info(dev, "active AOP driver armed (debugfs %s)\n",
++		 aop->debugfs ? "on" : "off");
++	return 0;
++}
++
++static const struct of_device_id a9_aop_active_match[] = {
++	{ .compatible = "apple,j71t-aop" },
++	{}
++};
++
++static struct platform_driver a9_aop_active_driver = {
++	.probe = a9_aop_probe,
++	.shutdown = a9_aop_shutdown,
++	.driver = {
++		.name = "apple-a9-aop-active",
++		.of_match_table = a9_aop_active_match,
++		.suppress_bind_attrs = true,
++	},
++};
++builtin_platform_driver(a9_aop_active_driver);
++
++MODULE_FIRMWARE(AOP_MAIN_FW);
++MODULE_FIRMWARE(AOP_EXT_FW);
++MODULE_FIRMWARE(AOP_CAL_FW);
++MODULE_DESCRIPTION("Apple J71t AOP active driver (RTBuddy, SPU/AFK, accelerometer)");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/soc/apple/apple-a9-aop.c b/drivers/soc/apple/apple-a9-aop.c
+index bc3b47cb8b..dd9559587c 100644
+--- a/drivers/soc/apple/apple-a9-aop.c
++++ b/drivers/soc/apple/apple-a9-aop.c
+@@ -10,6 +10,8 @@
+ #include <linux/seq_file.h>
+ #include <linux/soc/apple/pmgr-observe.h>
+ 
++#include "a9-aop.h"
++
+ #define AOP_REGS 5
+ #define AOP_DOMAINS 5
+ #define AOP_MAIN_FW "apple/aop/ipad6faop-20H350.bin"
+@@ -22,6 +24,12 @@ static bool attach;
+ module_param(attach, bool, 0400);
+ MODULE_PARM_DESC(attach, "Enable attach preflight only; hardware attach is blocked (default off)");
+ 
++/* Lets the active driver gate its debugfs on the same immutable parameter. */
++bool apple_a9_aop_debug(void)
++{
++	return debug;
++}
++
+ static const char * const reg_names[AOP_REGS] = {
+ 	"cpu_control", "cpu_running", "inbox_control", "outbox_control", "idle_status",
+ };
+-- 
+2.56.0
+

@@ -1,0 +1,93 @@
+From 5306b84fa39dacf0c2857f621a0988fc53cadbf5 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Tue, 27 Oct 2026 09:43:19 +0000
+Subject: [PATCH 4/4] usb: host: ehci/ohci-platform: J71t root-port budget as a
+ parameter
+
+The J71t host pair reported a 100 mA root-port budget (the ADT
+port-current-limit of 50). The Lightning port never sources 5 V VBUS:
+the powered camera adapter feeds its own hub, as on iOS. A bus-powered
+hub or a drive behind it asking for more than 100 mA was refused
+configuration, which looks like an electrical failure but is accounting.
+
+Make the budget a parameter (apple_port_budget_ma, default 500 mA, the
+USB 2.0 port budget), read at each host entry since the role switch
+creates the controllers then. 100 restores the ADT value.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ drivers/usb/host/ehci-platform.c | 16 ++++++++++++----
+ drivers/usb/host/ohci-platform.c | 16 ++++++++++++----
+ 2 files changed, 24 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/usb/host/ehci-platform.c b/drivers/usb/host/ehci-platform.c
+index 7b1fbd3e6c..75c487fbb0 100644
+--- a/drivers/usb/host/ehci-platform.c
++++ b/drivers/usb/host/ehci-platform.c
+@@ -45,6 +45,16 @@
+ 
+ #define BCM_USB_FIFO_THRESHOLD	0x00800040
+ 
++/*
++ * J71t: the Lightning port never sources 5 V VBUS (accessory LDO5 is not a
++ * general-purpose 5 V supply); a powered camera adapter feeds its own hub.
++ * This is enumeration accounting only. Read at each host entry.
++ */
++static unsigned int apple_port_budget_ma = 500;
++module_param(apple_port_budget_ma, uint, 0644);
++MODULE_PARM_DESC(apple_port_budget_ma,
++		 "J71t Lightning root-port power budget in mA (default 500; 100 = ADT port-current-limit)");
++
+ struct ehci_platform_priv {
+ 	struct clk *clks[EHCI_MAX_CLKS];
+ 	struct reset_control *rsts;
+@@ -377,11 +387,9 @@ static int ehci_platform_probe(struct platform_device *dev)
+ 	hcd->rsrc_start = res_mem->start;
+ 	hcd->rsrc_len = resource_size(res_mem);
+ 
+-	/* J71t ADT port-current-limit = 50 units of 2 mA.
+-	 * Accessory LDO5 is not a general-purpose 5 V supply.
+-	 */
++	/* J71t: see apple_port_budget_ma. */
+ 	if (of_device_is_compatible(dev->dev.of_node, "apple,s8000-ehci"))
+-		hcd->power_budget = 100;
++		hcd->power_budget = READ_ONCE(apple_port_budget_ma);
+ 
+ 	hcd->tpl_support = of_usb_host_tpl_support(dev->dev.of_node);
+ 
+diff --git a/drivers/usb/host/ohci-platform.c b/drivers/usb/host/ohci-platform.c
+index 53728ee4d5..0736b6374e 100644
+--- a/drivers/usb/host/ohci-platform.c
++++ b/drivers/usb/host/ohci-platform.c
+@@ -36,6 +36,16 @@
+ #define OHCI_MAX_CLKS 4
+ #define hcd_to_ohci_priv(h) ((struct ohci_platform_priv *)hcd_to_ohci(h)->priv)
+ 
++/*
++ * J71t: the Lightning port never sources 5 V VBUS (accessory LDO5 is not a
++ * general-purpose 5 V supply); a powered camera adapter feeds its own hub.
++ * This is enumeration accounting only. Read at each host entry.
++ */
++static unsigned int apple_port_budget_ma = 500;
++module_param(apple_port_budget_ma, uint, 0644);
++MODULE_PARM_DESC(apple_port_budget_ma,
++		 "J71t Lightning root-port power budget in mA (default 500; 100 = ADT port-current-limit)");
++
+ struct ohci_platform_priv {
+ 	struct clk *clks[OHCI_MAX_CLKS];
+ 	struct reset_control *resets;
+@@ -207,11 +217,9 @@ static int ohci_platform_probe(struct platform_device *dev)
+ 	hcd->rsrc_start = res_mem->start;
+ 	hcd->rsrc_len = resource_size(res_mem);
+ 
+-	/* J71t ADT port-current-limit = 50 units of 2 mA.
+-	 * Accessory LDO5 is not a general-purpose 5 V supply.
+-	 */
++	/* J71t: see apple_port_budget_ma. */
+ 	if (of_device_is_compatible(dev->dev.of_node, "apple,s8000-ohci"))
+-		hcd->power_budget = 100;
++		hcd->power_budget = READ_ONCE(apple_port_budget_ma);
+ 
+ 	hcd->tpl_support = of_usb_host_tpl_support(dev->dev.of_node);
+ 

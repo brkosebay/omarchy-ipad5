@@ -1,0 +1,62 @@
+From aa7347b2af85be9d26b610d1d94e41fe08224cb9 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 14:16:38 +0000
+Subject: [PATCH 34/43] PCI: apple-h9p: Let a boot opt ports into ASPM L1
+
+The S8003 DT keeps ASPM L1 off on every port (aspm-no-l1). iOS pairs L1
+with L1SS, LTR, CLKREQ# and refclk gating, and a link that can't leave
+L1 stalls the CPU on the next access. For Wi-Fi power work, add
+pcie_apple_h9p.aspm_l1_ports=<mask>: the driver drops aspm-no-l1 from
+those ports' DT nodes before they are enumerated, and L1 then follows
+the PCI ASPM policy:
+- default: L1;
+- powersupersave: L1 plus L1 substates;
+- performance: off again, at runtime.
+
+The default is 0, so nothing changes.
+---
+ drivers/pci/controller/pcie-apple-h9p.c | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/drivers/pci/controller/pcie-apple-h9p.c b/drivers/pci/controller/pcie-apple-h9p.c
+index 527b14dd6d..839c11b8cb 100644
+--- a/drivers/pci/controller/pcie-apple-h9p.c
++++ b/drivers/pci/controller/pcie-apple-h9p.c
+@@ -125,6 +125,19 @@
+ /* Link attempts per late port (power-cycled in between) */
+ #define H9P_LATE_PORT_LINK_TRIES	2
+ 
++/*
++ * The DT keeps ASPM L1 off on every port (aspm-no-l1): iOS pairs L1 with
++ * L1SS/LTR/CLKREQ# and refclk gating, and a link that can't leave L1 takes
++ * the CPU with it. This lets a boot opt in per port for power testing
++ * (e.g. 0x2 = Wi-Fi). L1 then follows the PCI ASPM policy:
++ * /sys/module/pcie_aspm/parameters/policy = default (L1),
++ * powersupersave (+ L1 substates) or performance (off again).
++ */
++static unsigned int aspm_l1_ports;
++module_param(aspm_l1_ports, uint, 0444);
++MODULE_PARM_DESC(aspm_l1_ports,
++	"Bitmask of root ports that may use ASPM L1 despite the DT's aspm-no-l1 (default 0; 0x2 = Wi-Fi)");
++
+ /*
+  * S8003 (A9, TSMC). From the iOS 16 AppleS800xPCIe/AppleS8003PCIe kexts; the
+  * T8010 sequence above does not match it (status register, port registers,
+@@ -1857,6 +1870,14 @@ static int apple_h9p_pcie_parse_ports(struct apple_h9p_pcie *pcie)
+ 		}
+ 
+ 		pcie->port_nodes[port] = of_node_get(np);
++		if (aspm_l1_ports & BIT(port)) {
++			struct property *prop = of_find_property(np, "aspm-no-l1",
++								 NULL);
++
++			if (prop && !of_remove_property(np, prop))
++				dev_warn(dev, "port %u: ASPM L1 allowed (aspm_l1_ports)\n",
++					 port);
++		}
+ 		if (of_property_present(np, "pwren-gpios"))
+ 			pcie->late_ports |= BIT(port);
+ 		else
+-- 
+2.56.0
+

@@ -1,0 +1,5 @@
+# linux-a9 round 1 (2026-10-22): TEMPORARY, approved by the orchestrator.
+# linux has a locked password (SSH key only), so sudo cannot prompt.
+# Remove once a password scheme is chosen:
+#   sudo passwd linux && sudo rm /etc/sudoers.d/90-linux-a9-temp
+linux ALL=(ALL) NOPASSWD: ALL

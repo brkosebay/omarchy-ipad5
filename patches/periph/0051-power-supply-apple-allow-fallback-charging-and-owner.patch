@@ -1,0 +1,158 @@
+From 6f602321997f30dd421c729448a7519977daacb7 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 12:44:00 +0000
+Subject: [PATCH 51/55] power: supply: apple: allow fallback charging and owner
+ input overrides
+
+Round 4 selected zero battery current at an ordinary USB budget and
+rejected the previously working owner request above the detected
+allowance. Permit a conservative 400 mA battery ceiling at nominal 500
+mA input, still bounded by calibrated input regulation and the hardware
+cap. Restore positive input_current_limit writes as explicit owner
+authorization up to 2400 mA. Keep detected USB current truthful, require
+live VBUS and all battery/status guards, and revoke the override on
+guard failure or PM quiesce. Retain checked transactions, rollback and
+fault latches.
+---
+ drivers/power/supply/apple_j71t_charger.c | 61 ++++++++++++++++++-----
+ 1 file changed, 49 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/power/supply/apple_j71t_charger.c b/drivers/power/supply/apple_j71t_charger.c
+index 704a41908f..a952b01b3f 100644
+--- a/drivers/power/supply/apple_j71t_charger.c
++++ b/drivers/power/supply/apple_j71t_charger.c
+@@ -23,6 +23,7 @@
+ #define J71T_CHARGE_TIMEOUT BIT(4)
+ #define J71T_CHARGE_END BIT(2)
+ #define J71T_CHARGE_CODE 50 /* 2500 mA, still bounded by 0xa0c[5:0]. */
++#define J71T_USB_CHARGE_CODE 8 /* Conservative 400 mA battery ceiling at 500 mA input. */
+ #define J71T_REQUEST_UA 2400000
+ 
+ static const int j71t_budgets_ua[] = { 500000, 1000000, 2100000, 2400000 };
+@@ -161,6 +162,29 @@ static int j71t_source_limit(struct j71t_charger *charger)
+ 	return ret ? ret : value.intval;
+ }
+ 
++/* A positive sysfs write authorizes this source, not a USB host grant. */
++static int j71t_policy_limit(struct j71t_charger *charger)
++{
++	int source_ua = j71t_source_limit(charger);
++
++	/* Require at least an ordinary source allowance, even for an override. */
++	if (source_ua < 500000)
++		return source_ua;
++	return charger->user_limit_ua ?: source_ua;
++}
++
++static int j71t_charge_code(int budget_ua)
++{
++	return budget_ua == 500000 ? J71T_USB_CHARGE_CODE : J71T_CHARGE_CODE;
++}
++
++static void j71t_revoke_override(struct j71t_charger *charger)
++{
++	if (charger->user_limit_ua)
++		dev_info(charger->dev, "owner input override revoked\n");
++	charger->user_limit_ua = 0;
++}
++
+ static int j71t_battery_safe(void)
+ {
+ 	struct power_supply *battery;
+@@ -222,7 +246,7 @@ static int j71t_guard(struct j71t_charger *charger)
+ 
+ 	if (ret != 1)
+ 		return ret < 0 ? ret : -ENOLINK;
+-	ret = j71t_source_limit(charger);
++	ret = j71t_policy_limit(charger);
+ 	if (ret < charger->budget_ua)
+ 		return ret < 0 ? ret : -ERANGE;
+ 	ret = j71t_battery_safe();
+@@ -285,7 +309,8 @@ static int j71t_enable(struct j71t_charger *charger)
+ 		return ret;
+ 	}
+ 	charger->active = true;
+-	dev_info(charger->dev, "source budget %d mA: input 0x%02x, battery limit %d mA\n",
++	dev_info(charger->dev, "%s budget %d mA: input 0x%02x, battery limit %d mA\n",
++		 charger->user_limit_ua ? "owner override" : "source",
+ 		 charger->budget_ua / 1000, charger->input_code, charger->charge_code * 50);
+ 	return 0;
+ }
+@@ -298,9 +323,9 @@ static void j71t_policy_work(struct work_struct *work)
+ 	int ret = 0, source_ua, index;
+ 
+ 	mutex_lock(&charger->lock);
+-	source_ua = j71t_source_limit(charger);
+-	if (charger->user_limit_ua > 0)
+-		source_ua = min(source_ua, charger->user_limit_ua);
++	source_ua = j71t_policy_limit(charger);
++	if (source_ua < 500000)
++		j71t_revoke_override(charger);
+ 	index = j71t_choose_budget(source_ua);
+ 	if (charger->active) {
+ 		ret = j71t_guard(charger);
+@@ -321,7 +346,9 @@ static void j71t_policy_work(struct work_struct *work)
+ 			if (ret != -ENOLINK && ret != -ERANGE && ret != -EBUSY && ret != -EAGAIN)
+ 				charger->faulted = true;
+ 			dev_warn(charger->dev, "charging request revoked: %d\n", ret);
++			j71t_revoke_override(charger);
+ 			charger->active = false;
++			index = j71t_choose_budget(j71t_policy_limit(charger));
+ 		}
+ 	}
+ 	if (!charger->active && charger->saved) {
+@@ -333,9 +360,10 @@ static void j71t_policy_work(struct work_struct *work)
+ 	    charger->calibrated && !charger->active && !charger->saved && index >= 0) {
+ 		charger->budget_ua = j71t_budgets_ua[index];
+ 		charger->input_code = charger->input_codes[index];
+-		/* ADT min-charge-capable-current is 1000 mA: input-only below it. */
+-		charger->charge_code = charger->budget_ua >= 1000000 ? J71T_CHARGE_CODE : 0;
+-		j71t_enable(charger);
++		/* Input regulation still bounds the total USB draw. */
++		charger->charge_code = j71t_charge_code(charger->budget_ua);
++		if (j71t_enable(charger))
++			j71t_revoke_override(charger);
+ 	}
+ 	if (!charger->stopping)
+ 		mod_delayed_work(system_power_efficient_wq, &charger->work,
+@@ -410,11 +438,15 @@ static int j71t_set_property(struct power_supply *psy, enum power_supply_propert
+ 		ret = -ESHUTDOWN;
+ 	} else if (!value->intval) {
+ 		charger->disabled = true;
+-		charger->user_limit_ua = 0;
++		j71t_revoke_override(charger);
+ 		ret = j71t_restore(charger);
+-	} else if (source_ua < value->intval) {
+-		ret = source_ua < 0 ? source_ua : -ERANGE;
++	} else if (source_ua < 500000) {
++		j71t_revoke_override(charger);
++		ret = j71t_restore(charger);
++		if (!ret)
++			ret = source_ua < 0 ? source_ua : -ERANGE;
+ 	} else {
++		j71t_revoke_override(charger);
+ 		ret = j71t_restore(charger);
+ 		if (!ret) {
+ 			charger->disabled = false;
+@@ -422,8 +454,12 @@ static int j71t_set_property(struct power_supply *psy, enum power_supply_propert
+ 			charger->user_limit_ua = value->intval;
+ 			charger->budget_ua = value->intval;
+ 			charger->input_code = charger->input_codes[index];
+-			charger->charge_code = value->intval >= 1000000 ? J71T_CHARGE_CODE : 0;
++			charger->charge_code = j71t_charge_code(value->intval);
++			dev_info(charger->dev, "owner authorizes %d mA input; detected allowance %d mA\n",
++				 value->intval / 1000, source_ua / 1000);
+ 			ret = j71t_enable(charger);
++			if (ret)
++				j71t_revoke_override(charger);
+ 		}
+ 	}
+ 	if (!charger->stopping)
+@@ -527,6 +563,7 @@ static int j71t_quiesce(struct device *dev)
+ 
+ 	mutex_lock(&charger->lock);
+ 	charger->stopping = true;
++	j71t_revoke_override(charger);
+ 	mutex_unlock(&charger->lock);
+ 	cancel_delayed_work_sync(&charger->work);
+ 	for (attempt = 0; attempt < 3; attempt++) {

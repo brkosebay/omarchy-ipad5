@@ -1,0 +1,52 @@
+From 225449c5cc3fb9370830e3082028f052bbb5a73c Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 23:09:15 +0000
+Subject: [PATCH 3/7] cpufreq: apple: preserve lower cooled clocks on emergency
+ revert
+
+---
+ drivers/cpufreq/apple-a9-tuning.h | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/cpufreq/apple-a9-tuning.h b/drivers/cpufreq/apple-a9-tuning.h
+index 31a43e49bd..6eb091c677 100644
+--- a/drivers/cpufreq/apple-a9-tuning.h
++++ b/drivers/cpufreq/apple-a9-tuning.h
+@@ -71,17 +71,23 @@ static int a9_restore_locked(struct a9_guard *g)
+ 	struct apple_cpu_priv *priv = g->priv;
+ 	u64 command;
+ 	u32 status;
++	unsigned int fallback;
+ 	int ret, state;
+ 
+ 	g->limit = A9_STOCK_KHZ;
+-	ret = apple_soc_cpufreq_request(priv, 7);
++	status = readl(priv->reg_base + APPLE_DVFS_STATUS);
++	fallback = (status >> 4) & 15;
++	if (!fallback || fallback > 7)
++		fallback = 7;
++	/* Never raise a CPU already cooled below the stock maximum. */
++	ret = apple_soc_cpufreq_request(priv, fallback);
+ 	if (ret)
+ 		return ret;
+ 	status = readl(priv->reg_base + APPLE_DVFS_STATUS);
+ 	command = readq(priv->reg_base + APPLE_DVFS_CMD);
+ 	/* A boost/load/thermal limitation may legitimately deliver a lower state. */
+ 	if (((status >> 4) & 15) > 7 || (status & 15) > 7 ||
+-	    FIELD_GET(APPLE_DVFS_CMD_PS1, command) != 7)
++	    FIELD_GET(APPLE_DVFS_CMD_PS1, command) != fallback)
+ 		return -EIO;
+ 	for (state = 9; state < 15; state++) {
+ 		if (!(g->dirty & BIT(state)))
+@@ -287,6 +293,8 @@ static ssize_t a9_control_write(struct file *file, const char __user *buffer,
+ 		return -EINVAL;
+ 	if (copy_from_user(command, buffer, count))
+ 		return -EFAULT;
++	if (memchr(command, 0, count))
++		return -EINVAL;
+ 	command[count] = 0;
+ 	strim(command);
+ 	mutex_lock(&g->control);
+-- 
+2.56.0
+

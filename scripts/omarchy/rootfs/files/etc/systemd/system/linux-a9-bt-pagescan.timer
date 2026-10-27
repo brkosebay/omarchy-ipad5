@@ -1,0 +1,13 @@
+# linux-a9: re-assert Bluetooth "connectable" every 30 s (see
+# linux-a9-bt-pagescan.service). A no-op costing one btmgmt call while it's
+# already on, or while bluetooth isn't running.
+[Unit]
+Description=linux-a9: keep Bluetooth connectable for keyboard reconnects
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=30
+AccuracySec=5
+
+[Install]
+WantedBy=timers.target

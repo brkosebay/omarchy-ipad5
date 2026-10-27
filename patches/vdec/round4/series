@@ -1,0 +1,9 @@
+0001-dt-bindings-media-add-Apple-S8000-VXD-video-decoder.patch
+0002-arm64-dts-apple-s8000-s8003-add-the-VXD-video-decode.patch
+0003-media-apple-add-VXD-PowerVR-MSVDX-probe-and-bring-up.patch
+0004-media-apple-vxd-add-the-V4L2-stateless-H.264-m2m-dev.patch
+0005-media-apple-vxd-wire-the-V4L2-device-into-probe-make.patch
+0006-media-apple-vxd-fix-the-open-NULL-dereference-and-ha.patch
+0007-media-apple-vxd-fix-the-GART-for-16-KiB-pages-and-DR.patch
+0008-media-apple-vxd-bring-up-the-host-MTX-mailbox-R3a.patch
+0009-media-apple-vxd-add-the-command-buffer-layer-R3b.patch

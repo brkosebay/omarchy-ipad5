@@ -1,0 +1,1124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 11:29:33 +0000
+Subject: [PATCH 14/21] media: apple: vxd: decode H.264 pictures through the mailbox
+
+device_run() now builds and submits real work:
+
+- The decode context allocates the buffers DecodeCreateH264VLD gives the
+  AVC path: the 4 KiB packed CAVLC table (CRC-checked after the copy),
+  the IntraBuffer (128 KiB) and the StreamStateBuffer (8 KiB, message
+  w5), zeroed and GART-mapped.  Every CAPTURE buffer gets its stored
+  macroblock parameter buffer ((W * H * 0x80 + 0x41ff) & ~0xfff, BE
+  0x62ec) with its own lifetime.
+- The OUTPUT queue keeps a kernel mapping: in frame-based mode the
+  driver walks the access unit itself.
+- NV12 CAPTURE strides are rounded up to 256 bytes.  Every MSVDX surface
+  base register drops the low 12 bits; with a 16-line aligned height
+  that keeps the chroma plane of a single-plane NV12 buffer 4 KiB
+  aligned.
+- Per picture: SPS/PPS checks, the slice walk, RefPicList0 per P slice
+  (v4l2-h264 helper plus the slice's modifications), the DPB resolved to
+  CAPTURE device addresses by timestamp, the command stream into a
+  pooled buffer, and one 0x81 message per slice.  The request's
+  controls are completed before the submit.
+- apple_vxd_submit() arms one fence per packet with Apple's arithmetic
+  ((seq << 4) | packet * 2), so a 0xc0 for any packet is recognised
+  whether the firmware answers every packet or only the 0x4004 one,
+  binds the buffer to the last fence, writes 0x1008 = 0xf00 after a GART
+  change as the kext does (MMU_CONTROL1 directory-cache invalidate in
+  Imagination's layout), and pushes the messages in packet order.
+- The last packet's 0xc0 finishes the job from a work item (the IRQ
+  path only signals); a fault bit on any answered packet fails the
+  picture.  A 1 s watchdog fails a picture that never completes and
+  leaves its command buffer quarantined.  The old watchdog called
+  job_finish(NULL, ...), which returned no buffer at all.
+
+At most eight packets per picture this round (the fence packet index
+has three bits).  The firmware never decoded a picture before this
+patch, so the first device run is the experiment; see the test plan.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ drivers/media/platform/apple/vxd/Kconfig          |   1 +
+ drivers/media/platform/apple/vxd/apple-vxd-core.c |  97 ++++++-
+ drivers/media/platform/apple/vxd/apple-vxd-gart.c |  34 +++
+ drivers/media/platform/apple/vxd/apple-vxd-h264.c | 329 ++++++++++++++++++++--
+ drivers/media/platform/apple/vxd/apple-vxd-mbox.c | 194 +++++++++++--
+ drivers/media/platform/apple/vxd/apple-vxd-v4l2.c |  52 +++-
+ drivers/media/platform/apple/vxd/apple-vxd.h      |  47 +++-
+ 7 files changed, 693 insertions(+), 61 deletions(-)
+
+diff --git a/drivers/media/platform/apple/vxd/Kconfig b/drivers/media/platform/apple/vxd/Kconfig
+index 815cdff56bb35a215231fedae69ac1f6566127b0..19d5fc75bea2cfb0d517b9f51221d5bbd3ab1c01 100644
+--- a/drivers/media/platform/apple/vxd/Kconfig
++++ b/drivers/media/platform/apple/vxd/Kconfig
+@@ -7,6 +7,7 @@ config VIDEO_APPLE_VXD
+ 	select VIDEOBUF2_DMA_CONTIG
+ 	select V4L2_MEM2MEM_DEV
+ 	select V4L2_H264
++	select CRC32
+ 	help
+ 	  Support for the Apple "VXD" video decoder present on pre-M1 Apple
+ 	  SoCs starting with the S5L8940X: an Imagination PowerVR MSVDX core
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-core.c b/drivers/media/platform/apple/vxd/apple-vxd-core.c
+index 7385b97cbdf7d1664ec1c43a3fa17bb96cd913f3..19190aa21b2cdb1d4adb6c01cd5bf1ccbc4eb3ab 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-core.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-core.c
+@@ -110,22 +110,99 @@ void vxd_step_io(const struct device *dev, const char *fmt, ...)
+ 	va_end(args);
+ }
+ 
+-void apple_vxd_watchdog(struct work_struct *work)
++/*
++ * Take the active job if @last_signalled says it is done (the completion
++ * path) or unconditionally (the watchdog).  job_lock makes the two paths
++ * exclusive: exactly one of them finishes a job.
++ */
++static bool vxd_job_take(struct apple_vxd_dev *vxd, bool need_signal,
++			 struct apple_vxd_job *job)
+ {
+-	struct apple_vxd_dev *vxd = container_of(work, struct apple_vxd_dev,
+-						 watchdog_work.work);
+ 	unsigned long flags;
+-	bool active;
++	bool taken = false;
+ 
+ 	spin_lock_irqsave(&vxd->job_lock, flags);
+-	active = vxd->job_active;
++	if (vxd->job_active && vxd->job.nfences &&
++	    (!need_signal ||
++	     READ_ONCE(vxd->job.fences[vxd->job.nfences - 1]->state) ==
++			APPLE_VXD_FENCE_SIGNALLED)) {
++		*job = vxd->job;
++		vxd->job_active = false;
++		taken = true;
++	}
+ 	spin_unlock_irqrestore(&vxd->job_lock, flags);
++	return taken;
++}
++
++/*
++ * Every fence of the job goes back to the pool.  A packet whose 0xc0 did
++ * not arrive (the firmware may answer only the 0x4004 message) is simply
++ * released; a fault on any packet that did answer fails the picture.
++ */
++static void vxd_job_complete(struct apple_vxd_dev *vxd,
++			     const struct apple_vxd_job *job, bool timed_out)
++{
++	struct apple_vxd_fence *last = job->fences[job->nfences - 1];
++	unsigned int i, answered = 0;
++	bool error = timed_out;
++	u32 status = 0;
++
++	for (i = 0; i < job->nfences; i++) {
++		struct apple_vxd_fence *f = job->fences[i];
++
++		if (READ_ONCE(f->state) == APPLE_VXD_FENCE_SIGNALLED) {
++			answered++;
++			error |= f->error;
++			status |= f->status;
++		}
++	}
++	vxd_step_io(vxd->dev,
++		    "decode: %s: fence %#x (seq %#x), %u of %u packets answered, status %#x, %lld us -> %s",
++		    timed_out ? "TIMEOUT" : "completion", last->id, job->seq,
++		    answered, job->nfences, status,
++		    ktime_us_delta(ktime_get(), job->submitted),
++		    error ? "ERROR" : "DONE");
++	for (i = 0; i < job->nfences; i++)
++		apple_vxd_fence_release(vxd, job->fences[i]);
++	apple_vxd_job_finish(job->ctx, error ? VB2_BUF_STATE_ERROR :
++						 VB2_BUF_STATE_DONE);
++}
+ 
+-	if (!active)
++void apple_vxd_job_done(struct work_struct *work)
++{
++	struct apple_vxd_dev *vxd = container_of(work, struct apple_vxd_dev,
++						 job_done_work);
++	struct apple_vxd_job job;
++
++	if (!vxd_job_take(vxd, true, &job))
++		return;
++	cancel_delayed_work(&vxd->watchdog_work);
++	vxd_job_complete(vxd, &job, false);
++}
++
++/*
++ * No 0xc0 for the last packet in APPLE_VXD_JOB_TIMEOUT_MS: fail the
++ * picture.  The command buffer stays quarantined (the core may still
++ * read it) until the firmware is stopped.
++ */
++void apple_vxd_watchdog(struct work_struct *work)
++{
++	struct apple_vxd_dev *vxd = container_of(work, struct apple_vxd_dev,
++						 watchdog_work.work);
++	struct apple_vxd_job job;
++
++	if (!vxd_job_take(vxd, false, &job))
+ 		return;
+ 
+-	dev_warn(vxd->dev, "decode job timed out (no firmware completion)\n");
+-	apple_vxd_job_finish(NULL, VB2_BUF_STATE_ERROR);
++	dev_warn(vxd->dev,
++		 "decode job timed out: no completion for fence %#x in %u ms (TO_MTX rd %u wr %u, TO_HOST rd %u wr %u, 0x200c %#x, irq status %#x)\n",
++		 job.fences[job.nfences - 1]->id, APPLE_VXD_JOB_TIMEOUT_MS,
++		 vxd_read(vxd, VXD_REG_TO_MTX_RD_INDEX),
++		 vxd_read(vxd, VXD_REG_TO_MTX_WR_INDEX),
++		 vxd_read(vxd, VXD_REG_TO_HOST_RD_INDEX),
++		 vxd_read(vxd, VXD_REG_TO_HOST_WR_INDEX),
++		 vxd_read(vxd, VXD_REG_FW_PC), vxd_read(vxd, VXD_REG_IRQ_STATUS));
++	vxd_job_complete(vxd, &job, true);
+ }
+ 
+ /*
+@@ -361,6 +438,7 @@ static int apple_vxd_probe(struct platform_device *pdev)
+ 	for (i = 0; i < APPLE_VXD_NUM_FENCES; i++)
+ 		init_completion(&vxd->fences[i].done);
+ 	INIT_DELAYED_WORK(&vxd->watchdog_work, apple_vxd_watchdog);
++	INIT_WORK(&vxd->job_done_work, apple_vxd_job_done);
+ 
+ 	vxd_step(&pdev->dev, "probe: map MMIO");
+ 	vxd->regs = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
+@@ -492,6 +570,9 @@ static void apple_vxd_remove(struct platform_device *pdev)
+ 
+ 	vxd_step(&pdev->dev, "remove: free firmware buffer");
+ 	apple_vxd_fw_cleanup(vxd);
++	/* fw_cleanup failed every fence: let a pending job finish first. */
++	flush_work(&vxd->job_done_work);
++	cancel_delayed_work_sync(&vxd->watchdog_work);
+ 
+ 	vxd_step(&pdev->dev, "remove: free GART");
+ 	apple_vxd_gart_fini(vxd);
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-gart.c b/drivers/media/platform/apple/vxd/apple-vxd-gart.c
+index c3a2490acd90180023da82d99acd3bb50057058e..cc2eb1f995256936b6d18f3773cea9760e67c1ee 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-gart.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-gart.c
+@@ -247,3 +247,37 @@ void apple_vxd_gart_unmap(struct apple_vxd_dev *vxd, struct apple_vxd_mapping *m
+ 	mutex_unlock(&gart->lock);
+ 	memset(map, 0, sizeof(*map));
+ }
++
++/*
++ * A zeroed coherent buffer, 4 KiB aligned (every MSVDX base-address
++ * register drops the low 12 bits), GART-mapped for its lifetime.
++ */
++int apple_vxd_dev_buf_alloc(struct apple_vxd_dev *vxd, size_t size,
++			    struct apple_vxd_dev_buf *buf)
++{
++	int ret;
++
++	ret = apple_vxd_dma_alloc_aligned(vxd, ALIGN(size, VXD_GART_PAGE_SIZE),
++					  VXD_GART_PAGE_SIZE, &buf->mem);
++	if (ret)
++		return ret;
++	memset(buf->mem.vaddr, 0, buf->mem.size);
++
++	ret = apple_vxd_gart_map(vxd, buf->mem.dma, buf->mem.size, &buf->map);
++	if (ret) {
++		apple_vxd_dma_free_aligned(vxd, &buf->mem);
++		return ret;
++	}
++	buf->va = buf->map.va;
++	return 0;
++}
++
++void apple_vxd_dev_buf_free(struct apple_vxd_dev *vxd,
++			    struct apple_vxd_dev_buf *buf)
++{
++	if (!buf->mem.raw_vaddr)
++		return;
++	apple_vxd_gart_unmap(vxd, &buf->map);
++	apple_vxd_dma_free_aligned(vxd, &buf->mem);
++	buf->va = 0;
++}
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-h264.c b/drivers/media/platform/apple/vxd/apple-vxd-h264.c
+index 105c7e8b1670ed215abc2b3bb5628d23998381df..e48554b67d7d2378eee999fa6fe8ffab44e8809b 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-h264.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-h264.c
+@@ -1,18 +1,54 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /*
+- * Apple VXD - H.264 backend (V4L2 stateless)
++ * Apple VXD - H.264 backend (V4L2 stateless, frame based)
+  *
+- * Userspace does the bitstream parsing (V4L2 stateless contract); this
+- * layer validates the parameters against what the silicon accepts and
+- * translates them into the firmware/hardware submission.  The submission
+- * is an MSVDX register program in a command buffer plus one mailbox
+- * message per slice packet (docs/periph/ds-vxd-cmdstream.md); the
+- * generator for that program (R3c) is not written yet, so
+- * apple_vxd_submit() still fails every job.
++ * Userspace parses the parameter sets and the DPB (V4L2 stateless
++ * contract); the OUTPUT buffer carries a whole Annex-B access unit.  Per
++ * picture this file
++ *
++ *   1. validates SPS/PPS against what the AVC recipe covers,
++ *   2. finds and parses the slices itself (frame-based mode has no
++ *      SLICE_PARAMS, apple-vxd-h264-parse.c),
++ *   3. builds RefPicList0 (v4l2-h264 helper + the slice's modifications)
++ *      and resolves the DPB to CAPTURE device addresses by timestamp,
++ *   4. builds the command stream (apple-vxd-h264-cmd.c) into a pooled
++ *      command buffer and submits one 0x81 message per slice.
++ *
++ * The job completes from the last packet's 0xc0 (apple_vxd_job_done()).
++ *
++ * The context owns the buffers DecodeCreateH264VLD allocates for the
++ * AVC path (ds-vxd-cmdstream.md section 16.5): the packed CAVLC table
++ * (0x1000, the 0x440-byte constant), the IntraBuffer and the
++ * StreamStateBuffer, each sized for the larger of Apple's two platform
++ * multipliers.  Each CAPTURE buffer carries its stored-macroblock
++ * parameter buffer (apple_vxd_buffer.aux).
+  */
++#include <linux/crc32.h>
++#include <linux/slab.h>
++#include <linux/sizes.h>
++
+ #include <media/v4l2-h264.h>
+ 
+ #include "apple-vxd.h"
++#include "apple-vxd-h264-cmd.h"
++#include "apple-vxd-h264-parse.h"
++#include "apple-vxd-h264-tables.h"
++
++/* DecodeCreateH264VLD sizes with Apple's multiplier M = 2. */
++#define APPLE_VXD_H264_CAVLC_BUF	SZ_4K
++#define APPLE_VXD_H264_INTRA_BUF	(2 << 16)
++#define APPLE_VXD_H264_STREAM_STATE_BUF	(2 << 12)
++
++struct apple_vxd_h264_ctx {
++	struct apple_vxd_dev_buf cavlc;
++	struct apple_vxd_dev_buf intra;
++	struct apple_vxd_dev_buf stream_state;
++	bool first_picture;
++	struct apple_vxd_h264_slice slices[APPLE_VXD_H264_MAX_SLICES];
++	u8 ref_slots[APPLE_VXD_H264_MAX_SLICES][2][V4L2_H264_REF_LIST_LEN];
++};
++
++static_assert(sizeof(apple_vxd_h264_vlc_table) == APPLE_VXD_H264_VLC_BYTES);
+ 
+ static int apple_vxd_h264_validate_sps(struct apple_vxd_ctx *ctx,
+ 				       const struct v4l2_ctrl_h264_sps *sps)
+@@ -24,7 +60,9 @@ static int apple_vxd_h264_validate_sps(struct apple_vxd_ctx *ctx,
+ 	 * High 10/4:2:2/4:4:4 are caught by the chroma/bit-depth checks below.
+ 	 * No allow-list: the control's default (profile_idc 0, before
+ 	 * userspace sets an SPS) must pass, or TRY_EXT_CTRLS on the current
+-	 * values fails (v4l2-compliance, round 3 QEMU smoke).
++	 * values fails (v4l2-compliance, round 3 QEMU smoke).  What the AVC
++	 * command recipe does not cover yet (interlace, FMO, scaling lists,
++	 * weighted prediction, 8x8 transform) is refused per picture.
+ 	 */
+ 	switch (sps->profile_idc) {
+ 	case 88: /* extended: data partitioning */
+@@ -85,12 +123,64 @@ static int apple_vxd_h264_try_ctrl(struct apple_vxd_ctx *ctx,
+ 
+ static int apple_vxd_h264_start(struct apple_vxd_ctx *ctx)
+ {
+-	/* R3c allocates the per-context entropy/VLC table buffers here. */
++	struct apple_vxd_dev *vxd = ctx->vxd;
++	struct apple_vxd_h264_ctx *h;
++	int ret;
++
++	h = kvzalloc_obj(*h);
++	if (!h)
++		return -ENOMEM;
++
++	ret = apple_vxd_dev_buf_alloc(vxd, APPLE_VXD_H264_CAVLC_BUF, &h->cavlc);
++	if (ret)
++		goto err_free;
++	ret = apple_vxd_dev_buf_alloc(vxd, APPLE_VXD_H264_INTRA_BUF, &h->intra);
++	if (ret)
++		goto err_cavlc;
++	ret = apple_vxd_dev_buf_alloc(vxd, APPLE_VXD_H264_STREAM_STATE_BUF,
++				      &h->stream_state);
++	if (ret)
++		goto err_intra;
++
++	memcpy(h->cavlc.mem.vaddr, apple_vxd_h264_vlc_table,
++	       sizeof(apple_vxd_h264_vlc_table));
++	if ((crc32_le(~0U, h->cavlc.mem.vaddr, APPLE_VXD_H264_VLC_BYTES) ^ ~0U) !=
++	    APPLE_VXD_H264_VLC_CRC32) {
++		dev_err(vxd->dev, "h264: CAVLC table CRC mismatch\n");
++		ret = -EIO;
++		goto err_state;
++	}
++	h->first_picture = true;
++	ctx->priv = h;
++
++	vxd_step_io(vxd->dev,
++		    "h264: context buffers: cavlc %#x, intra %#x (%u bytes), stream state %#x (%u bytes)",
++		    h->cavlc.va, h->intra.va, APPLE_VXD_H264_INTRA_BUF,
++		    h->stream_state.va, APPLE_VXD_H264_STREAM_STATE_BUF);
+ 	return 0;
++
++err_state:
++	apple_vxd_dev_buf_free(vxd, &h->stream_state);
++err_intra:
++	apple_vxd_dev_buf_free(vxd, &h->intra);
++err_cavlc:
++	apple_vxd_dev_buf_free(vxd, &h->cavlc);
++err_free:
++	kvfree(h);
++	return ret;
+ }
+ 
+ static void apple_vxd_h264_stop(struct apple_vxd_ctx *ctx)
+ {
++	struct apple_vxd_h264_ctx *h = ctx->priv;
++
++	if (!h)
++		return;
++	apple_vxd_dev_buf_free(ctx->vxd, &h->stream_state);
++	apple_vxd_dev_buf_free(ctx->vxd, &h->intra);
++	apple_vxd_dev_buf_free(ctx->vxd, &h->cavlc);
++	kvfree(h);
++	ctx->priv = NULL;
+ }
+ 
+ static enum apple_vxd_image_fmt
+@@ -102,10 +192,83 @@ apple_vxd_h264_get_image_fmt(struct apple_vxd_ctx *ctx, struct v4l2_ctrl *ctrl)
+ 	return APPLE_VXD_IMG_FMT_420_8BIT;
+ }
+ 
++static size_t apple_vxd_h264_capture_aux_size(struct apple_vxd_ctx *ctx)
++{
++	const struct v4l2_pix_format_mplane *pix = &ctx->decoded_fmt.fmt.pix_mp;
++
++	return apple_vxd_h264_colocated_size(DIV_ROUND_UP(pix->width, 16),
++					     DIV_ROUND_UP(pix->height, 16));
++}
++
++static const void *apple_vxd_h264_ctrl(struct apple_vxd_ctx *ctx, u32 id)
++{
++	struct v4l2_ctrl *ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, id);
++
++	return ctrl ? ctrl->p_cur.p : NULL;
++}
++
++/*
++ * RefPicList0 per P slice as DPB slots: the default list (8.2.4.2.1),
++ * truncated to num_ref_idx_l0_active, then the slice's modifications
++ * (8.2.4.3).  Entries past the available references are NO_REF.
++ */
++static int apple_vxd_h264_ref_lists(struct apple_vxd_h264_ctx *h,
++				    unsigned int nslices,
++				    const struct v4l2_ctrl_h264_sps *sps,
++				    const struct v4l2_ctrl_h264_decode_params *dp)
++{
++	struct v4l2_h264_reference plist[V4L2_H264_REF_LIST_LEN];
++	struct v4l2_h264_reference list[V4L2_H264_REF_LIST_LEN];
++	struct v4l2_h264_reflist_builder b;
++	bool built = false;
++	unsigned int i, k;
++	int ret;
++
++	for (i = 0; i < nslices; i++) {
++		const struct apple_vxd_h264_slice *sl = &h->slices[i];
++		unsigned int len = sl->num_ref_idx_l0_active_minus1 + 1;
++
++		memset(h->ref_slots[i], APPLE_VXD_H264_NO_REF,
++		       sizeof(h->ref_slots[i]));
++		if (sl->slice_type != V4L2_H264_SLICE_TYPE_P)
++			continue;
++
++		if (!built) {
++			v4l2_h264_init_reflist_builder(&b, dp, sps, dp->dpb);
++			v4l2_h264_build_p_ref_list(&b, plist);
++			built = true;
++		}
++		for (k = 0; k < V4L2_H264_REF_LIST_LEN; k++) {
++			list[k] = plist[k];
++			if (k >= b.num_valid)
++				list[k].index = APPLE_VXD_H264_NO_REF;
++		}
++		ret = apple_vxd_h264_modify_ref_list(sl, 0, sps, dp, list, len);
++		if (ret)
++			return ret;
++		for (k = 0; k < len; k++)
++			h->ref_slots[i][0][k] = list[k].index;
++	}
++	return 0;
++}
++
+ static int apple_vxd_h264_run(struct apple_vxd_ctx *ctx)
+ {
++	const struct v4l2_pix_format_mplane *pix = &ctx->decoded_fmt.fmt.pix_mp;
++	const struct v4l2_ctrl_h264_decode_params *dp;
++	const struct v4l2_ctrl_h264_sps *sps;
++	const struct v4l2_ctrl_h264_pps *pps;
++	struct apple_vxd_h264_ctx *h = ctx->priv;
+ 	struct apple_vxd_dev *vxd = ctx->vxd;
++	struct apple_vxd_h264_frame f = { };
++	struct apple_vxd_cmdbuf *cb = NULL;
+ 	struct apple_vxd_run run;
++	const char *why = NULL;
++	struct vb2_queue *cap_q;
++	unsigned int i, nslices;
++	const u8 *src;
++	size_t src_len;
++	u32 stride;
+ 	int ret;
+ 
+ 	apple_vxd_run_preamble(ctx, &run);
+@@ -113,21 +276,148 @@ static int apple_vxd_h264_run(struct apple_vxd_ctx *ctx)
+ 	if (!vxd->hw_ready || vxd->fw_panicked) {
+ 		dev_dbg(vxd->dev,
+ 			"decode job with no usable firmware (not booted, init message not taken, or panicked)\n");
+-		apple_vxd_run_postamble(ctx, &run);
+-		return -EAGAIN;
++		ret = -EAGAIN;
++		goto out;
++	}
++	if (!h) {
++		ret = -EINVAL;
++		goto out;
+ 	}
+ 
++	sps = apple_vxd_h264_ctrl(ctx, V4L2_CID_STATELESS_H264_SPS);
++	pps = apple_vxd_h264_ctrl(ctx, V4L2_CID_STATELESS_H264_PPS);
++	dp = apple_vxd_h264_ctrl(ctx, V4L2_CID_STATELESS_H264_DECODE_PARAMS);
++	if (!sps || !pps || !dp) {
++		ret = -EINVAL;
++		goto out;
++	}
++	ret = apple_vxd_h264_validate(sps, pps, &why);
++	if (ret)
++		goto out_why;
++	if (dp->flags & (V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC |
++			 V4L2_H264_DECODE_PARAM_FLAG_BFRAME)) {
++		why = "field or B pictures";
++		ret = -EINVAL;
++		goto out_why;
++	}
++	if ((sps->pic_width_in_mbs_minus1 + 1) * 16 > pix->width ||
++	    (sps->pic_height_in_map_units_minus1 + 1) * 16 > pix->height) {
++		why = "picture larger than the CAPTURE format";
++		ret = -EINVAL;
++		goto out_why;
++	}
++
++	src_len = vb2_get_plane_payload(&run.src->vb2_buf, 0);
++	src = vb2_plane_vaddr(&run.src->vb2_buf, 0);
++	if (!src) {
++		why = "OUTPUT buffer has no kernel mapping";
++		ret = -EINVAL;
++		goto out_why;
++	}
++	ret = apple_vxd_h264_find_slices(src, src_len, sps, pps, h->slices,
++					 APPLE_VXD_H264_MAX_SLICES, &nslices,
++					 &why);
++	if (ret)
++		goto out_why;
++	if (nslices > APPLE_VXD_JOB_MAX_PACKETS) {
++		why = "more than 8 slices in one picture";
++		ret = -EINVAL;
++		goto out_why;
++	}
++	ret = apple_vxd_h264_ref_lists(h, nslices, sps, dp);
++	if (ret) {
++		why = "a reference-list modification names a picture not in the DPB";
++		goto out_why;
++	}
++
++	stride = pix->plane_fmt[0].bytesperline;
++	f.sps = sps;
++	f.pps = pps;
++	f.dp = dp;
++	f.slices = h->slices;
++	f.nslices = nslices;
++	f.ref_slots = (const u8 (*)[2][V4L2_H264_REF_LIST_LEN])h->ref_slots;
++	f.src_va = apple_vxd_buf_va(run.src);
++	f.dst_luma = apple_vxd_buf_va(run.dst);
++	f.dst_chroma = f.dst_luma + stride * pix->height;
++	f.dst_stride = stride;
++	f.colocated = apple_vxd_buf_aux_va(run.dst);
++	f.bufs.cavlc = h->cavlc.va;
++	f.bufs.intra = h->intra.va;
++	f.bufs.stream_state = h->stream_state.va;
++	f.first_picture = h->first_picture;
++
++	cap_q = v4l2_m2m_get_vq(ctx->fh.m2m_ctx, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
++	for (i = 0; i < V4L2_H264_NUM_DPB_ENTRIES; i++) {
++		const struct v4l2_h264_dpb_entry *e = &dp->dpb[i];
++		struct vb2_buffer *ref;
++
++		if (!(e->flags & V4L2_H264_DPB_ENTRY_FLAG_VALID))
++			continue;
++		ref = vb2_find_buffer(cap_q, e->reference_ts);
++		if (!ref) {
++			dev_dbg(vxd->dev, "h264: dpb[%u] ts %llu has no CAPTURE buffer\n",
++				i, e->reference_ts);
++			continue;
++		}
++		f.dpb_luma[i] = apple_vxd_buf_va(to_vb2_v4l2_buffer(ref));
++		f.dpb_chroma[i] = f.dpb_luma[i] + stride * pix->height;
++	}
++	for (i = 0; i < nslices; i++) {
++		unsigned int k, len = h->slices[i].num_ref_idx_l0_active_minus1 + 1;
++
++		for (k = 0; h->slices[i].slice_type == V4L2_H264_SLICE_TYPE_P && k < len; k++) {
++			u8 slot = h->ref_slots[i][0][k];
++
++			if (slot < V4L2_H264_NUM_DPB_ENTRIES && !f.dpb_luma[slot]) {
++				why = "a reference picture has no CAPTURE buffer";
++				ret = -EINVAL;
++				goto out_why;
++			}
++		}
++	}
++
++	cb = apple_vxd_cmdbuf_get(vxd);
++	if (!cb) {
++		why = "no free command buffer";
++		ret = -EBUSY;
++		goto out_why;
++	}
++	ret = apple_vxd_h264_build(cb, &f, &why);
++	if (ret)
++		goto out_why;
++
++	vxd_step_io(vxd->dev,
++		    "decode: src %u va %#x (%zu bytes, %u slices, first NAL %#x+%u, header %u bits), dst %u Y %#x UV %#x stride %u, %zu command bytes in buf %u (va %#x), %u packets",
++		    run.src->vb2_buf.index, f.src_va, src_len, nslices,
++		    h->slices[0].nal_offset, h->slices[0].nal_size,
++		    8 + h->slices[0].header_bits_raw, run.dst->vb2_buf.index,
++		    f.dst_luma, f.dst_chroma, stride, cb->used, cb->index,
++		    cb->va, cb->npackets);
++
+ 	/*
+-	 * What R3c will reference: the bitstream and the render target by
+-	 * device VA (ds-vxd-cmdstream.md sections 3.3 and 6).
++	 * The controls were only read while building: complete them before
++	 * the submit, after which the job may finish (and the request with
++	 * it) at any moment.
+ 	 */
+-	vxd_step_io(vxd->dev, "decode: src %u va %#x (%lu bytes), dst %u va %#x",
+-		    run.src->vb2_buf.index, apple_vxd_buf_va(run.src),
+-		    vb2_get_plane_payload(&run.src->vb2_buf, 0),
+-		    run.dst->vb2_buf.index, apple_vxd_buf_va(run.dst));
+-	ret = apple_vxd_submit(ctx, &run);
+ 	apple_vxd_run_postamble(ctx, &run);
++	ret = apple_vxd_submit(ctx, cb);
++	if (ret) {
++		dev_warn_ratelimited(vxd->dev, "decode: submit failed: %d\n", ret);
++		if (cb->state == APPLE_VXD_CMDBUF_HOST)
++			apple_vxd_cmdbuf_put(vxd, cb);
++		return ret;
++	}
++	h->first_picture = false;
++	return 0;
+ 
++out_why:
++	dev_warn_ratelimited(vxd->dev, "decode: picture refused (%d): %s\n",
++			     ret, why ? why : "?");
++out:
++	if (cb)
++		apple_vxd_cmdbuf_put(vxd, cb);
++	apple_vxd_run_postamble(ctx, &run);
+ 	return ret;
+ }
+ 
+@@ -212,6 +502,7 @@ static const struct apple_vxd_coded_fmt_desc apple_vxd_h264_fmt = {
+ 		.run = apple_vxd_h264_run,
+ 		.try_ctrl = apple_vxd_h264_try_ctrl,
+ 		.get_image_fmt = apple_vxd_h264_get_image_fmt,
++		.capture_aux_size = apple_vxd_h264_capture_aux_size,
+ 	},
+ 	.num_decoded_fmts = ARRAY_SIZE(apple_vxd_h264_decoded_fmts),
+ 	.decoded_fmts = apple_vxd_h264_decoded_fmts,
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-mbox.c b/drivers/media/platform/apple/vxd/apple-vxd-mbox.c
+index d3b1c2ed0e0b060c602122580599984d27a282c0..c99dcec9574a70e95abeb8d88386762fd23b2b7c 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-mbox.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-mbox.c
+@@ -53,8 +53,6 @@
+  */
+ #define VXD_IRQ_STORM_LIMIT		1000
+ 
+-static bool apple_vxd_submit_announced;
+-
+ /* --- ring arithmetic: pure, shared with the self-test ------------------ */
+ 
+ static u32 vxd_ring_next(u32 idx, u32 cap)
+@@ -293,33 +291,49 @@ int apple_vxd_msg_wait_consumed(struct apple_vxd_dev *vxd,
+ 
+ /* --- fences ------------------------------------------------------------ */
+ 
+-struct apple_vxd_fence *apple_vxd_fence_arm(struct apple_vxd_dev *vxd,
+-					    unsigned int packet, u8 type)
++/* 12-bit submission counter, never 0: fence 0 is the init message's.  mbox_lock held. */
++static u16 vxd_fence_next_seq_locked(struct apple_vxd_dev *vxd)
++{
++	vxd->fence_seq = (vxd->fence_seq + 1) & 0xfff;
++	if (!vxd->fence_seq)
++		vxd->fence_seq = 1;
++	return vxd->fence_seq;
++}
++
++/* mbox_lock held. */
++static struct apple_vxd_fence *vxd_fence_arm_locked(struct apple_vxd_dev *vxd,
++						    u16 id, u8 type)
+ {
+-	struct apple_vxd_fence *fence = NULL;
+-	unsigned long flags;
+ 	unsigned int i;
+ 
+-	spin_lock_irqsave(&vxd->mbox_lock, flags);
+ 	for (i = 0; i < APPLE_VXD_NUM_FENCES; i++) {
+-		if (vxd->fences[i].state == APPLE_VXD_FENCE_FREE) {
+-			fence = &vxd->fences[i];
+-			break;
+-		}
+-	}
+-	if (fence) {
+-		/* 12-bit submission counter, never 0: fence 0 is the init message's. */
+-		vxd->fence_seq = (vxd->fence_seq + 1) & 0xfff;
+-		if (!vxd->fence_seq)
+-			vxd->fence_seq = 1;
+-		fence->id = vxd_fence_id(vxd->fence_seq, packet);
++		struct apple_vxd_fence *fence = &vxd->fences[i];
++
++		if (fence->state != APPLE_VXD_FENCE_FREE)
++			continue;
++		fence->id = id;
+ 		fence->type = type;
+ 		fence->status = 0;
+ 		fence->error = false;
++		fence->job = false;
+ 		fence->cmdbuf = NULL;
+ 		fence->state = APPLE_VXD_FENCE_ARMED;
+ 		reinit_completion(&fence->done);
++		return fence;
+ 	}
++	return NULL;
++}
++
++struct apple_vxd_fence *apple_vxd_fence_arm(struct apple_vxd_dev *vxd,
++					    unsigned int packet, u8 type)
++{
++	struct apple_vxd_fence *fence;
++	unsigned long flags;
++
++	spin_lock_irqsave(&vxd->mbox_lock, flags);
++	fence = vxd_fence_arm_locked(vxd,
++				     vxd_fence_id(vxd_fence_next_seq_locked(vxd),
++						  packet), type);
+ 	spin_unlock_irqrestore(&vxd->mbox_lock, flags);
+ 
+ 	return fence;
+@@ -336,6 +350,7 @@ void apple_vxd_fence_release(struct apple_vxd_dev *vxd,
+ 		fence->cmdbuf->fence = NULL;
+ 		fence->cmdbuf = NULL;
+ 	}
++	fence->job = false;
+ 	fence->state = APPLE_VXD_FENCE_FREE;
+ 	spin_unlock_irqrestore(&vxd->mbox_lock, flags);
+ }
+@@ -346,7 +361,8 @@ void apple_vxd_fence_release(struct apple_vxd_dev *vxd,
+  * or a teardown wakes the waiter but leaves the buffer quarantined until
+  * apple_vxd_cmdbufs_reclaim().
+  */
+-static void vxd_fence_complete(struct apple_vxd_fence *fence, u32 status,
++static void vxd_fence_complete(struct apple_vxd_dev *vxd,
++			       struct apple_vxd_fence *fence, u32 status,
+ 			       bool error, bool device_done)
+ {
+ 	struct apple_vxd_cmdbuf *cb = fence->cmdbuf;
+@@ -362,6 +378,9 @@ static void vxd_fence_complete(struct apple_vxd_fence *fence, u32 status,
+ 	fence->error = error;
+ 	fence->state = APPLE_VXD_FENCE_SIGNALLED;
+ 	complete_all(&fence->done);
++	/* The job is finished in process context (v4l2-m2m, runtime PM). */
++	if (fence->job)
++		queue_work(system_highpri_wq, &vxd->job_done_work);
+ }
+ 
+ /* Called with mbox_lock held: wake every waiter with an error. */
+@@ -371,7 +390,7 @@ static void vxd_fences_fail_all(struct apple_vxd_dev *vxd)
+ 
+ 	for (i = 0; i < APPLE_VXD_NUM_FENCES; i++)
+ 		if (vxd->fences[i].state == APPLE_VXD_FENCE_ARMED)
+-			vxd_fence_complete(&vxd->fences[i], 0, true, false);
++			vxd_fence_complete(vxd, &vxd->fences[i], 0, true, false);
+ }
+ 
+ /* --- drain ------------------------------------------------------------- */
+@@ -458,7 +477,7 @@ static void vxd_msg_completion(struct apple_vxd_dev *vxd, const u32 *msg,
+ 		struct apple_vxd_fence *fence = &vxd->fences[i];
+ 
+ 		if (fence->state == APPLE_VXD_FENCE_ARMED && fence->id == id) {
+-			vxd_fence_complete(fence, status, fault, true);
++			vxd_fence_complete(vxd, fence, status, fault, true);
+ 			return;
+ 		}
+ 	}
+@@ -669,19 +688,136 @@ void apple_vxd_mbox_stop(struct apple_vxd_dev *vxd)
+ }
+ 
+ /*
+- * Decode submission.  The mailbox is live, but the H.264 command-stream
+- * generator (R3c) is not written yet, so a decode job still fails.
++ * Decode submission: one picture's command buffer, one mailbox message per
++ * packet, in packet-list order (SubmitCommandBufferInternal
++ * 0xfffffff00628a8d4 [E]).  The last message carries 0x4004 and its fence
++ * completes the job (apple_vxd_job_done(), process context); the buffer
++ * is bound to that fence and freed by its 0xc0.  Returns 0 once every
++ * message is in TO_MTX; on an error nothing is left armed, and a buffer
++ * the firmware may already have been told about stays quarantined.
+  */
+-int apple_vxd_submit(struct apple_vxd_ctx *ctx, struct apple_vxd_run *run)
++int apple_vxd_submit(struct apple_vxd_ctx *ctx, struct apple_vxd_cmdbuf *cb)
+ {
++	u32 msgs[APPLE_VXD_JOB_MAX_PACKETS][VXD_DECODE_MSG_WORDS];
++	struct apple_vxd_fence *fences[APPLE_VXD_JOB_MAX_PACKETS] = { };
+ 	struct apple_vxd_dev *vxd = ctx->vxd;
++	struct apple_vxd_msg_ticket ticket;
++	unsigned int i, pushed = 0;
++	unsigned long flags;
++	bool gart_dirty;
++	int n, ret;
++	size_t off;
++	u16 seq;
++
++	n = apple_vxd_cmdbuf_validate(cb);
++	if (n <= 0 || n > APPLE_VXD_JOB_MAX_PACKETS) {
++		dev_err(vxd->dev, "decode: %d packets in the command buffer (1..%u)\n",
++			n, APPLE_VXD_JOB_MAX_PACKETS);
++		return -EINVAL;
++	}
+ 
+-	if (!apple_vxd_submit_announced) {
+-		dev_info(vxd->dev,
+-			 "decode: the mailbox is up but the H.264 command-stream generator (R3c) is not implemented; decode jobs fail\n");
+-		apple_vxd_submit_announced = true;
++	mutex_lock(&vxd->power_lock);
++	if (!vxd->mbox_ready || !vxd->hw_ready || vxd->fw_panicked) {
++		ret = -ENODEV;
++		goto out_unlock;
+ 	}
+-	return -EOPNOTSUPP;
++
++	/* Fences first: the firmware may answer before the last push. */
++	spin_lock_irqsave(&vxd->mbox_lock, flags);
++	seq = vxd_fence_next_seq_locked(vxd);
++	for (i = 0, off = 0; i < n; i++) {
++		const u32 *pkt = (const u32 *)(cb->pkt + off);
++
++		fences[i] = vxd_fence_arm_locked(vxd, vxd_fence_id(seq, i),
++						 pkt[3 + VXD_PKT_KIND / 4]);
++		if (!fences[i])
++			break;
++		off += VXD_PKT_HDR_BYTES + pkt[1];
++	}
++	spin_unlock_irqrestore(&vxd->mbox_lock, flags);
++	if (i < n) {
++		ret = -EBUSY;
++		goto out_fences;
++	}
++
++	for (i = 0, off = 0; i < n; i++) {
++		u32 *pkt = (u32 *)(cb->pkt + off);
++
++		ret = apple_vxd_packet_msg(vxd, pkt, fences[i]->id, 0, i == n - 1,
++					   msgs[i]);
++		if (ret < 0)
++			goto out_fences;
++		fences[i]->type = ret;
++		off += VXD_PKT_HDR_BYTES + pkt[1];
++	}
++	fences[n - 1]->job = true;
++	ret = apple_vxd_cmdbuf_bind(vxd, cb, fences[n - 1]);
++	if (ret)
++		goto out_fences;
++
++	spin_lock_irqsave(&vxd->job_lock, flags);
++	if (vxd->job_active) {
++		spin_unlock_irqrestore(&vxd->job_lock, flags);
++		ret = -EBUSY;
++		goto out_unbind;
++	}
++	vxd->job.ctx = ctx;
++	vxd->job.nfences = n;
++	vxd->job.seq = seq;
++	vxd->job.submitted = ktime_get();
++	memcpy(vxd->job.fences, fences, sizeof(fences));
++	vxd->job_active = true;
++	spin_unlock_irqrestore(&vxd->job_lock, flags);
++
++	/* The kext rewrites 0x1008 before a submit that follows a GART change. */
++	mutex_lock(&vxd->gart.lock);
++	gart_dirty = vxd->gart.dirty;
++	vxd->gart.dirty = false;
++	mutex_unlock(&vxd->gart.lock);
++	if (gart_dirty)
++		vxd_write(vxd, VXD_REG_MMU_CONTROL1, VXD_MMU_INVALDC_ALL);
++
++	for (i = 0; i < n; i++) {
++		vxd_step_io(vxd->dev,
++			    "decode: push %#x fence %#x {%#x %#x %#x %#x %#x %#x}",
++			    fences[i]->type, fences[i]->id, msgs[i][0], msgs[i][1],
++			    msgs[i][2], msgs[i][3], msgs[i][4], msgs[i][5]);
++		ret = apple_vxd_msg_push(vxd, msgs[i], &ticket);
++		if (ret)
++			break;
++		pushed++;
++	}
++	if (ret) {
++		dev_err(vxd->dev, "decode: push %u of %d failed: %d%s\n", pushed + 1,
++			n, ret, pushed ? "; the command buffer stays quarantined" : "");
++		spin_lock_irqsave(&vxd->job_lock, flags);
++		vxd->job_active = false;
++		spin_unlock_irqrestore(&vxd->job_lock, flags);
++		if (pushed)
++			goto out_fences;	/* release leaves the buffer DEVICE */
++		goto out_unbind;
++	}
++
++	schedule_delayed_work(&vxd->watchdog_work,
++			      msecs_to_jiffies(APPLE_VXD_JOB_TIMEOUT_MS));
++	mutex_unlock(&vxd->power_lock);
++	return 0;
++
++out_unbind:
++	spin_lock_irqsave(&vxd->mbox_lock, flags);
++	if (cb->state == APPLE_VXD_CMDBUF_DEVICE && cb->fence == fences[n - 1]) {
++		cb->state = APPLE_VXD_CMDBUF_HOST;
++		cb->fence = NULL;
++		fences[n - 1]->cmdbuf = NULL;
++	}
++	spin_unlock_irqrestore(&vxd->mbox_lock, flags);
++out_fences:
++	for (i = 0; i < n; i++)
++		if (fences[i])
++			apple_vxd_fence_release(vxd, fences[i]);
++out_unlock:
++	mutex_unlock(&vxd->power_lock);
++	return ret;
+ }
+ 
+ /* --- debugfs ------------------------------------------------------------- */
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-v4l2.c b/drivers/media/platform/apple/vxd/apple-vxd-v4l2.c
+index f02e21d08b02141d0cb9347c38a79ffaeb7cd106..9a348ff862f83b57bd209c1f767691b4c081cdef 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-v4l2.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-v4l2.c
+@@ -45,11 +45,28 @@ static void apple_vxd_reset_fmt(struct apple_vxd_ctx *ctx,
+ 	f->fmt.pix_mp.xfer_func = V4L2_XFER_FUNC_DEFAULT;
+ }
+ 
++/*
++ * Every MSVDX surface base register (luma and chroma reconstruction,
++ * references) drops the low 12 bits, and the extended row stride counts
++ * 64-byte units.  With single-plane NV12 the chroma plane starts at
++ * bytesperline * height, so the luma stride is rounded up to 256 bytes:
++ * with the height a multiple of 16 that keeps the chroma plane 4 KiB
++ * aligned behind a page-aligned buffer.
++ */
++#define APPLE_VXD_NV12_STRIDE_ALIGN	256
++
+ static void apple_vxd_fill_decoded_pixfmt(struct apple_vxd_ctx *ctx,
+ 					  struct v4l2_pix_format_mplane *pix_mp)
+ {
++	struct v4l2_plane_pix_format *plane = &pix_mp->plane_fmt[0];
++
+ 	v4l2_fill_pixfmt_mp(pix_mp, pix_mp->pixelformat,
+ 			    pix_mp->width, pix_mp->height);
++	if (pix_mp->pixelformat == V4L2_PIX_FMT_NV12) {
++		plane->bytesperline = ALIGN(pix_mp->width,
++					    APPLE_VXD_NV12_STRIDE_ALIGN);
++		plane->sizeimage = plane->bytesperline * pix_mp->height * 3 / 2;
++	}
+ }
+ 
+ static const struct apple_vxd_decoded_fmt_desc *
+@@ -691,6 +708,26 @@ static int apple_vxd_buf_init(struct vb2_buffer *vb)
+ 		    "vb2: %s buffer %u GART-mapped: dma %pad, %zu bytes -> device VA %#x",
+ 		    V4L2_TYPE_IS_OUTPUT(vb->type) ? "output" : "capture",
+ 		    vb->index, &dma, len, buf->va);
++
++	if (V4L2_TYPE_IS_CAPTURE(vb->type) &&
++	    ctx->coded_fmt_desc->ops->capture_aux_size) {
++		size_t aux = ctx->coded_fmt_desc->ops->capture_aux_size(ctx);
++
++		if (aux) {
++			ret = apple_vxd_dev_buf_alloc(ctx->vxd, aux, &buf->aux);
++			if (ret) {
++				dev_err(ctx->vxd->dev,
++					"capture buffer %u: %zu-byte side buffer: %d\n",
++					vb->index, aux, ret);
++				apple_vxd_gart_unmap(ctx->vxd, &buf->map);
++				buf->va = 0;
++				return ret;
++			}
++			vxd_step_io(ctx->vxd->dev,
++				    "vb2: capture buffer %u side buffer %zu bytes at device VA %#x",
++				    vb->index, aux, buf->aux.va);
++		}
++	}
+ 	return 0;
+ }
+ 
+@@ -699,6 +736,7 @@ static void apple_vxd_buf_cleanup(struct vb2_buffer *vb)
+ 	struct apple_vxd_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
+ 	struct apple_vxd_buffer *buf = vxd_buf(to_vb2_v4l2_buffer(vb));
+ 
++	apple_vxd_dev_buf_free(ctx->vxd, &buf->aux);
+ 	apple_vxd_gart_unmap(ctx->vxd, &buf->map);
+ 	buf->va = 0;
+ }
+@@ -709,6 +747,12 @@ u32 apple_vxd_buf_va(struct vb2_v4l2_buffer *vbuf)
+ 	return vxd_buf(vbuf)->va;
+ }
+ 
++/* Device VA of a CAPTURE buffer's side buffer, 0 if it has none. */
++u32 apple_vxd_buf_aux_va(struct vb2_v4l2_buffer *vbuf)
++{
++	return vxd_buf(vbuf)->aux.va;
++}
++
+ static void apple_vxd_buf_queue(struct vb2_buffer *vb)
+ {
+ 	struct apple_vxd_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
+@@ -870,9 +914,11 @@ static int apple_vxd_queue_init(void *priv, struct vb2_queue *src_vq,
+ 	src_vq->drv_priv = ctx;
+ 	src_vq->ops = &apple_vxd_queue_ops;
+ 	src_vq->mem_ops = &vb2_dma_contig_memops;
+-	/* Mostly sequential access; no CPU access on the source queue. */
+-	src_vq->dma_attrs = DMA_ATTR_ALLOC_SINGLE_PAGES |
+-			    DMA_ATTR_NO_KERNEL_MAPPING;
++	/*
++	 * Frame-based decode: the driver walks the access unit and parses
++	 * the slice headers itself, so the bitstream needs a kernel mapping.
++	 */
++	src_vq->dma_attrs = DMA_ATTR_ALLOC_SINGLE_PAGES;
+ 	src_vq->buf_struct_size = sizeof(struct apple_vxd_buffer);
+ 	src_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
+ 	src_vq->lock = &vxd->vdev_lock;
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd.h b/drivers/media/platform/apple/vxd/apple-vxd.h
+index 4fc8b14193274c082b3fa5ccb9735efd3879c7f3..a97aa918692f713f23a70d6feca971734335b904 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd.h
++++ b/drivers/media/platform/apple/vxd/apple-vxd.h
+@@ -123,6 +123,13 @@ struct apple_vxd_dma_buf {
+ 	size_t raw_size;
+ };
+ 
++/* A zeroed, GART-mapped buffer the core reads or writes (decode context). */
++struct apple_vxd_dev_buf {
++	struct apple_vxd_dma_buf mem;
++	struct apple_vxd_mapping map;
++	u32 va;				/* device address of mem.vaddr */
++};
++
+ struct apple_vxd_gart {
+ 	struct mutex lock;		/* serializes table updates */
+ 	struct apple_vxd_dma_buf dir_buf; /* directory, 64 KiB aligned */
+@@ -166,7 +173,7 @@ struct apple_vxd_msg_ticket {
+  * [E]), and routes completions to core (fence & 1).  A slot is armed
+  * before the push and signalled from the IRQ drain.
+  */
+-#define APPLE_VXD_NUM_FENCES		8
++#define APPLE_VXD_NUM_FENCES		16
+ 
+ enum apple_vxd_fence_state {
+ 	APPLE_VXD_FENCE_FREE = 0,
+@@ -181,6 +188,7 @@ struct apple_vxd_fence {
+ 	bool error;			/* fault bits, panic or teardown */
+ 	u32 status;			/* 0xc0 word 2 */
+ 	struct apple_vxd_cmdbuf *cmdbuf; /* freed by a clean completion */
++	bool job;			/* last packet of a decode job */
+ 	struct completion done;
+ };
+ 
+@@ -224,6 +232,12 @@ struct apple_vxd_buffer {
+ 	struct v4l2_m2m_buffer base;
+ 	struct apple_vxd_mapping map;
+ 	u32 va;				/* device VA of plane 0's first byte */
++	/*
++	 * CAPTURE only: the per-picture side buffer the core keeps with the
++	 * reconstructed surface (H.264: stored macroblock parameters, BE
++	 * register 0x62ec), allocated with the buffer.
++	 */
++	struct apple_vxd_dev_buf aux;
+ };
+ 
+ struct apple_vxd_mbox_stats {
+@@ -251,6 +265,25 @@ struct apple_vxd_run {
+ 	struct vb2_v4l2_buffer *dst;
+ };
+ 
++/*
++ * One submission in flight: one picture, one command buffer, one message
++ * per packet.  Every packet gets a fence of the same submission
++ * ((seq << 4) | packet * 2, Apple's arithmetic), so a 0xc0 for any of
++ * them is recognised whatever the firmware's per-packet policy is; the
++ * job completes on the last packet's fence (the 0x4004 message) or on the
++ * watchdog.  Eight packets at most: the packet index has three bits.
++ */
++#define APPLE_VXD_JOB_MAX_PACKETS	8
++#define APPLE_VXD_JOB_TIMEOUT_MS	1000
++
++struct apple_vxd_job {
++	struct apple_vxd_ctx *ctx;
++	struct apple_vxd_fence *fences[APPLE_VXD_JOB_MAX_PACKETS];
++	unsigned int nfences;
++	u16 seq;
++	ktime_t submitted;
++};
++
+ struct apple_vxd_dev {
+ 	struct device *dev;
+ 	const struct apple_vxd_variant *variant;
+@@ -312,6 +345,8 @@ struct apple_vxd_dev {
+ 	/* Active job (R3d; decode jobs fail until the command stream lands). */
+ 	spinlock_t job_lock;
+ 	bool job_active;
++	struct apple_vxd_job job;	/* under job_lock while job_active */
++	struct work_struct job_done_work;
+ 	struct delayed_work watchdog_work;
+ 
+ 	/* V4L2 stateless device (R3/R4 skeleton). */
+@@ -351,6 +386,8 @@ struct apple_vxd_coded_fmt_ops {
+ 	int (*try_ctrl)(struct apple_vxd_ctx *ctx, struct v4l2_ctrl *ctrl);
+ 	enum apple_vxd_image_fmt (*get_image_fmt)(struct apple_vxd_ctx *ctx,
+ 						  struct v4l2_ctrl *ctrl);
++	/* Bytes of per-CAPTURE side buffer, 0 for none. */
++	size_t (*capture_aux_size)(struct apple_vxd_ctx *ctx);
+ };
+ 
+ struct apple_vxd_decoded_fmt_desc {
+@@ -398,6 +435,7 @@ static inline u32 vxd_read(struct apple_vxd_dev *vxd, u32 off)
+ /* core.c */
+ irqreturn_t apple_vxd_irq(int irq, void *data);
+ void apple_vxd_watchdog(struct work_struct *work);
++void apple_vxd_job_done(struct work_struct *work);
+ void apple_vxd_job_finish(struct apple_vxd_ctx *ctx,
+ 			  enum vb2_buffer_state result);
+ void apple_vxd_job_finish_no_pm(struct apple_vxd_ctx *ctx,
+@@ -424,6 +462,10 @@ int apple_vxd_gart_map_at(struct apple_vxd_dev *vxd, dma_addr_t dma,
+ 			  struct apple_vxd_mapping *map);
+ void apple_vxd_gart_unmap(struct apple_vxd_dev *vxd,
+ 			  struct apple_vxd_mapping *map);
++int apple_vxd_dev_buf_alloc(struct apple_vxd_dev *vxd, size_t size,
++			    struct apple_vxd_dev_buf *buf);
++void apple_vxd_dev_buf_free(struct apple_vxd_dev *vxd,
++			    struct apple_vxd_dev_buf *buf);
+ 
+ /* fw.c */
+ int apple_vxd_boot_firmware(struct apple_vxd_dev *vxd);
+@@ -448,7 +490,7 @@ void apple_vxd_fence_release(struct apple_vxd_dev *vxd,
+ void apple_vxd_build_init_msg(u32 msg[VXD_INIT_MSG_WORDS], u32 fw_va,
+ 			      size_t fw_bytes, u16 seq);
+ int apple_vxd_mbox_selftest(struct apple_vxd_dev *vxd);
+-int apple_vxd_submit(struct apple_vxd_ctx *ctx, struct apple_vxd_run *run);
++int apple_vxd_submit(struct apple_vxd_ctx *ctx, struct apple_vxd_cmdbuf *cb);
+ 
+ /* cmdbuf.c */
+ int apple_vxd_cmdbufs_init(struct apple_vxd_dev *vxd);
+@@ -469,6 +511,7 @@ void apple_vxd_cmdbufs_debugfs(struct apple_vxd_dev *vxd);
+ 
+ /* v4l2.c */
+ u32 apple_vxd_buf_va(struct vb2_v4l2_buffer *vbuf);
++u32 apple_vxd_buf_aux_va(struct vb2_v4l2_buffer *vbuf);
+ int apple_vxd_v4l2_init(struct apple_vxd_dev *vxd);
+ void apple_vxd_v4l2_cleanup(struct apple_vxd_dev *vxd);
+ extern const struct v4l2_ctrl_ops apple_vxd_ctrl_ops;

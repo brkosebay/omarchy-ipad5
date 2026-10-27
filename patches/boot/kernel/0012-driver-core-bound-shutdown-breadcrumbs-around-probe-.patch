@@ -1,0 +1,106 @@
+From 5fd640de0b4b181cbff10161026b85543611f2fd Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 11:14:42 +0000
+Subject: [PATCH] driver core: bound shutdown breadcrumbs around probe waits
+ and device locks
+
+---
+ drivers/base/core.c | 43 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 43 insertions(+)
+
+diff --git a/drivers/base/core.c b/drivers/base/core.c
+index fc84d919ad..b9934ee571 100644
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@ -4872,6 +4872,35 @@ int device_change_owner(struct device *dev, kuid_t kuid, kgid_t kgid)
+ 	return error;
+ }
+ 
++static unsigned int shutdown_trace_budget;
++
++static int __init driver_shutdown_trace_setup(char *arg)
++{
++	unsigned int count;
++	int ret = kstrtouint(arg, 0, &count);
++
++	if (!ret)
++		WRITE_ONCE(shutdown_trace_budget, min(count, 4096U));
++	return ret;
++}
++early_param("driver_shutdown_trace", driver_shutdown_trace_setup);
++
++static void driver_shutdown_trace(struct device *dev, const char *stage)
++{
++	unsigned int left = READ_ONCE(shutdown_trace_budget);
++
++	while (left) {
++		if (try_cmpxchg(&shutdown_trace_budget, &left, left - 1)) {
++			if (dev)
++				dev_info(dev, "shutdown-trace %s driver=%s\n",
++					 stage, dev_driver_string(dev));
++			else
++				pr_info("shutdown-trace %s\n", stage);
++			break;
++		}
++	}
++}
++
+ /**
+  * device_shutdown - call ->shutdown() on each device to shutdown.
+  */
+@@ -4879,10 +4908,14 @@ void device_shutdown(void)
+ {
+ 	struct device *dev, *parent;
+ 
++	driver_shutdown_trace(NULL, "wait probes begin");
+ 	wait_for_device_probe();
++	driver_shutdown_trace(NULL, "wait probes end");
+ 	device_block_probing();
+ 
++	driver_shutdown_trace(NULL, "cpufreq begin");
+ 	cpufreq_suspend();
++	driver_shutdown_trace(NULL, "cpufreq end");
+ 
+ 	spin_lock(&devices_kset->list_lock);
+ 	/*
+@@ -4909,27 +4942,37 @@ void device_shutdown(void)
+ 		spin_unlock(&devices_kset->list_lock);
+ 
+ 		/* hold lock to avoid race with probe/release */
++		driver_shutdown_trace(dev, "device locks begin");
+ 		if (parent)
+ 			device_lock(parent);
+ 		device_lock(dev);
+ 
++		driver_shutdown_trace(dev, "device locks end");
+ 		/* Don't allow any more runtime suspends */
+ 		pm_runtime_get_noresume(dev);
++		driver_shutdown_trace(dev, "runtime barrier begin");
+ 		pm_runtime_barrier(dev);
++		driver_shutdown_trace(dev, "runtime barrier end");
+ 
+ 		if (dev->class && dev->class->shutdown_pre) {
+ 			if (initcall_debug)
+ 				dev_info(dev, "shutdown_pre\n");
++			driver_shutdown_trace(dev, "class callback begin");
+ 			dev->class->shutdown_pre(dev);
++			driver_shutdown_trace(dev, "class callback end");
+ 		}
+ 		if (dev->bus && dev->bus->shutdown) {
+ 			if (initcall_debug)
+ 				dev_info(dev, "shutdown\n");
++			driver_shutdown_trace(dev, "bus callback begin");
+ 			dev->bus->shutdown(dev);
++			driver_shutdown_trace(dev, "bus callback end");
+ 		} else if (dev->driver && dev->driver->shutdown) {
+ 			if (initcall_debug)
+ 				dev_info(dev, "shutdown\n");
++			driver_shutdown_trace(dev, "driver callback begin");
+ 			dev->driver->shutdown(dev);
++			driver_shutdown_trace(dev, "driver callback end");
+ 		}
+ 
+ 		device_unlock(dev);
+-- 
+2.56.0
+

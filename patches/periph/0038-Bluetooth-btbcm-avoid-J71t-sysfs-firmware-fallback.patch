@@ -1,0 +1,48 @@
+From 93fb55b00616e28487171bc5d12adb60c141b5a7 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 10:29:14 +0000
+Subject: [PATCH 38/55] Bluetooth: btbcm: avoid J71t sysfs firmware fallback
+
+The same boot log has another roughly 60-second wait before the missing
+HCD report: firmware_request_nowarn suppresses warnings but still
+permits forced sysfs fallback. Use direct requests only for the J71t
+board, retaining generic controller behavior.
+
+The transmit-power warning is emitted by hci_broken_table because
+HCI_QUIRK_BROKEN_READ_TRANSMIT_POWER is already set. Preserve that quirk
+and document the C0 board sharing the match data; no duplicate quirk or
+log suppression is needed.
+---
+ drivers/bluetooth/btbcm.c   | 6 +++++-
+ drivers/bluetooth/hci_bcm.c | 1 +
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/bluetooth/btbcm.c b/drivers/bluetooth/btbcm.c
+index fc4d33cf43..edec85ff5d 100644
+--- a/drivers/bluetooth/btbcm.c
++++ b/drivers/bluetooth/btbcm.c
+@@ -680,7 +680,11 @@ int btbcm_initialize(struct hci_dev *hdev, bool *fw_load_done, bool use_autobaud
+ 	fw_name_count++;
+ 
+ 	for (i = 0; i < fw_name_count; i++) {
+-		err = firmware_request_nowarn(&fw, fw_name[i], &hdev->dev);
++		/* J71t RAM boots have no firmware helper; fail each name fast. */
++		if (board_name && !strcmp(board_name, "apple,j71t"))
++			err = request_firmware_direct(&fw, fw_name[i], &hdev->dev);
++		else
++			err = firmware_request_nowarn(&fw, fw_name[i], &hdev->dev);
+ 		if (err == 0) {
+ 			bt_dev_info(hdev, "%s '%s' Patch",
+ 				    hw_name ? hw_name : "BCM", fw_name[i]);
+diff --git a/drivers/bluetooth/hci_bcm.c b/drivers/bluetooth/hci_bcm.c
+index 7d93b4da82..c5b1597355 100644
+--- a/drivers/bluetooth/hci_bcm.c
++++ b/drivers/bluetooth/hci_bcm.c
+@@ -1650,6 +1650,7 @@ static struct bcm_device_data bcm4355_j172_device_data = {
+ 	.no_early_set_baudrate = true,
+ 	.wake_before_power_cycle = true,
+ 	.set_baudrate_before_patch = true,
++	/* Also required by J71t BCM4355C0; the core logs active quirks. */
+ 	.broken_read_transmit_power = true,
+ 	.fixup_le_adv_report_evt_type = true,
+ };

@@ -1,0 +1,510 @@
+From e04c13394ef1fbf3dbacadc2c1170c4de969f426 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Tue, 27 Oct 2026 09:38:19 +0000
+Subject: [PATCH 1/4] usb: roles: apple-s8000: iOS mode-2 PHY programming,
+ accessory host role
+
+iOS 16.7.10 on J71t (2026-10-27 capture) takes the Lightning camera
+adapter straight to USB host mode: configureUSBMode(2), ConnectType
+"Device", cable type USBDevice, arbitrator publish mask 5. EHCI and OHCI
+are published and the device nub stays. The adapter's hub enumerates at
+high speed within a second.
+
+AppleS5L8960XUSBPhy::setPowerLevel sets USB_CTL+0 bit 1 whenever the PHY
+is powered (level 2 and up) and clears it below. start() clears it. The
+role switch never set it. Linux therefore entered host mode with
+USB_CTL+0 = 0x1 where iOS has 0x3, and every earlier host trial saw an
+empty port (PORTSC 0x501000, sig=se0). Set bit 1 before the host select
+and the PHY host reset, and clear it after the host select when leaving.
+usb_ctl_phy_on=0 restores the old behaviour for comparison.
+
+Also from the same reconstruction: iOS's device-mode enable is PHY SIG
+(+0x04) bit 1, which phy-apple-ausb already keeps set as
+VBUSDET_FORCE_EN. iOS never writes USB_CTL+4. Say so where the old knob
+is defined.
+
+Add a host role owned by the Lightning accessory policy:
+apple_s8000_usb_role_claim() marks the next host entry. A claimed host
+role has no revert timeout and uses accessory_gates (default pmu: D2365
+LDO5 and its switch, iOS's acc_sw power mode 4 for this adapter). It
+lasts until any device-role request. The Tristar VBUS-sink bit is
+refused for accessory_gates: on this board setting it makes the CBTL1610
+report no VBUS, so charging would stop. Sysfs accessory and
+accessory_gates attributes, and the debugfs regs line, show the state.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ drivers/usb/roles/apple-s8000-usb-role.c | 246 ++++++++++++++++++++---
+ include/linux/usb/apple-s8000-role.h     |  34 ++++
+ 2 files changed, 253 insertions(+), 27 deletions(-)
+ create mode 100644 include/linux/usb/apple-s8000-role.h
+
+diff --git a/drivers/usb/roles/apple-s8000-usb-role.c b/drivers/usb/roles/apple-s8000-usb-role.c
+index 6c7d795a6b..09a455e88c 100644
+--- a/drivers/usb/roles/apple-s8000-usb-role.c
++++ b/drivers/usb/roles/apple-s8000-usb-role.c
+@@ -3,18 +3,26 @@
+  * Apple S8000 (A9) Lightning port USB role switch.
+  *
+  * The A9 USB complex has a device-only DWC2 (GHWCFG2.OP_MODE 4) and a
+- * separate EHCI + OHCI host pair, all behind one AUSB PHY. iOS publishes
+- * either the device controller or the host pair, never both (ADT
+- * publish-criteria 3 and 4), and moves the pins with USB_CTL bit 0 and the
+- * PHY host tunables (AppleS5L8960XUSBPhy::enableHostMode).
++ * separate EHCI + OHCI host pair, all behind one AUSB PHY. For a USB device
++ * on the port (cable type USBDevice) iOS's arbitrator applies publish mask
++ * 5: EHCI and OHCI (publish-criteria 4) are published and the device nub
++ * (criteria 3) stays. The PHY moves the pins with USB_CTL bit 0 and the
++ * host tunables (AppleS5L8960XUSBPhy::enableHostMode); its power-up
++ * (setPowerLevel >= 2) also sets USB_CTL bit 1, which iOS keeps set while
++ * the PHY is powered.
+  *
+  * Device mode is the default. Host mode is entered on request through the
+  * usb_role class and, unless confirmed, reverts to device mode after a
+- * timeout: the gadget network link is down while the port is a host.
++ * timeout: the gadget network link is down while the port is a host. A host
++ * role claimed by the Lightning accessory policy does not revert; it lasts
++ * until the accessory is unplugged.
+  *
+- * Accessory power is opt-in. The D2365 LDO5 rows below come from the iOS
+- * PMU LDO table (ADT dock function-acc_pwr = pmuL(0x5), function-acc_sw_en =
+- * pmuL(0x80000005)); the Tristar bit is AppleTriStarBuiltIn::setVBUSSink.
++ * The D2365 LDO5 rows below come from the iOS PMU LDO table (ADT dock
++ * function-acc_pwr = pmuL(0x5), function-acc_sw_en = pmuL(0x80000005)).
++ * iOS powers the camera adapter that way (IOAccessoryActivePowerMode 4,
++ * the acc_sw limit). The Tristar bit is AppleTriStarBuiltIn::setVBUSSink;
++ * on this board setting it makes the CBTL1610 report no VBUS, so the
++ * accessory path never uses it.
+  */
+ 
+ #include <linux/bitfield.h>
+@@ -37,12 +45,19 @@
+ #include <linux/seq_file.h>
+ #include <linux/string.h>
+ #include <linux/sysfs.h>
++#include <linux/usb/apple-s8000-role.h>
+ #include <linux/usb/role.h>
+ #include <linux/workqueue.h>
+ 
+ /* USB_CTL (ADT otgphyctrl reg[1]) */
+ #define USB_CTL_HOST			0x00
+ #define USB_CTL_HOST_EN			BIT(0)
++/* Set by AppleS5L8960XUSBPhy::setPowerLevel(>= 2), cleared below that. */
++#define USB_CTL_PHY_ON			BIT(1)
++/*
++ * Not written by iOS: its device-mode enable is PHY SIG (+0x04) bit 1, the
++ * bit phy-apple-ausb sets as VBUSDET_FORCE_EN. Kept for the old opt-in knob.
++ */
+ #define USB_CTL_DEVICE			0x04
+ #define USB_CTL_DEVICE_EN		BIT(1)
+ 
+@@ -96,7 +111,16 @@ MODULE_PARM_DESC(revert_timeout,
+ static bool clear_device_enable;
+ module_param(clear_device_enable, bool, 0644);
+ MODULE_PARM_DESC(clear_device_enable,
+-		 "Also clear USB_CTL device enable while in host mode (default: leave it, as iOS's PHY code does)");
++		 "Also clear USB_CTL+4 bit 1 while in host mode (default: leave it; iOS never writes it)");
++
++static bool usb_ctl_phy_on = true;
++module_param(usb_ctl_phy_on, bool, 0644);
++MODULE_PARM_DESC(usb_ctl_phy_on,
++		 "Set USB_CTL+0 bit 1 in host mode, as iOS does while its PHY is powered (default: on)");
++
++/* Only one switch exists on this SoC; the accessory API checks against it. */
++static DEFINE_MUTEX(apple_usb_role_instance_lock);
++static struct apple_usb_role *apple_usb_role_instance;
+ 
+ struct apple_usb_role {
+ 	struct device *dev;
+@@ -132,10 +156,17 @@ struct apple_usb_role {
+ 	unsigned int revert_timeout;
+ 	unsigned int gates;
+ 	unsigned int gates_on;
++	/* Gates for a host role claimed by the accessory policy */
++	unsigned int accessory_gates;
+ 	bool revert_pending;
+ 	bool phy_held;
+ 	bool ctl_host;
++	bool ctl_phy_on;
+ 	bool cleared_device_enable;
++	/* The next host entry is the accessory policy's */
++	bool accessory_claim;
++	/* The current host role is the accessory policy's: no revert */
++	bool accessory;
+ 	bool dying;
+ };
+ 
+@@ -234,11 +265,11 @@ static void apple_usb_role_gates_off(struct apple_usb_role *ur)
+ 	ur->gates_on = 0;
+ }
+ 
+-static int apple_usb_role_gates_on(struct apple_usb_role *ur)
++static int apple_usb_role_gates_on(struct apple_usb_role *ur, unsigned int gates)
+ {
+ 	int ret;
+ 
+-	if (ur->gates & GATE_PMU) {
++	if (gates & GATE_PMU) {
+ 		/* Order is inferred: rail first, then the accessory switch. */
+ 		ur->gates_on |= GATE_PMU;
+ 		ret = apple_usb_role_ldo5(ur, true);
+@@ -249,7 +280,7 @@ static int apple_usb_role_gates_on(struct apple_usb_role *ur)
+ 			return ret;
+ 		}
+ 	}
+-	if (ur->gates & GATE_TRISTAR) {
++	if (gates & GATE_TRISTAR) {
+ 		ur->gates_on |= GATE_TRISTAR;
+ 		ret = apple_usb_role_tristar_sink(ur, true);
+ 		if (ret) {
+@@ -351,11 +382,17 @@ static void apple_usb_role_host_off(struct apple_usb_role *ur)
+ 		of_platform_device_destroy(&ur->ehci->dev, NULL);
+ 		ur->ehci = NULL;
+ 	}
++	/* iOS order: enableHostMode(0) clears bit 0, the power-down bit 1. */
+ 	if (ur->ctl_host) {
+ 		writel(readl(ur->usb_ctl + USB_CTL_HOST) & ~USB_CTL_HOST_EN,
+ 		       ur->usb_ctl + USB_CTL_HOST);
+ 		ur->ctl_host = false;
+ 	}
++	if (ur->ctl_phy_on) {
++		writel(readl(ur->usb_ctl + USB_CTL_HOST) & ~USB_CTL_PHY_ON,
++		       ur->usb_ctl + USB_CTL_HOST);
++		ur->ctl_phy_on = false;
++	}
+ 	if (ur->cleared_device_enable) {
+ 		writel(readl(ur->usb_ctl + USB_CTL_DEVICE) | USB_CTL_DEVICE_EN,
+ 		       ur->usb_ctl + USB_CTL_DEVICE);
+@@ -370,13 +407,14 @@ static void apple_usb_role_host_off(struct apple_usb_role *ur)
+ 	apple_usb_role_gates_off(ur);
+ }
+ 
+-static int apple_usb_role_enter_host(struct apple_usb_role *ur)
++static int apple_usb_role_enter_host(struct apple_usb_role *ur, unsigned int gates)
+ {
++	u32 ctl;
+ 	int ret;
+ 
+ 	apple_usb_role_release_gadget(ur);
+ 
+-	ret = apple_usb_role_gates_on(ur);
++	ret = apple_usb_role_gates_on(ur, gates);
+ 	if (ret)
+ 		goto fail;
+ 
+@@ -393,9 +431,17 @@ static int apple_usb_role_enter_host(struct apple_usb_role *ur)
+ 	}
+ 	ur->phy_held = true;
+ 
+-	/* enableHostMode order: USB_CTL host select, then tunables + reset. */
+-	writel(readl(ur->usb_ctl + USB_CTL_HOST) | USB_CTL_HOST_EN,
+-	       ur->usb_ctl + USB_CTL_HOST);
++	/*
++	 * setPowerLevel(2) sets USB_CTL bit 1 before its PHY reset; then
++	 * enableHostMode: USB_CTL host select, tunables, reset (set_mode).
++	 */
++	ctl = readl(ur->usb_ctl + USB_CTL_HOST);
++	if (usb_ctl_phy_on && !(ctl & USB_CTL_PHY_ON)) {
++		ctl |= USB_CTL_PHY_ON;
++		writel(ctl, ur->usb_ctl + USB_CTL_HOST);
++		ur->ctl_phy_on = true;
++	}
++	writel(ctl | USB_CTL_HOST_EN, ur->usb_ctl + USB_CTL_HOST);
+ 	ur->ctl_host = true;
+ 	if (clear_device_enable) {
+ 		writel(readl(ur->usb_ctl + USB_CTL_DEVICE) & ~USB_CTL_DEVICE_EN,
+@@ -416,7 +462,8 @@ static int apple_usb_role_enter_host(struct apple_usb_role *ur)
+ 	if (!ur->ohci)
+ 		dev_warn(ur->dev, "no OHCI: low/full-speed devices will not work\n");
+ 
+-	dev_info(ur->dev, "host mode (USB_CTL %#x/%#x, accessory power: %s)\n",
++	dev_info(ur->dev, "host mode%s (USB_CTL %#x/%#x, accessory power: %s)\n",
++		 ur->accessory_claim ? " for the Lightning accessory" : "",
+ 		 readl(ur->usb_ctl + USB_CTL_HOST), readl(ur->usb_ctl + USB_CTL_DEVICE),
+ 		 gate_names[ur->gates_on]);
+ 	return 0;
+@@ -461,14 +508,24 @@ static int apple_usb_role_set(struct usb_role_switch *sw, enum usb_role role)
+ 	if (ur->dying) {
+ 		ret = -ESHUTDOWN;
+ 	} else if (role == ur->role) {
+-		/* Asking for host again restarts an unconfirmed countdown. */
+-		if (role == USB_ROLE_HOST && ur->revert_pending)
++		if (role == USB_ROLE_HOST && ur->accessory_claim) {
++			/* The accessory takes over a manual host role. */
++			ur->accessory = true;
++			ur->revert_pending = false;
++			cancel_delayed_work(&ur->revert_work);
++		} else if (role == USB_ROLE_HOST && ur->revert_pending) {
++			/* Asking for host again restarts an unconfirmed countdown. */
+ 			apple_usb_role_arm_revert(ur);
++		}
+ 	} else if (role == USB_ROLE_HOST) {
+-		ret = apple_usb_role_enter_host(ur);
++		bool accessory = ur->accessory_claim;
++
++		ret = apple_usb_role_enter_host(ur, accessory ? ur->accessory_gates : ur->gates);
+ 		if (!ret) {
+ 			WRITE_ONCE(ur->role, USB_ROLE_HOST);
+-			apple_usb_role_arm_revert(ur);
++			ur->accessory = accessory;
++			if (!accessory)
++				apple_usb_role_arm_revert(ur);
+ 		}
+ 	} else {
+ 		ur->revert_pending = false;
+@@ -476,11 +533,80 @@ static int apple_usb_role_set(struct usb_role_switch *sw, enum usb_role role)
+ 		cancel_delayed_work(&ur->revert_work);
+ 		apple_usb_role_enter_device(ur);
+ 		WRITE_ONCE(ur->role, USB_ROLE_DEVICE);
++		ur->accessory = false;
+ 	}
++	ur->accessory_claim = false;
+ 	mutex_unlock(&ur->lock);
+ 	return ret;
+ }
+ 
++/* Caller holds apple_usb_role_instance_lock, which keeps the instance alive. */
++static struct apple_usb_role *apple_usb_role_from_switch(struct usb_role_switch *sw)
++{
++	struct apple_usb_role *ur;
++
++	lockdep_assert_held(&apple_usb_role_instance_lock);
++	if (IS_ERR_OR_NULL(sw) || !apple_usb_role_instance)
++		return NULL;
++	ur = usb_role_switch_get_drvdata(sw);
++	return ur == apple_usb_role_instance ? ur : NULL;
++}
++
++/**
++ * apple_s8000_usb_role_claim - mark the next host entry as the accessory's
++ * @sw: the Lightning role switch
++ * @claim: true before usb_role_switch_set_role(USB_ROLE_HOST); false to drop
++ *	   a claim that was not used
++ *
++ * A claimed host role has no revert timeout and uses the accessory power
++ * gates. Any device-role request ends it.
++ *
++ * Return: 0, or -ENODEV if @sw is not this driver's switch.
++ */
++int apple_s8000_usb_role_claim(struct usb_role_switch *sw, bool claim)
++{
++	struct apple_usb_role *ur;
++	int ret = 0;
++
++	mutex_lock(&apple_usb_role_instance_lock);
++	ur = apple_usb_role_from_switch(sw);
++	if (ur) {
++		mutex_lock(&ur->lock);
++		if (claim && ur->dying)
++			ret = -ESHUTDOWN;
++		ur->accessory_claim = claim && !ret;
++		mutex_unlock(&ur->lock);
++	} else {
++		ret = -ENODEV;
++	}
++	mutex_unlock(&apple_usb_role_instance_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(apple_s8000_usb_role_claim);
++
++/**
++ * apple_s8000_usb_role_accessory - whether the accessory owns the host role
++ * @sw: the Lightning role switch
++ *
++ * Return: true while the port is a host on the accessory policy's request.
++ */
++bool apple_s8000_usb_role_accessory(struct usb_role_switch *sw)
++{
++	struct apple_usb_role *ur;
++	bool ret = false;
++
++	mutex_lock(&apple_usb_role_instance_lock);
++	ur = apple_usb_role_from_switch(sw);
++	if (ur) {
++		mutex_lock(&ur->lock);
++		ret = ur->role == USB_ROLE_HOST && ur->accessory;
++		mutex_unlock(&ur->lock);
++	}
++	mutex_unlock(&apple_usb_role_instance_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(apple_s8000_usb_role_accessory);
++
+ static enum usb_role apple_usb_role_get(struct usb_role_switch *sw)
+ {
+ 	struct apple_usb_role *ur = usb_role_switch_get_drvdata(sw);
+@@ -594,11 +720,56 @@ static ssize_t vbus_gates_store(struct device *dev, struct device_attribute *att
+ }
+ static DEVICE_ATTR_RW(vbus_gates);
+ 
++static ssize_t accessory_gates_show(struct device *dev, struct device_attribute *attr,
++				    char *buf)
++{
++	struct apple_usb_role *ur = dev_get_drvdata(dev);
++	unsigned int i, gates = READ_ONCE(ur->accessory_gates);
++	ssize_t len = 0;
++
++	for (i = 0; i <= GATE_PMU; i++)
++		len += sysfs_emit_at(buf, len, i == gates ? "[%s] " : "%s ", gate_names[i]);
++	buf[len - 1] = '\n';
++	return len;
++}
++
++/* The Tristar bit removes VBUS from the CBTL1610 status: never for the accessory. */
++static ssize_t accessory_gates_store(struct device *dev, struct device_attribute *attr,
++				     const char *buf, size_t count)
++{
++	struct apple_usb_role *ur = dev_get_drvdata(dev);
++	int gates = sysfs_match_string(gate_names, buf);
++
++	if (gates < 0)
++		return gates;
++	if (gates & GATE_TRISTAR)
++		return -EINVAL;
++	if ((gates & GATE_PMU) && !ur->pmic)
++		return -ENODEV;
++	WRITE_ONCE(ur->accessory_gates, gates);
++	return count;
++}
++static DEVICE_ATTR_RW(accessory_gates);
++
++static ssize_t accessory_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct apple_usb_role *ur = dev_get_drvdata(dev);
++	bool accessory;
++
++	mutex_lock(&ur->lock);
++	accessory = ur->role == USB_ROLE_HOST && ur->accessory;
++	mutex_unlock(&ur->lock);
++	return sysfs_emit(buf, "%d\n", accessory);
++}
++static DEVICE_ATTR_RO(accessory);
++
+ static struct attribute *apple_usb_role_attrs[] = {
+ 	&dev_attr_revert_timeout.attr,
+ 	&dev_attr_revert_pending.attr,
+ 	&dev_attr_confirm.attr,
+ 	&dev_attr_vbus_gates.attr,
++	&dev_attr_accessory_gates.attr,
++	&dev_attr_accessory.attr,
+ 	NULL
+ };
+ ATTRIBUTE_GROUPS(apple_usb_role);
+@@ -640,14 +811,18 @@ static int apple_usb_role_regs_show(struct seq_file *s, void *unused)
+ 	int ret;
+ 
+ 	mutex_lock(&ur->lock);
+-	seq_printf(s, "role: %s%s, accessory power: %s (armed for host: %s)\n",
++	seq_printf(s, "role: %s%s%s, accessory power: %s (armed for host: %s, accessory: %s)\n",
+ 		   usb_role_string(ur->role),
+ 		   ur->revert_pending ? " (revert pending)" : "",
+-		   gate_names[ur->gates_on], gate_names[ur->gates]);
++		   ur->role == USB_ROLE_HOST && ur->accessory ? " (Lightning accessory)" : "",
++		   gate_names[ur->gates_on], gate_names[ur->gates],
++		   gate_names[ur->accessory_gates]);
+ 	seq_printf(s, "phy: init %d power %d, held by switch: %d\n",
+ 		   ur->phy->init_count, ur->phy->power_count, ur->phy_held);
+-	seq_printf(s, "usb_ctl: +00=%08x +04=%08x\n", readl(ur->usb_ctl + USB_CTL_HOST),
+-		   readl(ur->usb_ctl + USB_CTL_DEVICE));
++	seq_printf(s, "usb_ctl: +00=%08x +04=%08x (host select %d, phy-on bit1 %d set by switch %d)\n",
++		   readl(ur->usb_ctl + USB_CTL_HOST), readl(ur->usb_ctl + USB_CTL_DEVICE),
++		   ur->ctl_host, !!(readl(ur->usb_ctl + USB_CTL_HOST) & USB_CTL_PHY_ON),
++		   ur->ctl_phy_on);
+ 	apple_usb_role_dump(s, "remap", ur->remap, REMAP_DEVICE, REMAP_LAST);
+ 
+ 	if (ur->phy_regs) {
+@@ -945,6 +1120,11 @@ static void apple_usb_role_teardown(void *data)
+ {
+ 	struct apple_usb_role *ur = data;
+ 
++	mutex_lock(&apple_usb_role_instance_lock);
++	if (apple_usb_role_instance == ur)
++		apple_usb_role_instance = NULL;
++	mutex_unlock(&apple_usb_role_instance_lock);
++
+ 	mutex_lock(&ur->lock);
+ 	ur->dying = true;
+ 	ur->revert_pending = false;
+@@ -973,6 +1153,8 @@ static int apple_usb_role_probe(struct platform_device *pdev)
+ 	ur->dev = dev;
+ 	ur->role = USB_ROLE_DEVICE;
+ 	ur->revert_timeout = revert_timeout;
++	/* iOS powers the camera adapter (IOAccessoryActivePowerMode 4). */
++	ur->accessory_gates = GATE_PMU;
+ 	platform_set_drvdata(pdev, ur);
+ 	ret = devm_mutex_init(dev, &ur->lock);
+ 	if (ret)
+@@ -1001,6 +1183,8 @@ static int apple_usb_role_probe(struct platform_device *pdev)
+ 	ret = apple_usb_role_get_pmic(ur);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "PMIC\n");
++	if (!ur->pmic)
++		ur->accessory_gates = 0;
+ 	ret = apple_usb_role_get_tristar(ur);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "Tristar\n");
+@@ -1027,7 +1211,10 @@ static int apple_usb_role_probe(struct platform_device *pdev)
+ 		return ret;
+ 
+ 	apple_usb_role_debugfs(ur);
+-	dev_info(dev, "device role; host on request (revert after %u s)\n",
++	mutex_lock(&apple_usb_role_instance_lock);
++	apple_usb_role_instance = ur;
++	mutex_unlock(&apple_usb_role_instance_lock);
++	dev_info(dev, "device role; host on request (revert after %u s) or for the Lightning accessory\n",
+ 		 ur->revert_timeout);
+ 	return 0;
+ }
+@@ -1050,6 +1237,11 @@ static void apple_usb_role_shutdown(struct platform_device *pdev)
+ 		       ur->usb_ctl + USB_CTL_HOST);
+ 		ur->ctl_host = false;
+ 	}
++	if (ur->ctl_phy_on) {
++		writel(readl(ur->usb_ctl + USB_CTL_HOST) & ~USB_CTL_PHY_ON,
++		       ur->usb_ctl + USB_CTL_HOST);
++		ur->ctl_phy_on = false;
++	}
+ 	if (ur->cleared_device_enable) {
+ 		writel(readl(ur->usb_ctl + USB_CTL_DEVICE) | USB_CTL_DEVICE_EN,
+ 		       ur->usb_ctl + USB_CTL_DEVICE);
+diff --git a/include/linux/usb/apple-s8000-role.h b/include/linux/usb/apple-s8000-role.h
+new file mode 100644
+index 0000000000..de3035e04a
+--- /dev/null
++++ b/include/linux/usb/apple-s8000-role.h
+@@ -0,0 +1,34 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Apple S8000 (A9) Lightning role switch: host role owned by an accessory.
++ *
++ * The Lightning accessory policy (apple_tristar_power) claims the next host
++ * entry before it calls usb_role_switch_set_role(). A claimed host role has
++ * no revert timeout and uses the accessory power gates; it ends when the
++ * policy, or anyone else, sets the device role.
++ */
++#ifndef __LINUX_USB_APPLE_S8000_ROLE_H
++#define __LINUX_USB_APPLE_S8000_ROLE_H
++
++#include <linux/errno.h>
++#include <linux/kconfig.h>
++#include <linux/types.h>
++
++struct usb_role_switch;
++
++#if IS_REACHABLE(CONFIG_USB_ROLES_APPLE_S8000)
++int apple_s8000_usb_role_claim(struct usb_role_switch *sw, bool claim);
++bool apple_s8000_usb_role_accessory(struct usb_role_switch *sw);
++#else
++static inline int apple_s8000_usb_role_claim(struct usb_role_switch *sw, bool claim)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline bool apple_s8000_usb_role_accessory(struct usb_role_switch *sw)
++{
++	return false;
++}
++#endif
++
++#endif /* __LINUX_USB_APPLE_S8000_ROLE_H */

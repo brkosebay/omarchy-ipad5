@@ -1,0 +1,1345 @@
+From 0c677e84ce621ab4c52616b62ebbffe3cd3ebb50 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 19:48:43 +0000
+Subject: [PATCH] soc: apple: add A9 SEP mailbox and sep-bio transport
+
+The SEP on s8000/s8003 is an ASC coprocessor at 0x20da00000 with a 32-bit
+mailbox at +0x4000. Add a driver that owns the mailbox and implements the
+endpoint transport recovered from the iOS 16.7.10 kernelcache and a live
+os_log capture:
+
+  - 64-bit messages (ep/tag/opcode/param/data), drained and logged;
+  - per-endpoint 16 KiB OOL buffers published with control opcodes
+    0x04/0x02 (send size/address) and 0x05/0x03 (receive);
+  - the transfer framing: tag 0xfc request, command in the opcode field,
+    total length in the data field, completion matched on tag and command;
+  - cache maintenance around the buffers (dcache clean/inval by VA).
+
+Large transfers above 16356 bytes need the 0xfc/0xfd/0xfe chunk sequence
+seen on the wire; that is documented in docs/sep/driver-notes.md and not
+implemented yet.
+
+Userspace is the Aurora Silicon ABI (/dev/sep-bio, interface v4) so their
+libfprint driver, fprintd and Omarchy's fingerprint UI can be reused
+unchanged. Enrol/verify return -ENOSYS until SBIO is implemented and
+GET_INFO reports sensor_present = 0 so no unusable reader is exposed.
+
+The mailbox is polled (no SEP node in the DT yet) and stays untouched until
+debugfs start is written, because the first read of a powered-down SEP block
+can stall the AP. The driver is inert unless sep_a9.enable=1.
+
+When a device tree node (apple,s8003-sep / apple,s8000-sep) is present the
+driver binds from OF instead of registering its own platform device, so the
+nextint DT can describe the SEP once without a duplicate instance.
+
+Add the j71t/j72s/iPad5 DT node (apple,s8003-sep, mailbox at 0x20da00000,
+AIC interrupts 99/98/101/100) so the driver binds from OF.
+
+Implement the SBIO handshake (command 0x73, u32 1) and expose it through
+/dev/sep-bio: GET_INFO reports sensor_present only after it succeeds, and
+ENROL_START/VERIFY_START send provisional 48/68-byte zeroed payloads with the
+caller's flags. Those payload layouts are produced by biometrickitd in
+userspace and are not yet recovered, so the commands exercise the transport
+without claiming correct semantics.
+---
+ arch/arm64/boot/dts/apple/s800x-ipad5.dtsi |   16 +
+ drivers/soc/apple/Kconfig                  |    8 +
+ drivers/soc/apple/Makefile                 |    1 +
+ drivers/soc/apple/sep-a9.c                 | 1088 ++++++++++++++++++++
+ include/uapi/linux/apple-sep.h             |  133 +++
+ 5 files changed, 1246 insertions(+)
+ create mode 100644 drivers/soc/apple/sep-a9.c
+ create mode 100644 include/uapi/linux/apple-sep.h
+
+diff --git a/arch/arm64/boot/dts/apple/s800x-ipad5.dtsi b/arch/arm64/boot/dts/apple/s800x-ipad5.dtsi
+index 972d84d6c0..8852e3b45d 100644
+--- a/arch/arm64/boot/dts/apple/s800x-ipad5.dtsi
++++ b/arch/arm64/boot/dts/apple/s800x-ipad5.dtsi
+@@ -7,10 +7,26 @@
+ 
+ #include "s800-0-3-common.dtsi"
+ #include <dt-bindings/input/input.h>
++#include <dt-bindings/interrupt-controller/apple-aic.h>
++#include <dt-bindings/interrupt-controller/irq.h>
+ 
+ / {
+ 	chassis-type = "tablet";
+ 
++	/*
++	 * Secure Enclave. Inert unless the sep-a9 driver is enabled
++	 * (sep_a9.enable=1); the mailbox sits 0x4000 into the block.
++	 */
++	sep: sep@20da00000 {
++		compatible = "apple,s8003-sep", "apple,s8000-sep";
++		reg = <0x2 0x0da00000 0x0 0x10000>;
++		interrupt-parent = <&aic>;
++		interrupts = <AIC_IRQ 99 IRQ_TYPE_LEVEL_HIGH>,
++			     <AIC_IRQ 98 IRQ_TYPE_LEVEL_HIGH>,
++			     <AIC_IRQ 101 IRQ_TYPE_LEVEL_HIGH>,
++			     <AIC_IRQ 100 IRQ_TYPE_LEVEL_HIGH>;
++	};
++
+ 	gpio-keys {
+ 		compatible = "gpio-keys";
+ 
+diff --git a/drivers/soc/apple/Kconfig b/drivers/soc/apple/Kconfig
+index 99fa23a57c..605200d108 100644
+--- a/drivers/soc/apple/Kconfig
++++ b/drivers/soc/apple/Kconfig
+@@ -65,3 +65,11 @@ config APPLE_TUNABLE
+ endmenu
+ 
+ endif
++
++config APPLE_SEP_A9
++	tristate "Apple A9 Secure Enclave mailbox"
++	depends on ARCH_APPLE || COMPILE_TEST
++	help
++	  Mailbox driver for the Secure Enclave on Apple A9 (s8000/s8003).
++	  Exposes raw SEP messaging and endpoint OOL buffer setup. Used to
++	  bring up sepOS and the biometric (SBIO) endpoint on iPad 5.
+diff --git a/drivers/soc/apple/Makefile b/drivers/soc/apple/Makefile
+index cad33f1cc0..284c03cd07 100644
+--- a/drivers/soc/apple/Makefile
++++ b/drivers/soc/apple/Makefile
+@@ -15,3 +15,4 @@ obj-$(CONFIG_APPLE_TUNABLE) += apple-tunable.o
+ apple-tunable-y = tunable.o
+ 
+ obj-$(CONFIG_APPLE_PMP_T8015_V1) += pmp_t8015_v1.o
++obj-$(CONFIG_APPLE_SEP_A9) += sep-a9.o
+diff --git a/drivers/soc/apple/sep-a9.c b/drivers/soc/apple/sep-a9.c
+new file mode 100644
+index 0000000000..d6fdc26da5
+--- /dev/null
++++ b/drivers/soc/apple/sep-a9.c
+@@ -0,0 +1,1088 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Apple A9 (s8000/s8003) Secure Enclave mailbox driver.
++ *
++ * The SEP is an ASC coprocessor: registers at 0x20DA00000, a 32-bit mailbox
++ * at +0x4000 and four GIC interrupts (ADT "interrupts" = 99 98 101 100).
++ * The AP and the SEP exchange 64-bit little-endian messages:
++ *
++ *	bits  0..7	destination endpoint
++ *	bits  8..15	tag
++ *	bits 16..23	opcode
++ *	bits 24..31	parameter
++ *	bits 32..63	data
++ *
++ * Every endpoint owns a page-sized send and receive "OOL" (out-of-line)
++ * buffer. Their size and physical address are published to the SEP with
++ * control messages on endpoint 0 (see sep_ool_publish()), after which the
++ * endpoint can be used for commands. Those opcodes were recovered from the
++ * iOS 16.7.10 AppleSEPManager kext; see docs/sep/driver-notes.md.
++ *
++ * This first stage only owns the mailbox: it drains and logs messages and
++ * exposes a raw send path for bring-up. The OOL buffers and the per-endpoint
++ * command framing come next.
++ */
++
++#include <linux/debugfs.h>
++#include <linux/delay.h>
++#include <linux/fs.h>
++#include <linux/jiffies.h>
++#include <linux/mm.h>
++#include <linux/completion.h>
++#include <linux/io.h>
++#include <linux/miscdevice.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++#include <linux/workqueue.h>
++
++#include <asm/cacheflush.h>
++
++#include <uapi/linux/apple-sep.h>
++
++#define SEP_MBOX_OFFSET		0x4000
++#define SEP_MBOX_SIZE		0x1000
++
++/* 32-bit mailbox register layout (pongoOS struct mailbox_registers32) */
++#define SEP_MBOX_DIS_INT	0x00
++#define SEP_MBOX_EN_INT		0x04
++#define SEP_MBOX_SND_STS	0x08
++#define SEP_MBOX_SND0		0x10
++#define SEP_MBOX_SND1		0x14
++#define SEP_MBOX_RECV_STS	0x20
++#define SEP_MBOX_RECV0		0x34
++#define SEP_MBOX_RECV1		0x38
++
++/* recv_sts bit clear => a message is waiting (pongoOS sep_check_mailbox) */
++#define SEP_MBOX_RECV_EMPTY	0x20000
++/* pongoOS enables exactly this interrupt bit after probe */
++#define SEP_MBOX_INT_ENABLE	0x1000
++
++#define SEP_LOG_ENTRIES		256
++
++#define SEP_MSG_EP(ep)		((u64)(ep) & 0xff)
++#define SEP_MSG_TAG(tag)	(((u64)(tag) & 0xff) << 8)
++#define SEP_MSG_OP(op)		(((u64)(op) & 0xff) << 16)
++#define SEP_MSG_PARAM(param)	(((u64)(param) & 0xff) << 24)
++#define SEP_MSG_DATA(data)	(((u64)(data)) << 32)
++#define SEP_MSG(ep, tag, op, param, data) \
++	(SEP_MSG_EP(ep) | SEP_MSG_TAG(tag) | SEP_MSG_OP(op) | \
++	 SEP_MSG_PARAM(param) | SEP_MSG_DATA(data))
++
++#define SEP_MSG_GET_EP(msg)	((u8)((msg) & 0xff))
++#define SEP_MSG_GET_TAG(msg)	((u8)(((msg) >> 8) & 0xff))
++#define SEP_MSG_GET_OP(msg)	((u8)(((msg) >> 16) & 0xff))
++#define SEP_MSG_GET_PARAM(msg)	((u8)(((msg) >> 24) & 0xff))
++#define SEP_MSG_GET_DATA(msg)	((u32)((msg) >> 32))
++
++/* Control-endpoint opcodes that publish an endpoint OOL buffer. */
++#define SEP_OP_SET_SEND_ADDR	0x02
++#define SEP_OP_SET_RECV_ADDR	0x03
++#define SEP_OP_SET_SEND_SIZE	0x04
++#define SEP_OP_SET_RECV_SIZE	0x05
++
++/* Endpoint transfer framing (docs/sep/driver-notes.md §7). */
++#define SEP_TAG_XFER		0xfc	/* request, and final completion */
++#define SEP_TAG_XFER_CONT	0xfd	/* continuation chunk */
++#define SEP_TAG_XFER_ACK	0xfe	/* SEP: send the next chunk */
++#define SEP_TAG_XFER_ERR	0xff	/* SEP: error, status word in buffer+0x10 */
++#define SEP_XFER_HDR		7	/* reply payload starts after 7 bytes */
++
++#define SEP_OOL_SIZE		16384
++#define SEP_OOL_CHUNK		16356	/* payload bytes per chunk */
++#define SEP_OEP_MAX		16
++
++struct sep_ep {
++	bool allocated;
++	void *send;
++	void *recv;
++	dma_addr_t send_pa;
++	dma_addr_t recv_pa;
++	size_t send_len;
++	size_t recv_len;
++};
++
++struct sep_a9 {
++	struct device *dev;
++	void __iomem *base;
++	void __iomem *mbox;
++
++	struct mutex lock;		/* serialises send + log access */
++	u64 log[SEP_LOG_ENTRIES];
++	unsigned int log_head;
++	unsigned int log_count;
++
++	struct delayed_work poll;
++	unsigned int poll_us;
++	bool running;
++
++	struct sep_ep eps[SEP_OEP_MAX];
++	struct mutex xfer_lock;
++	struct completion xfer_done;
++	bool xfer_waiting;
++	u8 xfer_cmd;
++	int xfer_err;
++	u8 sbio_ep;		/* SEP endpoint number for sbio, -1 = unset */
++	bool sbio_ready;
++	u32 bio_state;		/* SEP_BIO_STATE_* */
++	u32 bio_stage;
++	u8 enrol_payload[68];	/* raw override, see debugfs bio_payload */
++	size_t enrol_len;
++	u8 verify_payload[68];
++	size_t verify_len;
++	size_t xfer_out_len;
++	size_t last_out_len;
++	u8 last_out[SEP_OOL_SIZE];
++
++	struct dentry *dbg;
++	u64 tx_count;
++	u64 rx_count;
++	u64 dropped;
++};
++
++static inline u64 sep_read_msg(struct sep_a9 *sep)
++{
++	u64 lo = readl(sep->mbox + SEP_MBOX_RECV0);
++	u64 hi = readl(sep->mbox + SEP_MBOX_RECV1);
++
++	return lo | (hi << 32);
++}
++
++static inline void sep_write_msg(struct sep_a9 *sep, u64 msg)
++{
++	writel(lower_32_bits(msg), sep->mbox + SEP_MBOX_SND0);
++	writel(upper_32_bits(msg), sep->mbox + SEP_MBOX_SND1);
++}
++
++static void sep_log_push(struct sep_a9 *sep, u64 msg)
++{
++	unsigned int slot = (sep->log_head + sep->log_count) % SEP_LOG_ENTRIES;
++
++	sep->log[slot] = msg;
++	if (sep->log_count < SEP_LOG_ENTRIES)
++		sep->log_count++;
++	else
++		sep->log_head = (sep->log_head + 1) % SEP_LOG_ENTRIES;
++
++	sep->rx_count++;
++}
++
++/*
++ * Drain everything the SEP queued. The status bit is the same handshake
++ * pongoOS uses; there is no separate acknowledge on the AP side.
++ */
++static int sep_drain(struct sep_a9 *sep)
++{
++	unsigned int drained = 0;
++
++	mutex_lock(&sep->lock);
++	while (!(readl(sep->mbox + SEP_MBOX_RECV_STS) & SEP_MBOX_RECV_EMPTY)) {
++		u64 msg = sep_read_msg(sep);
++
++		sep_log_push(sep, msg);
++
++		/* Completion for a pending transfer: same tag (0xfc) and the
++		 * command echoed back (docs/sep/driver-notes.md §7). */
++		if (sep->xfer_waiting &&
++		    SEP_MSG_GET_TAG(msg) == SEP_TAG_XFER &&
++		    SEP_MSG_GET_OP(msg) == sep->xfer_cmd) {
++			sep->xfer_out_len = SEP_MSG_GET_DATA(msg);
++			sep->xfer_err = 0;
++			sep->xfer_waiting = false;
++			complete(&sep->xfer_done);
++		} else if (sep->xfer_waiting &&
++			   SEP_MSG_GET_TAG(msg) == SEP_TAG_XFER_ERR) {
++			/* error word sits at reply buffer + 0x10 */
++			sep->xfer_err = -EIO;
++			sep->xfer_waiting = false;
++			complete(&sep->xfer_done);
++		}
++
++		if (++drained > SEP_LOG_ENTRIES) {
++			sep->dropped++;
++			break;
++		}
++	}
++	mutex_unlock(&sep->lock);
++
++	return drained;
++}
++
++static void sep_poll_work(struct work_struct *work)
++{
++	struct sep_a9 *sep = container_of(to_delayed_work(work),
++					  struct sep_a9, poll);
++
++	if (!sep->running)
++		return;
++
++	sep_drain(sep);
++	schedule_delayed_work(&sep->poll, usecs_to_jiffies(sep->poll_us));
++}
++
++static int sep_send_raw(struct sep_a9 *sep, u8 ep, u8 tag, u8 op, u8 param,
++			u32 data)
++{
++	mutex_lock(&sep->lock);
++	sep_write_msg(sep, SEP_MSG(ep, tag, op, param, data));
++	sep->tx_count++;
++	mutex_unlock(&sep->lock);
++
++	return 0;
++}
++
++static int sep_ool_publish(struct sep_a9 *sep, u8 ep, bool send,
++			   dma_addr_t pa, size_t len);
++
++/*
++ * Allocate the two OOL buffers an endpoint needs. 16 KiB each, page aligned,
++ * physically contiguous: the SEP reads AP DRAM directly (no DART), so the
++ * physical address is handed over as-is.
++ */
++static int sep_ep_alloc(struct sep_a9 *sep, u8 ep, size_t size)
++{
++	struct sep_ep *e;
++
++	if (ep >= SEP_OEP_MAX)
++		return -EINVAL;
++	if (size == 0 || size > SEP_OOL_SIZE)
++		return -EINVAL;
++
++	e = &sep->eps[ep];
++	if (e->allocated)
++		return -EBUSY;
++
++	e->send = alloc_pages_exact(PAGE_ALIGN(size), GFP_KERNEL | __GFP_ZERO);
++	if (!e->send)
++		return -ENOMEM;
++	e->recv = alloc_pages_exact(PAGE_ALIGN(size), GFP_KERNEL | __GFP_ZERO);
++	if (!e->recv) {
++		free_pages_exact(e->send, PAGE_ALIGN(size));
++		e->send = NULL;
++		return -ENOMEM;
++	}
++
++	e->send_pa = virt_to_phys(e->send);
++	e->recv_pa = virt_to_phys(e->recv);
++	e->send_len = e->recv_len = size;
++
++	if (sep_ool_publish(sep, ep, true, e->send_pa, size) ||
++	    sep_ool_publish(sep, ep, false, e->recv_pa, size)) {
++		free_pages_exact(e->send, PAGE_ALIGN(size));
++		free_pages_exact(e->recv, PAGE_ALIGN(size));
++		memset(e, 0, sizeof(*e));
++		return -EIO;
++	}
++
++	e->allocated = true;
++	dev_info(sep->dev, "ep %u: send %pad recv %pad len %zu\n", ep,
++		 &e->send_pa, &e->recv_pa, size);
++	return 0;
++}
++
++/*
++ * Run one endpoint command. Small payloads only for now; the >16 KiB
++ * 0xfc/0xfd/0xfe chunk dance is documented but not implemented yet.
++ */
++static int sep_transfer(struct sep_a9 *sep, u8 ep, u8 cmd,
++			const void *in, size_t inlen,
++			void *out, size_t outlen, unsigned int timeout_ms)
++{
++	struct sep_ep *e = ep < SEP_OEP_MAX ? &sep->eps[ep] : NULL;
++	unsigned long left;
++	int ret = 0;
++
++	if (!e || !e->allocated)
++		return -ENODEV;
++	if (inlen > e->send_len || outlen > e->recv_len)
++		return -EMSGSIZE;
++	if (inlen > SEP_OOL_CHUNK)
++		return -EMSGSIZE;	/* chunking TODO */
++
++	mutex_lock(&sep->xfer_lock);
++
++	if (inlen)
++		memcpy(e->send, in, inlen);
++	dcache_clean_poc((unsigned long)e->send,
++			 (unsigned long)e->send + inlen);
++
++	reinit_completion(&sep->xfer_done);
++	sep->xfer_cmd = cmd;
++	sep->xfer_out_len = 0;
++	sep->xfer_err = 0;
++	sep->xfer_waiting = true;
++
++	sep_send_raw(sep, ep, SEP_TAG_XFER, cmd, 0, inlen);
++
++	left = wait_for_completion_timeout(&sep->xfer_done,
++					   msecs_to_jiffies(timeout_ms));
++	if (!left) {
++		sep->xfer_waiting = false;
++		ret = -ETIMEDOUT;
++		goto out;
++	}
++	if (sep->xfer_err) {
++		ret = sep->xfer_err;
++		goto out;
++	}
++
++	if (out && outlen) {
++		size_t n;
++
++		/* The reply carries a 7-byte header before the payload. */
++		if (sep->xfer_out_len <= SEP_XFER_HDR) {
++			ret = 0;
++			goto out;
++		}
++		n = min(outlen, sep->xfer_out_len - SEP_XFER_HDR);
++
++		dcache_inval_poc((unsigned long)e->recv,
++				 (unsigned long)e->recv + n);
++		memcpy(out, e->recv + SEP_XFER_HDR, n);
++		sep->last_out_len = n;
++		memcpy(sep->last_out, e->recv + SEP_XFER_HDR, n);
++		ret = n;
++	} else {
++		sep->last_out_len = 0;
++	}
++
++out:
++	mutex_unlock(&sep->xfer_lock);
++	return ret;
++}
++
++/*
++ * Publish one endpoint OOL buffer. Length is in bytes, the address is the
++ * AP physical address shifted right by 12 (both as in AppleSEPManager's
++ * cmsgSET_OOL_IN/OUT handling). Endpoint 0 carries the control messages and
++ * the target endpoint travels in the parameter field.
++ */
++static int sep_ool_publish(struct sep_a9 *sep, u8 ep, bool send,
++			   dma_addr_t pa, size_t len)
++{
++	int ret;
++
++	ret = sep_send_raw(sep, 0, 0, send ? SEP_OP_SET_SEND_SIZE
++					   : SEP_OP_SET_RECV_SIZE, ep, len);
++	if (ret)
++		return ret;
++
++	return sep_send_raw(sep, 0, 0, send ? SEP_OP_SET_SEND_ADDR
++					    : SEP_OP_SET_RECV_ADDR, ep,
++			    upper_32_bits(pa) << 20 | (lower_32_bits(pa) >> 12));
++}
++
++static ssize_t sep_dbg_status_read(struct file *file, char __user *ubuf,
++				   size_t count, loff_t *ppos)
++{
++	struct sep_a9 *sep = file->private_data;
++	char *buf;
++	ssize_t ret;
++
++	buf = kzalloc(512, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	if (sep->running) {
++		ret = scnprintf(buf, 512,
++				"base=%px mbox=%px running=1\n"
++				"recv_sts=%#x snd_sts=%#x en_int=%#x\n"
++				"tx=%llu rx=%llu dropped=%llu log=%u\n",
++				sep->base, sep->mbox,
++				readl(sep->mbox + SEP_MBOX_RECV_STS),
++				readl(sep->mbox + SEP_MBOX_SND_STS),
++				readl(sep->mbox + SEP_MBOX_EN_INT),
++				sep->tx_count, sep->rx_count, sep->dropped,
++				sep->log_count);
++	} else {
++		ret = scnprintf(buf, 512,
++				"base=%px mbox=%px running=0 (mailbox untouched)\n"
++				"tx=%llu rx=%llu dropped=%llu log=%u\n",
++				sep->base, sep->mbox, sep->tx_count,
++				sep->rx_count, sep->dropped, sep->log_count);
++	}
++
++	ret = simple_read_from_buffer(ubuf, count, ppos, buf, ret);
++	kfree(buf);
++	return ret;
++}
++
++static const struct file_operations sep_dbg_status_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.read = sep_dbg_status_read,
++};
++
++static ssize_t sep_dbg_log_read(struct file *file, char __user *ubuf,
++				size_t count, loff_t *ppos)
++{
++	struct sep_a9 *sep = file->private_data;
++	unsigned int i;
++	char *buf;
++	ssize_t len = 0;
++
++	buf = kzalloc(PAGE_SIZE, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	mutex_lock(&sep->lock);
++	for (i = 0; i < sep->log_count && len < PAGE_SIZE - 96; i++) {
++		u64 msg = sep->log[(sep->log_head + i) % SEP_LOG_ENTRIES];
++
++		len += scnprintf(buf + len, PAGE_SIZE - len,
++				 "ep=%02x tag=%02x op=%02x param=%02x data=%08x\n",
++				 SEP_MSG_GET_EP(msg), SEP_MSG_GET_TAG(msg),
++				 SEP_MSG_GET_OP(msg), SEP_MSG_GET_PARAM(msg),
++				 SEP_MSG_GET_DATA(msg));
++	}
++	mutex_unlock(&sep->lock);
++
++	len = simple_read_from_buffer(ubuf, count, ppos, buf, len);
++	kfree(buf);
++	return len;
++}
++
++static const struct file_operations sep_dbg_log_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.read = sep_dbg_log_read,
++};
++
++/*
++ * Raw bring-up interface:
++ *	echo "ep tag op param data" > send	(all hex, one message)
++ *	send a message to an endpoint without any framing assumptions
++ */
++static ssize_t sep_dbg_send_write(struct file *file, const char __user *ubuf,
++				  size_t count, loff_t *ppos)
++{
++	struct sep_a9 *sep = file->private_data;
++	unsigned int ep, tag, op, param, data;
++	char buf[64];
++
++	if (count >= sizeof(buf))
++		return -EINVAL;
++	if (copy_from_user(buf, ubuf, count))
++		return -EFAULT;
++	buf[count] = '\0';
++
++	if (sscanf(buf, "%x %x %x %x %x", &ep, &tag, &op, &param, &data) != 5)
++		return -EINVAL;
++
++	sep_send_raw(sep, ep, tag, op, param, data);
++	return count;
++}
++
++static const struct file_operations sep_dbg_send_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = sep_dbg_send_write,
++};
++
++/*
++ * OOL buffer bring-up:
++ *	echo "ep send|recv size" > ool
++ * Allocates a coherent buffer, publishes size+address to the SEP and keeps
++ * the allocation alive for the lifetime of the driver instance.
++ */
++struct sep_ool {
++	struct sep_a9 *sep;
++	u8 ep;
++	bool send;
++	void *cpu;
++	dma_addr_t dma;
++	size_t len;
++};
++
++static ssize_t sep_dbg_ool_write(struct file *file, const char __user *ubuf,
++				 size_t count, loff_t *ppos)
++{
++	struct sep_a9 *sep = file->private_data;
++	unsigned int ep, len;
++	char buf[64];
++	int ret;
++
++	if (count >= sizeof(buf))
++		return -EINVAL;
++	if (copy_from_user(buf, ubuf, count))
++		return -EFAULT;
++	buf[count] = '\0';
++
++	/* echo "ep size" > ool   -- size is the same for send and receive */
++	if (sscanf(buf, "%x %x", &ep, &len) != 2)
++		return -EINVAL;
++
++	ret = sep_ep_alloc(sep, ep, len);
++	return ret ? ret : count;
++}
++
++static const struct file_operations sep_dbg_ool_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = sep_dbg_ool_write,
++};
++
++
++/*
++ * /dev/sep-bio: the ABI the Aurora Silicon libfprint driver speaks
++ * (include/uapi/linux/apple-sep.h, interface version 4). Keeping the same
++ * interface means their libfprint `aurora` driver, fprintd and Omarchy's
++ * fingerprint UI work unchanged; only the operations this driver has not
++ * implemented yet return -ENOSYS.
++ */
++static struct sep_a9 *sep_a9_instance;
++
++static int sbio_ep = -1;
++module_param(sbio_ep, int, 0444);
++MODULE_PARM_DESC(sbio_ep, "SEP endpoint number for sbio (-1 = unset)");
++
++/*
++ * SBIO handshake: command 0x73 with a u32 of 1 (IOSEPBiometricService::
++ * initSbioCommunication). Everything else on the endpoint depends on it.
++ */
++static int sep_sbio_init(struct sep_a9 *sep)
++{
++	u32 one = 1;
++	int ret;
++
++	if (sep->sbio_ready)
++		return 0;
++	if (!sep->running || sep->sbio_ep >= SEP_OEP_MAX ||
++	    !sep->eps[sep->sbio_ep].allocated)
++		return -EAGAIN;
++
++	ret = sep_transfer(sep, sep->sbio_ep, 0x73, &one, sizeof(one), NULL, 0,
++			   10000);
++	if (ret < 0)
++		return ret;
++
++	sep->sbio_ready = true;
++	dev_info(sep->dev, "sbio endpoint %u ready\n", sep->sbio_ep);
++	return 0;
++}
++
++static int sep_bio_open(struct inode *inode, struct file *file)
++{
++	file->private_data = sep_a9_instance;
++	return 0;
++}
++
++static long sep_bio_ioctl(struct file *file, unsigned int cmd,
++			  unsigned long arg)
++{
++	struct sep_a9 *sep = file->private_data;
++	struct sep_bio_info info = {
++		.version = SEP_BIO_IFACE_VERSION,
++		.sensor_present = 0,
++		.enrolled = 0,
++		.capacity = 0,
++		.enroll_stages = 0,
++	};
++	struct sep_bio_list *list;
++
++	if (!sep)
++		return -ENODEV;
++
++	switch (cmd) {
++	case SEP_BIO_GET_INFO:
++		/*
++		 * sensor_present stays 0 until the SBIO endpoint is up: the
++		 * sensor only exists once sepOS has brought it up, and libfprint
++		 * correctly declines to expose a reader without one.
++		 */
++		info.sensor_present = sep->sbio_ready;
++		if (copy_to_user((void __user *)arg, &info, sizeof(info)))
++			return -EFAULT;
++		return 0;
++	case SEP_BIO_LIST:
++		/* too large for the stack, and empty until SBIO is implemented */
++		list = kzalloc(sizeof(*list), GFP_KERNEL);
++		if (!list)
++			return -ENOMEM;
++		if (copy_to_user((void __user *)arg, list, sizeof(*list))) {
++			kfree(list);
++			return -EFAULT;
++		}
++		kfree(list);
++		return 0;
++	case SEP_BIO_ENROL_START: {
++		/*
++		 * Provisional: the 68-byte EnrollMode payload is produced by
++		 * biometrickitd in userspace, so its layout is not yet known.
++		 * Send a zeroed buffer with the caller's flags so the transport
++		 * can be exercised; refine once the struct is recovered.
++		 */
++		struct sep_bio_enrol_start start;
++		u8 payload[68] = { };
++		int ret;
++
++		if (copy_from_user(&start, (void __user *)arg, sizeof(start)))
++			return -EFAULT;
++		if (sep_sbio_init(sep))
++			return -EAGAIN;
++		if (sep->enrol_len) {
++			memcpy(payload, sep->enrol_payload, sep->enrol_len);
++		} else {
++			memcpy(payload, &start.flags, sizeof(start.flags));
++		}
++		ret = sep_transfer(sep, sep->sbio_ep, 0x03, payload,
++				   sep->enrol_len ? sep->enrol_len : sizeof(payload),
++				   NULL, 0, 10000);
++		if (ret < 0)
++			return ret;
++		sep->bio_state = SEP_BIO_STATE_PENDING;
++		sep->bio_stage = 0;
++		return 0;
++	}
++	case SEP_BIO_ENROL_POLL: {
++		struct sep_bio_enrol_poll poll = {
++			.state = sep->bio_state,
++			.stage = sep->bio_stage,
++			.stages_total = 0,	/* unknown until the struct lands */
++			.status = 0,
++		};
++
++		if (copy_to_user((void __user *)arg, &poll, sizeof(poll)))
++			return -EFAULT;
++		return 0;
++	}
++	case SEP_BIO_VERIFY_START: {
++		/* Provisional 68-byte MatchMode payload, same caveat as enrol. */
++		struct sep_bio_verify_start start;
++		u8 payload[68] = { };
++		int ret;
++
++		if (copy_from_user(&start, (void __user *)arg, sizeof(start)))
++			return -EFAULT;
++		if (sep_sbio_init(sep))
++			return -EAGAIN;
++		if (sep->verify_len) {
++			memcpy(payload, sep->verify_payload, sep->verify_len);
++		} else {
++			memcpy(payload, &start.flags, sizeof(start.flags));
++		}
++		ret = sep_transfer(sep, sep->sbio_ep, 0x25, payload,
++				   sep->verify_len ? sep->verify_len : sizeof(payload),
++				   NULL, 0, 10000);
++		if (ret < 0)
++			return ret;
++		sep->bio_state = SEP_BIO_STATE_PENDING;
++		return 0;
++	}
++	case SEP_BIO_VERIFY_POLL: {
++		struct sep_bio_verify_poll poll = {
++			.state = sep->bio_state,
++			.result = SEP_BIO_NOT_COMPARED,
++			.status = 0,
++		};
++
++		if (copy_to_user((void __user *)arg, &poll, sizeof(poll)))
++			return -EFAULT;
++		return 0;
++	}
++	case SEP_BIO_CANCEL:
++	case SEP_BIO_DELETE:
++	case SEP_BIO_DELETE_ALL:
++	case SEP_BIO_ATTEST:
++		/* SBIO framing is not implemented yet (docs/sep/driver-notes.md). */
++		return -ENOSYS;
++	default:
++		return -ENOTTY;
++	}
++}
++
++static const struct file_operations sep_bio_fops = {
++	.owner = THIS_MODULE,
++	.open = sep_bio_open,
++	.unlocked_ioctl = sep_bio_ioctl,
++	.llseek = noop_llseek,
++};
++
++static struct miscdevice sep_bio_dev = {
++	.minor = MISC_DYNAMIC_MINOR,
++	.name = "sep-bio",
++	.mode = 0600,
++	.fops = &sep_bio_fops,
++};
++
++
++/*
++ * Arming control. Nothing touches the SEP registers until the user writes 1
++ * here: the first read of a powered-down SEP block can stall the AP, and on a
++ * checkm8 boot sepOS is usually not running. Arm only after the pongoOS/m1n1
++ * side has confirmed the SEP is up.
++ */
++static ssize_t sep_dbg_start_write(struct file *file, const char __user *ubuf,
++				   size_t count, loff_t *ppos)
++{
++	struct sep_a9 *sep = file->private_data;
++	unsigned int on;
++	char buf[8];
++
++	if (count >= sizeof(buf))
++		return -EINVAL;
++	if (copy_from_user(buf, ubuf, count))
++		return -EFAULT;
++	buf[count] = '\0';
++	if (kstrtouint(buf, 0, &on))
++		return -EINVAL;
++
++	if (on && !sep->running) {
++		writel(0, sep->mbox + SEP_MBOX_DIS_INT);
++		writel(SEP_MBOX_INT_ENABLE, sep->mbox + SEP_MBOX_EN_INT);
++		sep->running = true;
++		schedule_delayed_work(&sep->poll,
++				      usecs_to_jiffies(sep->poll_us));
++	} else if (!on && sep->running) {
++		cancel_delayed_work_sync(&sep->poll);
++		writel(SEP_MBOX_INT_ENABLE, sep->mbox + SEP_MBOX_DIS_INT);
++		sep->running = false;
++	}
++
++	return count;
++}
++
++static const struct file_operations sep_dbg_start_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = sep_dbg_start_write,
++};
++
++
++static int sep_hex2bin(u8 *dst, const char *src, size_t max)
++{
++	size_t n = 0;
++
++	while (*src && n < max) {
++		unsigned int v;
++		char byte[3];
++
++		while (*src == ' ')
++			src++;
++		if (!src[0] || !src[1])
++			break;
++		byte[0] = src[0];
++		byte[1] = src[1];
++		byte[2] = '\0';
++		if (kstrtouint(byte, 16, &v))
++			break;
++		dst[n++] = v;
++		src += 2;
++	}
++	return n;
++}
++
++/*
++ * echo "ep cmd hexpayload" > xfer
++ * Runs one endpoint command and keeps the reply for read().
++ */
++static ssize_t sep_dbg_xfer_write(struct file *file, const char __user *ubuf,
++				  size_t count, loff_t *ppos)
++{
++	struct sep_a9 *sep = file->private_data;
++	unsigned int ep, cmd;
++	u8 *payload;
++	char *buf, *hex;
++	size_t n;
++	int ret;
++
++	if (count > SEP_OOL_CHUNK * 2 + 32)
++		return -EINVAL;
++
++	buf = memdup_user_nul(ubuf, count);
++	if (IS_ERR(buf))
++		return PTR_ERR(buf);
++
++	if (sscanf(buf, "%x %x", &ep, &cmd) != 2) {
++		kfree(buf);
++		return -EINVAL;
++	}
++
++	payload = kmalloc(SEP_OOL_CHUNK, GFP_KERNEL);
++	if (!payload) {
++		kfree(buf);
++		return -ENOMEM;
++	}
++
++	hex = strchr(buf, ' ');
++	hex = hex ? strchr(hex + 1, ' ') : NULL;
++	n = hex ? sep_hex2bin(payload, hex + 1, SEP_OOL_CHUNK) : 0;
++
++	ret = sep_transfer(sep, ep, cmd, payload, n, sep->last_out,
++			   sizeof(sep->last_out), 10000);
++	kfree(payload);
++	kfree(buf);
++
++	return ret < 0 ? ret : count;
++}
++
++static ssize_t sep_dbg_xfer_read(struct file *file, char __user *ubuf,
++				 size_t count, loff_t *ppos)
++{
++	struct sep_a9 *sep = file->private_data;
++	char *buf;
++	ssize_t len = 0;
++	size_t i;
++
++	buf = kzalloc(PAGE_SIZE, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	len += scnprintf(buf + len, PAGE_SIZE - len, "out_len=%zu\n",
++			 sep->last_out_len);
++	for (i = 0; i < sep->last_out_len && len < PAGE_SIZE - 8; i++)
++		len += scnprintf(buf + len, PAGE_SIZE - len, "%02x",
++				 sep->last_out[i]);
++	len += scnprintf(buf + len, PAGE_SIZE - len, "\n");
++
++	len = simple_read_from_buffer(ubuf, count, ppos, buf, len);
++	kfree(buf);
++	return len;
++}
++
++static const struct file_operations sep_dbg_xfer_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.read = sep_dbg_xfer_read,
++	.write = sep_dbg_xfer_write,
++};
++
++
++/* echo <n> > sbio : select the SEP endpoint number for sbio at runtime */
++static ssize_t sep_dbg_sbio_write(struct file *file, const char __user *ubuf,
++				  size_t count, loff_t *ppos)
++{
++	struct sep_a9 *sep = file->private_data;
++	unsigned int ep;
++	char buf[8];
++
++	if (count >= sizeof(buf))
++		return -EINVAL;
++	if (copy_from_user(buf, ubuf, count))
++		return -EFAULT;
++	buf[count] = '\0';
++	if (kstrtouint(buf, 0, &ep) || ep >= SEP_OEP_MAX)
++		return -EINVAL;
++
++	sep->sbio_ep = ep;
++	sep->sbio_ready = false;
++	return count;
++}
++
++static const struct file_operations sep_dbg_sbio_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = sep_dbg_sbio_write,
++};
++
++
++/*
++ * echo "enrol <hex>"  > bio_payload
++ * echo "verify <hex>" > bio_payload
++ *
++ * The EnrollMode (0x03) and MatchMode (0x25) payloads are serialized by
++ * biometrickitd in userspace; until that layout is recovered this lets a raw
++ * payload be tested against a live SEP without rebuilding the kernel.
++ */
++static ssize_t sep_dbg_bio_payload_write(struct file *file,
++					 const char __user *ubuf, size_t count,
++					 loff_t *ppos)
++{
++	struct sep_a9 *sep = file->private_data;
++	char *buf, *hex;
++	size_t n;
++	int ret = count;
++
++	if (count > 512)
++		return -EINVAL;
++	buf = memdup_user_nul(ubuf, count);
++	if (IS_ERR(buf))
++		return PTR_ERR(buf);
++
++	if (!strncmp(buf, "enrol ", 6)) {
++		hex = buf + 6;
++		n = sep_hex2bin(sep->enrol_payload, hex, sizeof(sep->enrol_payload));
++		sep->enrol_len = n;
++	} else if (!strncmp(buf, "verify ", 7)) {
++		hex = buf + 7;
++		n = sep_hex2bin(sep->verify_payload, hex, sizeof(sep->verify_payload));
++		sep->verify_len = n;
++	} else {
++		ret = -EINVAL;
++	}
++
++	kfree(buf);
++	return ret;
++}
++
++static const struct file_operations sep_dbg_bio_payload_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = sep_dbg_bio_payload_write,
++};
++
++static void sep_debugfs_init(struct sep_a9 *sep)
++{
++	sep->dbg = debugfs_create_dir("sep-a9", NULL);
++	if (IS_ERR_OR_NULL(sep->dbg)) {
++		sep->dbg = NULL;
++		return;
++	}
++
++	debugfs_create_file("status", 0444, sep->dbg, sep, &sep_dbg_status_fops);
++	debugfs_create_file("log", 0444, sep->dbg, sep, &sep_dbg_log_fops);
++	debugfs_create_file("send", 0200, sep->dbg, sep, &sep_dbg_send_fops);
++	debugfs_create_file("ool", 0200, sep->dbg, sep, &sep_dbg_ool_fops);
++	debugfs_create_file("start", 0200, sep->dbg, sep, &sep_dbg_start_fops);
++	debugfs_create_file("xfer", 0600, sep->dbg, sep, &sep_dbg_xfer_fops);
++	debugfs_create_file("sbio", 0200, sep->dbg, sep, &sep_dbg_sbio_fops);
++	debugfs_create_file("bio_payload", 0200, sep->dbg, sep,
++			    &sep_dbg_bio_payload_fops);
++}
++
++static int sep_probe(struct platform_device *pdev)
++{
++	struct sep_a9 *sep;
++	struct resource *res;
++
++	sep = devm_kzalloc(&pdev->dev, sizeof(*sep), GFP_KERNEL);
++	if (!sep)
++		return -ENOMEM;
++
++	sep->dev = &pdev->dev;
++	mutex_init(&sep->lock);
++	mutex_init(&sep->xfer_lock);
++	init_completion(&sep->xfer_done);
++	INIT_DELAYED_WORK(&sep->poll, sep_poll_work);
++	sep->poll_us = 10000;
++	sep->sbio_ep = sbio_ep < 0 ? 0xff : sbio_ep;
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res)
++		return -ENODEV;
++
++	sep->base = devm_ioremap_resource(&pdev->dev, res);
++	if (IS_ERR(sep->base))
++		return PTR_ERR(sep->base);
++
++	sep->mbox = sep->base + SEP_MBOX_OFFSET;
++
++	/*
++	 * Deliberately no MMIO here: ioremap only reserves the range. The
++	 * mailbox is armed through debugfs start.
++	 */
++	platform_set_drvdata(pdev, sep);
++	sep_a9_instance = sep;
++
++	if (misc_register(&sep_bio_dev))
++		dev_warn(&pdev->dev, "could not register /dev/sep-bio\n");
++
++	sep_debugfs_init(sep);
++
++	dev_info(&pdev->dev, "mailbox at %px (sep %px), unarmed\n", sep->mbox,
++		 sep->base);
++	return 0;
++}
++
++static void sep_remove(struct platform_device *pdev)
++{
++	struct sep_a9 *sep = platform_get_drvdata(pdev);
++
++	cancel_delayed_work_sync(&sep->poll);
++	misc_deregister(&sep_bio_dev);
++	sep_a9_instance = NULL;
++	if (sep->running)
++		writel(SEP_MBOX_INT_ENABLE, sep->mbox + SEP_MBOX_DIS_INT);
++	debugfs_remove_recursive(sep->dbg);
++}
++
++static const struct of_device_id sep_of_match[] = {
++	{ .compatible = "apple,s8000-sep" },
++	{ .compatible = "apple,s8003-sep" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, sep_of_match);
++
++static struct platform_driver sep_driver = {
++	.probe = sep_probe,
++	.remove = sep_remove,
++	.driver = {
++		.name = "sep-a9",
++		.of_match_table = sep_of_match,
++	},
++};
++
++/*
++ * There is no SEP node in the device tree yet, so instantiate the device
++ * ourselves with the j71t addresses from the ADT. Interrupts are not wired
++ * up in this stage (see docs/sep/driver-notes.md); the mailbox is polled.
++ */
++#define SEP_A9_BASE	0x20da00000ULL
++#define SEP_A9_SIZE	0x10000
++
++static struct platform_device *sep_pdev;
++
++/*
++ * Off by default: reading the SEP block while its power domain is down can
++ * stall the AP, and on a checkm8 boot sepOS is usually not running at all.
++ * Enable explicitly with sep_a9.enable=1 on the kernel command line.
++ */
++static bool enable;
++module_param(enable, bool, 0444);
++MODULE_PARM_DESC(enable, "Probe the A9 SEP mailbox (default: off)");
++
++static int __init sep_init(void)
++{
++	struct resource res[] = {
++		DEFINE_RES_MEM(SEP_A9_BASE, SEP_A9_SIZE),
++	};
++	struct device_node *np;
++	int ret;
++
++	if (!enable) {
++		pr_info("sep-a9: disabled; pass sep_a9.enable=1 to probe\n");
++		return 0;
++	}
++
++	/*
++	 * If the device tree describes the SEP (apple,s8003-sep), the platform
++	 * driver instantiates itself from it; registering our own device would
++	 * create a second instance.
++	 */
++	np = of_find_compatible_node(NULL, NULL, "apple,s8003-sep");
++	if (!np)
++		np = of_find_compatible_node(NULL, NULL, "apple,s8000-sep");
++	if (np) {
++		of_node_put(np);
++		return platform_driver_register(&sep_driver);
++	}
++
++	sep_pdev = platform_device_register_simple("sep-a9", -1, res,
++						   ARRAY_SIZE(res));
++	if (IS_ERR(sep_pdev))
++		return PTR_ERR(sep_pdev);
++
++	ret = platform_driver_register(&sep_driver);
++	if (ret) {
++		platform_device_unregister(sep_pdev);
++		return ret;
++	}
++
++	return 0;
++}
++
++static void __exit sep_exit(void)
++{
++	platform_driver_unregister(&sep_driver);
++	if (sep_pdev)
++		platform_device_unregister(sep_pdev);
++}
++
++module_init(sep_init);
++module_exit(sep_exit);
++
++MODULE_DESCRIPTION("Apple A9 Secure Enclave mailbox");
++MODULE_LICENSE("GPL");
+diff --git a/include/uapi/linux/apple-sep.h b/include/uapi/linux/apple-sep.h
+new file mode 100644
+index 0000000000..394b497ff7
+--- /dev/null
++++ b/include/uapi/linux/apple-sep.h
+@@ -0,0 +1,133 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note OR MIT */
++/* Copyright 2026 Dj */
++/*
++ * Userspace interface for the SEP biometric device.
++ *
++ * The enclave does the matching. Nothing biometric crosses this interface: only
++ * an operation, a stage, a status, an opaque identity UUID, and an opaque host
++ * label userspace chooses.
++ */
++
++#ifndef _UAPI_LINUX_APPLE_SEP_H
++#define _UAPI_LINUX_APPLE_SEP_H
++
++#include <linux/ioctl.h>
++#include <linux/types.h>
++
++#define SEP_BIO_IFACE_VERSION  4
++
++#define SEP_BIO_UUID_LEN       16
++#define SEP_BIO_LABEL_LEN      128
++#define SEP_BIO_NONCE_LEN      32
++#define SEP_BIO_TOKEN_LEN      32
++#define SEP_BIO_MAX_IDENTITIES 32
++#define SEP_BIO_CHALLENGE_LEN  32
++#define SEP_BIO_ATTEST_PUB_LEN 65
++#define SEP_BIO_ATTEST_SIG_MAX 72
++
++enum {
++	SEP_BIO_STATE_IDLE     = 0,
++	SEP_BIO_STATE_PENDING  = 1,
++	SEP_BIO_STATE_PROGRESS = 2,
++	SEP_BIO_STATE_DONE     = 3,
++	SEP_BIO_STATE_FAILED   = 4,
++};
++
++enum {
++	SEP_BIO_NO_MATCH = 0,
++	SEP_BIO_MATCH    = 1,
++	SEP_BIO_NOT_COMPARED = 2,
++};
++
++struct sep_bio_identity {
++	__u8 uuid[SEP_BIO_UUID_LEN];
++	__u8 label[SEP_BIO_LABEL_LEN];
++};
++
++struct sep_bio_info {
++	__u32 version;
++	__u32 sensor_present;
++	__u32 enrolled;
++	__u32 capacity; /* usable slots in this SEP user context, not ABI list size */
++	__u32 enroll_stages;
++	__u32 reserved[3];
++};
++
++/* reserved[0] flags; reserved[1] is a live SEP identity count only when valid. */
++#define SEP_BIO_INFO_LIVE_COUNT_VALID 1u
++
++struct sep_bio_list {
++	__u32 count;
++	__u32 reserved;
++	struct sep_bio_identity id[SEP_BIO_MAX_IDENTITIES];
++};
++
++struct sep_bio_enrol_start {
++	__u32 flags;
++	__u32 reserved;
++	__u8  label[SEP_BIO_LABEL_LEN];
++};
++
++#define SEP_BIO_GUIDANCE_NONE          0
++#define SEP_BIO_GUIDANCE_PLACE         1
++#define SEP_BIO_GUIDANCE_LIFT_AND_MOVE 2
++#define SEP_BIO_GUIDANCE_HOLD_STILL    3
++
++struct sep_bio_enrol_poll {
++	__u32 state;
++	__u32 stage;
++	__u32 stages_total;
++	__u32 status;
++	__u8  uuid[SEP_BIO_UUID_LEN];
++	__u32 guidance;
++	__u32 progress_percent;
++};
++
++struct sep_bio_verify_start {
++	__u32 flags;
++	__u32 reserved;
++	__u8  nonce[SEP_BIO_NONCE_LEN];
++};
++
++struct sep_bio_verify_poll {
++	__u32 state;
++	__u32 result;
++	__u32 status;
++	__u32 guidance; /* SEP_BIO_GUIDANCE_*; status only, no capture side effect */
++	__u8  uuid[SEP_BIO_UUID_LEN];
++	__u8  token[SEP_BIO_TOKEN_LEN];  /* single use, bound to the nonce */
++	__u64 deadline_ns;      /* CLOCK_MONOTONIC; past this the token is void */
++};
++
++struct sep_bio_delete {
++	__u8 uuid[SEP_BIO_UUID_LEN];
++};
++
++/*
++ * Device attestation of key possession: the enclave signs 'challenge' with the
++ * machine ref-key (ECDSA-P256 over the challenge as the pre-computed digest) and
++ * returns the DER signature and public point. The private key never leaves the
++ * enclave.
++ */
++struct sep_bio_attest {
++	__u32 sig_len;                              /* out: DER signature length */
++	__u8  challenge[SEP_BIO_CHALLENGE_LEN];  /* in */
++	__u8  public_key[SEP_BIO_ATTEST_PUB_LEN]; /* out: P-256 point, 04||X||Y */
++	__u8  signature[SEP_BIO_ATTEST_SIG_MAX]; /* out: DER SEQUENCE{r,s} */
++	__u8  reserved[3];
++};
++
++#define SEP_BIO_IOC_MAGIC 0xB1
++
++#define SEP_BIO_GET_INFO     _IOR(SEP_BIO_IOC_MAGIC, 0x01, struct sep_bio_info)
++#define SEP_BIO_LIST         _IOR(SEP_BIO_IOC_MAGIC, 0x02, struct sep_bio_list)
++#define SEP_BIO_ENROL_START  _IOW(SEP_BIO_IOC_MAGIC, 0x03, struct sep_bio_enrol_start)
++#define SEP_BIO_ENROL_POLL   _IOR(SEP_BIO_IOC_MAGIC, 0x04, struct sep_bio_enrol_poll)
++#define SEP_BIO_VERIFY_START _IOW(SEP_BIO_IOC_MAGIC, 0x05, struct sep_bio_verify_start)
++#define SEP_BIO_VERIFY_POLL  _IOR(SEP_BIO_IOC_MAGIC, 0x06, struct sep_bio_verify_poll)
++#define SEP_BIO_CANCEL       _IO(SEP_BIO_IOC_MAGIC, 0x07)
++#define SEP_BIO_DELETE       _IOW(SEP_BIO_IOC_MAGIC, 0x08, struct sep_bio_delete)
++#define SEP_BIO_DELETE_ALL   _IO(SEP_BIO_IOC_MAGIC, 0x09)
++#define SEP_BIO_ATTEST       _IOWR(SEP_BIO_IOC_MAGIC, 0x0a, struct sep_bio_attest)
++
++#endif /* _UAPI_LINUX_APPLE_SEP_H */
+-- 
+2.56.0
+

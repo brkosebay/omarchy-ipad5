@@ -1,0 +1,132 @@
+From dc33fef48a6b01d14aba06fe87b8c000d93585f6 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 21:14:51 +0000
+Subject: [PATCH 2/3] spi: apple-s8000: allow opt-in runtime domain autosuspend
+
+---
+ drivers/spi/spi-apple-s8000.c | 65 +++++++++++++++++++++++++++++++++--
+ 1 file changed, 62 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/spi/spi-apple-s8000.c b/drivers/spi/spi-apple-s8000.c
+index fb5efa5696..12da8fe7ee 100644
+--- a/drivers/spi/spi-apple-s8000.c
++++ b/drivers/spi/spi-apple-s8000.c
+@@ -36,14 +36,27 @@
+ #define S8000_DIV_MAX		2047
+ #define S8000_XFER_TIMEOUT_US	1000000
+ 
++static bool autosuspend;
++module_param(autosuspend, bool, 0444);
++MODULE_PARM_DESC(autosuspend, "Experimental PIO domain autosuspend (default: off)");
++
+ struct s8000_spi {
+ 	void __iomem *base;
+ 	struct clk *clk;
++	bool held;
+ };
+ 
+ static void s8000_spi_pm_put(void *data)
+ {
+-	pm_runtime_put_sync(data);
++	struct device *dev = data;
++	struct spi_controller *ctlr = dev_get_drvdata(dev);
++	struct s8000_spi *spi = spi_controller_get_devdata(ctlr);
++
++	pm_runtime_dont_use_autosuspend(dev);
++	if (spi->held)
++		pm_runtime_put_sync(dev);
++	else
++		pm_runtime_barrier(dev);
+ }
+ 
+ static void s8000_spi_set_cs(struct spi_device *device, bool high)
+@@ -153,6 +166,35 @@ static int s8000_spi_transfer_one(struct spi_controller *ctlr,
+ 	return ret;
+ }
+ 
++static int s8000_spi_runtime_suspend(struct device *dev)
++{
++	struct s8000_spi *spi = spi_controller_get_devdata(dev_get_drvdata(dev));
++
++	/* SPI core holds a PM reference across the entire message, including CS. */
++	writel(0, spi->base + S8000_CTRL);
++	readl(spi->base + S8000_CTRL);
++	return 0;
++}
++
++static int s8000_spi_runtime_resume(struct device *dev)
++{
++	struct s8000_spi *spi = spi_controller_get_devdata(dev_get_drvdata(dev));
++
++	if (!autosuspend)
++		return 0;
++	/* genpd has powered the block before this callback. No IRQs or DMA. */
++	writel(0, spi->base + S8000_CTRL);
++	writel(S8000_PIN_CS, spi->base + S8000_PIN);
++	writel(S8000_CFG_BASE, spi->base + S8000_CFG);
++	writel(S8000_STATUS_CLEAR, spi->base + S8000_STATUS);
++	/* CLKDIV, WORD_DELAY, CFG and counts are programmed per transfer. */
++	return 0;
++}
++
++static const struct dev_pm_ops s8000_spi_pm_ops = {
++	SET_RUNTIME_PM_OPS(s8000_spi_runtime_suspend, s8000_spi_runtime_resume, NULL)
++};
++
+ static int s8000_spi_probe(struct platform_device *pdev)
+ {
+ 	struct spi_controller *ctlr;
+@@ -173,13 +215,19 @@ static int s8000_spi_probe(struct platform_device *pdev)
+ 	rate = clk_get_rate(spi->clk);
+ 	if (!rate)
+ 		return -EINVAL;
++	platform_set_drvdata(pdev, ctlr);
++	if (autosuspend) {
++		pm_runtime_set_autosuspend_delay(&pdev->dev, 1000);
++		pm_runtime_use_autosuspend(&pdev->dev);
++	}
+ 	ret = devm_pm_runtime_enable(&pdev->dev);
+ 	if (ret)
+ 		return ret;
+ 	ret = pm_runtime_resume_and_get(&pdev->dev);
+ 	if (ret < 0)
+ 		return ret;
+-	/* Keep the block active for the lifetime of this bring-up controller. */
++	spi->held = true;
++	/* Keep the default bring-up reference unless explicitly opted in. */
+ 	ret = devm_add_action_or_reset(&pdev->dev, s8000_spi_pm_put, &pdev->dev);
+ 	if (ret)
+ 		return ret;
+@@ -194,10 +242,20 @@ static int s8000_spi_probe(struct platform_device *pdev)
+ 	ctlr->transfer_one = s8000_spi_transfer_one;
+ 	ctlr->max_transfer_size = s8000_spi_max_transfer_size;
+ 	ctlr->use_gpio_descriptors = true;
++	ctlr->auto_runtime_pm = autosuspend;
+ 	/* No controller IRQ enable bits are set: every PIO transfer is bounded. */
+ 	writel(0, spi->base + S8000_CTRL);
+ 	dev_info(&pdev->dev, "Samsung SPI v1 PIO, input clock %lu Hz\n", rate);
+-	return devm_spi_register_controller(&pdev->dev, ctlr);
++	ret = devm_spi_register_controller(&pdev->dev, ctlr);
++	if (ret)
++		return ret;
++	if (autosuspend) {
++		spi->held = false;
++		pm_runtime_mark_last_busy(&pdev->dev);
++		pm_runtime_put_autosuspend(&pdev->dev);
++		dev_info(&pdev->dev, "experimental 1000ms domain autosuspend enabled\n");
++	}
++	return 0;
+ }
+ 
+ static const struct of_device_id s8000_spi_match[] = {
+@@ -211,6 +269,7 @@ static struct platform_driver s8000_spi_driver = {
+ 	.driver = {
+ 		.name = "apple-s8000-spi",
+ 		.of_match_table = s8000_spi_match,
++		.pm = &s8000_spi_pm_ops,
+ 	},
+ };
+ module_platform_driver(s8000_spi_driver);
+-- 
+2.56.0
+

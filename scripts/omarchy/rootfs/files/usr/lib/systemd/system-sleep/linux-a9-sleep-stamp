@@ -1,0 +1,12 @@
+#!/bin/sh
+# linux-a9: lets ipad-sleep ignore the Power press that woke the iPad. Power
+# is a wake source, and its key event reaches Hyprland right after resume,
+# which would otherwise put the iPad straight back to sleep.
+mkdir -p /run/linux-a9
+case "$1" in
+pre) : >/run/linux-a9/sleeping ;;
+post)
+	cut -d' ' -f1 /proc/uptime >/run/linux-a9/resumed
+	rm -f /run/linux-a9/sleeping
+	;;
+esac

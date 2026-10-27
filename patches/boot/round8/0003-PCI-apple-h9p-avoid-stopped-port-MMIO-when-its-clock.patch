@@ -1,0 +1,27 @@
+From 18eecae4429f02e4fba870b23a6da7e4f19fb84f Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 17:57:21 +0000
+Subject: [PATCH] PCI/apple-h9p: avoid stopped-port MMIO when its clock is off
+
+Require both RC power and clock bits before stopping retained LTSSM state. The full-cycle path must also accept a partially powered inherited port without reading its inaccessible register block.
+---
+ drivers/pci/controller/pcie-apple-h9p.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/pci/controller/pcie-apple-h9p.c b/drivers/pci/controller/pcie-apple-h9p.c
+index 34f0409539..ebf39f421b 100644
+--- a/drivers/pci/controller/pcie-apple-h9p.c
++++ b/drivers/pci/controller/pcie-apple-h9p.c
+@@ -1983,7 +1983,8 @@ static int apple_s8003_setup_port_full(struct apple_h9p_pcie *pcie,
+ 	 * rc+124 reset, 60us, rc+114 refclk, rc+100 power (not the legacy
+ 	 * helper's misleading CTL/PWR/REFCLK names).
+ 	 */
+-	if (readl(rc + S8003_RC_PORT_CTL(port)) & S8003_RC_PORT_CTL_ENABLE)
++	if ((readl(rc + S8003_RC_PORT_CTL(port)) & S8003_RC_PORT_CTL_ENABLE) &&
++	    (readl(rc + S8003_RC_PORT_PWR(port)) & S8003_RC_PORT_PWR_ON))
+ 		apple_s8003_port_stop(pcie, port);
+ 	h9p_rmw(rc + S8003_RC_PORT_REFCLK(port), S8003_RC_PORT_REFCLK_ON, 0);
+ 	udelay(S8003_PERST_TO_REFCLK_US);
+-- 
+2.56.0
+

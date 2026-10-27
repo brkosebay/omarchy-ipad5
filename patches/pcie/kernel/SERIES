@@ -1,0 +1,44 @@
+76cd318a5c dt-bindings: pci: apple: Add T8010 PCIe host bridge
+85f985a305 PCI: apple: Add T8010 PCIe host bridge support
+8b127f1204 nvme-pci: Add Apple ANS FlatDMA support
+727b7e86af arm64: dts: apple: Add T8010 PCIe and NVMe
+3d972d5f95 MAINTAINERS: Add T8010 PCIe and ANS support
+1e1bbcd118 dt-bindings: pci: apple,t8010-pcie: Add S8003
+7e407f7370 PCI: apple-h9p: Add S8003 support
+39b99e010f nvme-pci: apple-ans: Match by host bridge, check the HMB first
+c20e3fe6c4 nvme-pci: Add a read-only mode for Apple iDevice bring-up
+28da4f83e8 arm64: dts: apple: s800-0-3: Add PCIe DARTs
+ea4ca97cf2 arm64: dts: apple: s8003: Add PCIe, enable it on iPad 5 (TSMC)
+cf4b81002d dt-bindings: pci: apple,t8010-pcie: Add tunables and NVMMU FIFO mode
+66148506e4 PCI: apple-h9p: Apply tunables, honour the NVMMU invalidate FIFO
+66ead9a45f nvme-pci: apple-ans: Log bring-up phases, check the link first
+1e342d43fb nvme-pci: Bring Apple ANS controllers up from reset_work
+4f70c40735 arm64: dts: apple: s8003: Tunables, NVMMU FIFO mode, no ASPM
+3e86ad4fb4 iommu: apple-dart: Fix the S5L8960X fault handler and TCR update
+50e9494d6b iommu: apple-dart: Program the S5L8960X error reflector and configs
+82c44c5338 iommu: apple-dart: Add a per-DART apple,dma-range IOVA window
+a8505d9116 arm64: dts: apple: s800-0-3, s8003: PCIe DART windows, no dma-ranges
+91a26f5bd2 PCI: apple-h9p: SoC-side host state for the ANS glue, log NVMMU faults
+fbe06b833b nvme-pci: apple-ans: Staged, instrumented controller enable
+320a9f634d iommu: apple-dart: S5L8960X windows are base-relative, clear stale errors
+73a80e55aa iommu/io-pgtable-dart: S5L8960X table entries need bits 1:0 set
+ede8790b3d PCI: apple-h9p, nvme-pci: apple-ans: Log the DART walk for the admin queues
+e7a3ee6eb2 nvme-pci: apple-ans: Write-protect the system namespaces
+fdbc93b5fe nvme-pci: apple-ans, iommu: apple-dart: Bring-up diagnostics behind a switch
+1b6e02d8b4 dt-bindings: gpio: add Apple D2365 PMIC GPIOs
+4eae86c7b0 gpio: add Apple D2365 PMIC driver
+ab0c31aea4 PCI: apple-h9p: Bring up powered endpoints after probe
+946c7da17f arm64: dts: apple: s8003-j71t: Wi-Fi on PCIe port 1
+4408074bc8 wifi: brcmfmac: of: Read the country code map for PCIe DT nodes too
+6ae884719a wifi: brcmfmac: feature: Drop P2P on the Apple iOS BCM4355 C0 firmware
+aa7347b2af PCI: apple-h9p: Let a boot opt ports into ASPM L1
+868c0c56cc arm64: dts: apple: s8003-j71t: Pass the Wi-Fi country to the firmware
+1e73081979 PCI: apple-h9p: Opt-in system sleep (s2idle)
+ae51922420 nvme-pci: Don't enable a device whose host bridge cut it off
+14113876c9 wifi: brcmfmac: pcie: Stay down if the device was lost over suspend
+711cec52a9 pinctrl: apple: gpio: Skip set_wake
+02f018b032 pmdomain: apple: pmgr-pwrstate: Keep wakeup-path domains on in sleep
+c994b628dd arm64: dts: apple: s800-0-3: Keep the AP GPIO domain on
+ca94a3c6f9 usb: dwc2: Optionally keep a connected gadget over suspend-to-idle
+2752fedbbf arm64: dts: apple: s800x-ipad5: Keep the display domains on
+base: 6831bc701a6ce059e71e5aaa9488c9195bea6927 (Merge branch 'bits/090-dart' into hoolock)

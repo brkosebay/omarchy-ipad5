@@ -1,0 +1,148 @@
+From 824a8bda2cd69634884d8830224a41aa3ceecd93 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Tue, 27 Oct 2026 17:09:00 +0000
+Subject: [PATCH 2/2] power: supply: apple: qualify 3A CC sources and retain
+ ADC fault origin
+
+---
+ Documentation/ABI/testing/sysfs-apple-charge8 |  6 ++--
+ drivers/power/supply/apple_tristar_power.c    | 35 ++++++++++++++-----
+ 2 files changed, 30 insertions(+), 11 deletions(-)
+
+diff --git a/Documentation/ABI/testing/sysfs-apple-charge8 b/Documentation/ABI/testing/sysfs-apple-charge8
+index 0999ba0d3b..05a8658615 100644
+--- a/Documentation/ABI/testing/sysfs-apple-charge8
++++ b/Documentation/ABI/testing/sysfs-apple-charge8
+@@ -9,7 +9,8 @@ Description:
+ 		refused callback), attempts/failures count this physical source,
+ 		retry_ms is the failure backoff (1000..60000 ms), poisoned means
+ 		ADC completion was uncertain and further triggers are prohibited
+-		until reboot. Detach does not clear that poison.
++		until reboot. Detach does not clear that poison; poison_stage and
++		poison_attach retain the operation and source epoch that latched it.
+ 
+ 		route is the last pre-monitor DX_CONTROL byte, adc_status the last
+ 		0x156 read. Negative values indicate errno or unavailable (-ENODATA).
+@@ -17,5 +18,6 @@ Description:
+ 		D+ sample for verified DigitalID 10 09 08 00 00 00. These are pin
+ 		voltages, never VBUS. sampled means classification completed.
+ 		Type C budgets come from stable CC advertisement (1500/3000 mA),
+-		bounded by the charger's board ceiling and supported current ladder.
++		3 A requires BC1.2 charging-port evidence; otherwise it is capped
++		at 1500 mA. All budgets are bounded by the charger's board ceiling and supported current ladder.
+ 		Classification does not negotiate USB Power Delivery or change VBUS.
+diff --git a/drivers/power/supply/apple_tristar_power.c b/drivers/power/supply/apple_tristar_power.c
+index 27c738e903..6a2f5b2185 100644
+--- a/drivers/power/supply/apple_tristar_power.c
++++ b/drivers/power/supply/apple_tristar_power.c
+@@ -123,11 +123,14 @@ struct apple_tristar {
+ 	unsigned int detect_attempts;
+ 	unsigned int detect_failures;
+ 	unsigned int retry_ms;
++	bool detect_logged;
+ 	u8 saved_route;
+ 	bool restore_pending;
+ 	bool dcp_pending;
+ 	bool brick_sampled;
+ 	bool adc_poisoned;
++	const char *adc_fault_stage;
++	unsigned int adc_fault_attach;
+ 	bool stopping;
+ 	bool notifier_registered;
+ 	bool sleeping;
+@@ -234,6 +237,8 @@ static int apple_tristar_adc_mv(struct apple_tristar *ts)
+ poison:
+ 	/* A late completion must never be mistaken for the next pin's sample. */
+ 	ts->adc_poisoned = true;
++	ts->adc_fault_stage = ts->detect_stage;
++	ts->adc_fault_attach = ts->attach_id;
+ 	return ret;
+ }
+ 
+@@ -374,19 +379,20 @@ static void apple_tristar_detect_failed(struct apple_tristar *ts, int ret)
+ 	ts->retry_ms = min(1000U << min(ts->detect_failures - 1, 6U), 60000U);
+ 	ts->classify_after = jiffies + msecs_to_jiffies(ts->retry_ms);
+ 	/* No repeated 1 Hz warnings, even if the global printk bucket refills. */
+-	if (ts->detect_failures == 1 || !time_before(jiffies, ts->classify_log_after)) {
++	if (!ts->detect_logged || !time_before(jiffies, ts->classify_log_after)) {
+ 		dev_warn_ratelimited(&ts->client->dev,
+ 				     "charger detect: %s/%s error %d route %d adc %d poisoned %d attempt %u retry %u ms\n",
+ 				     ts->detect_pin ?: "none", ts->detect_stage ?: "none", ret,
+ 				     ts->route_before, ts->adc_status, ts->adc_poisoned,
+ 				     ts->detect_attempts, ts->adc_poisoned ? 0 : ts->retry_ms);
+ 		ts->classify_log_after = jiffies + msecs_to_jiffies(60000);
++		ts->detect_logged = true;
+ 	}
+ }
+ 
+ static void apple_tristar_classify(struct apple_tristar *ts)
+ {
+-	int dp, dm, ret, cc, type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
++	int dp, dm, ret, cc, cc_ua = 0, type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
+ 	bool typec = apple_tristar_typec_cable(ts);
+ 
+ 	/* Caller holds the role hardware lock before ts->lock. */
+@@ -425,10 +431,7 @@ static void apple_tristar_classify(struct apple_tristar *ts)
+ 			ret = -EAGAIN;
+ 			goto fail;
+ 		}
+-		if (ret) {
+-			type = POWER_SUPPLY_USB_TYPE_C;
+-			goto commit;
+-		}
++		cc_ua = ret;
+ 	}
+ 	dp = apple_tristar_pin_mv(ts, false, false, false);
+ 	ts->dp_mv = dp;
+@@ -475,7 +478,14 @@ static void apple_tristar_classify(struct apple_tristar *ts)
+ 			ret = 1500000;
+ 		}
+ 	}
+-commit:
++	/* iOS 5e23a90: without a charging-port type, clamp 3 A CC to 1.5 A. */
++	if (cc_ua == 3000000 && type != POWER_SUPPLY_USB_TYPE_DCP &&
++	    type != POWER_SUPPLY_USB_TYPE_CDP)
++		cc_ua = 1500000;
++	if (cc_ua && cc_ua >= ret) {
++		ret = cc_ua;
++		type = POWER_SUPPLY_USB_TYPE_C;
++	}
+ 	cc = apple_tristar_sample_vbus(ts);
+ 	if (cc) {
+ 		ret = cc;
+@@ -604,6 +614,7 @@ static int apple_tristar_update(struct apple_tristar *ts)
+ 		ts->analog_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
+ 		ts->classify_after = jiffies + msecs_to_jiffies(1000);
+ 		ts->detect_attempts = 0;
++		ts->detect_logged = false;
+ 		ts->detect_failures = 0;
+ 		ts->retry_ms = 0;
+ 		ts->detect_error = 0;
+@@ -754,6 +765,11 @@ static int apple_tristar_quiesce(struct apple_tristar *ts)
+ 		ts->notifier_registered = false;
+ 	}
+ 	cancel_delayed_work_sync(&ts->work);
++	mutex_lock(&ts->lock);
++	ret = ts->restore_pending || ts->dcp_pending;
++	mutex_unlock(&ts->lock);
++	if (!ret)
++		return 0;
+ 	for (attempt = 0; attempt < 3; attempt++) {
+ 		ret = ts->role_sw ?
+ 			apple_s8000_usb_role_monitor(ts->role_sw, apple_tristar_monitor, ts) :
+@@ -1554,12 +1570,13 @@ static ssize_t lightning_state_show(struct device *dev, struct device_attribute
+ 	type = ts->usb_type;
+ 	error = ts->error;
+ 	len += sysfs_emit_at(buf, len,
+-			     "charger_detect: stage=%s pin=%s error=%d monitor_error=%d attempts=%u failures=%u retry_ms=%u poisoned=%d route=%d adc_status=%d dp_mv=%d dm_mv=%d cc_mv=%d sampled=%d\n",
++			     "charger_detect: stage=%s pin=%s error=%d monitor_error=%d attempts=%u failures=%u retry_ms=%u poisoned=%d route=%d adc_status=%d dp_mv=%d dm_mv=%d cc_mv=%d sampled=%d poison_stage=%s poison_attach=%u\n",
+ 			     ts->detect_stage ?: "none", ts->detect_pin ?: "none",
+ 			     ts->detect_error, ts->monitor_error, ts->detect_attempts,
+ 			     ts->detect_failures, ts->retry_ms, ts->adc_poisoned,
+ 			     ts->route_before, ts->adc_status, ts->dp_mv, ts->dm_mv,
+-			     ts->cc_mv, ts->brick_sampled);
++			     ts->cc_mv, ts->brick_sampled, ts->adc_fault_stage ?: "none",
++			     ts->adc_fault_attach);
+ 	mutex_unlock(&ts->lock);
+ 
+ 	len += sysfs_emit_at(buf, len, "auto_host: %d\nphase: %s\nrole: %s%s\n",

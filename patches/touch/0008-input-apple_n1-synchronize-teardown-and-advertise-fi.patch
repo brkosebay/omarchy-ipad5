@@ -1,0 +1,121 @@
+From 0cbca54ab4e56a939ff83a9340744c67f849ec6f Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 12:54:24 +0000
+Subject: [PATCH 8/9] input: apple_n1: synchronize teardown and advertise
+ firmware
+
+Free and synchronize the managed IRQ before releasing contacts and power, including when the bounded error handler already masked it. Track ownership only in probe/remove instead of racing an IRQ-thread enabled flag. Use the same idempotent cleanup on shutdown.
+
+Declare both firmware filenames for initramfs tooling, retain full stage 3 as the normal boot default and direct no-fallback firmware requests, and diagnose missing calibration/invalid firmware explicitly.
+---
+ drivers/input/touchscreen/apple_n1.c | 32 +++++++++++++++++++---------
+ 1 file changed, 22 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/input/touchscreen/apple_n1.c b/drivers/input/touchscreen/apple_n1.c
+index 3f6330eebf7d5717de837e9695fd0b2a6afdcbd5..eecf94a019704777b54f67d476d472286f88237f 100644
+--- a/drivers/input/touchscreen/apple_n1.c
++++ b/drivers/input/touchscreen/apple_n1.c
+@@ -60,7 +60,7 @@ struct apple_n1 {
+ 	unsigned long last_wake;
+ 	bool wake_valid;
+ 	bool powered;
+-	bool irq_enabled;
++	bool irq_requested;
+ };
+ 
+ static u32 n1_sum(const u8 *data, size_t len)
+@@ -722,7 +722,6 @@ static irqreturn_t n1_irq(int irq, void *data)
+ 		dev_err_ratelimited(&n1->spi->dev, "frame/ATN error %d; rebind to recover\n",
+ 				    ret < 0 ? ret : -EOVERFLOW);
+ 		disable_irq_nosync(irq);
+-		n1->irq_enabled = false;
+ 		dev_err(&n1->spi->dev, "IRQ disabled after bounded error budget\n");
+ 	}
+ 	return IRQ_HANDLED;
+@@ -843,8 +842,10 @@ static int n1_probe(struct spi_device *spi)
+ 		if (ret)
+ 			return dev_err_probe(dev, ret, "N1 firmware %s\n", name);
+ 		ret = n1_validate_firmware(fw);
+-		if (ret)
++		if (ret) {
++			dev_err(dev, "invalid N1 firmware %s: %d\n", name, ret);
+ 			goto release_firmware;
++		}
+ 		if (device_property_present(dev, "apple,n1-calibration")) {
+ 			count = device_property_count_u8(dev, "apple,n1-calibration");
+ 			if (count != N1_CAL_SIZE) {
+@@ -866,8 +867,10 @@ static int n1_probe(struct spi_device *spi)
+ 			if (ret)
+ 				goto release_firmware;
+ 			ret = request_firmware_direct(&calibration, cal_name, dev);
+-			if (ret)
++			if (ret) {
++				dev_err(dev, "N1 calibration %s: %d\n", cal_name, ret);
+ 				goto release_firmware;
++			}
+ 			if (calibration->size != N1_CAL_SIZE) {
+ 				ret = -EINVAL;
+ 				goto release_firmware;
+@@ -931,6 +934,7 @@ static int n1_probe(struct spi_device *spi)
+ 	input_set_abs_params(n1->input, ABS_MT_TOUCH_MINOR, 0, 65535, 0, 0);
+ 	input_set_abs_params(n1->input, ABS_MT_ORIENTATION, -32768, 32767, 0, 0);
+ 	input_set_abs_params(n1->input, ABS_MT_PRESSURE, 0, 65535, 0, 0);
++	/* Classic N1 coordinates/ellipse axes are hundredths of a millimetre. */
+ 	input_abs_set_res(n1->input, ABS_MT_POSITION_X, 100);
+ 	input_abs_set_res(n1->input, ABS_MT_POSITION_Y, 100);
+ 	input_abs_set_res(n1->input, ABS_MT_TOUCH_MAJOR, 100);
+@@ -946,6 +950,7 @@ static int n1_probe(struct spi_device *spi)
+ 				       IRQF_ONESHOT | IRQF_NO_AUTOEN, dev_name(dev), n1);
+ 	if (ret)
+ 		goto power_off;
++	n1->irq_requested = true;
+ 	/* Drain old boot/runtime reports before accepting interrupts. */
+ 	for (i = 0; i < 8; i++) {
+ 		ret = n1_read_frame(n1, false);
+@@ -964,9 +969,8 @@ static int n1_probe(struct spi_device *spi)
+ 		dev_err(dev, "ATN did not deassert after bounded initial drain\n");
+ 		goto power_off;
+ 	}
+-	n1->irq_enabled = true;
+ 	enable_irq(spi->irq);
+-	dev_info(dev, "touchscreen reporting enabled\n");
++	dev_info(dev, "touchscreen reporting enabled (inverted-y=%u)\n", n1->props.invert_y);
+ 	goto release_firmware;
+ 
+ power_off:
+@@ -983,12 +987,17 @@ static void n1_remove(struct spi_device *spi)
+ {
+ 	struct apple_n1 *n1 = spi_get_drvdata(spi);
+ 
+-	if (n1->irq_enabled)
+-		disable_irq(spi->irq);
+-	else if (n1->input)
+-		synchronize_irq(spi->irq);
++	/* Free/synchronize even if the error path already masked this IRQ.
++	 * Do not race an IRQ-thread flag or add another disable-depth count.
++	 * The managed action is removed here, before contacts and power go away.
++	 */
++	if (n1->irq_requested) {
++		devm_free_irq(&spi->dev, spi->irq, n1);
++		n1->irq_requested = false;
++	}
+ 	n1_release_contacts(n1);
+ 	n1_power_off(n1);
++	dev_info(&spi->dev, "N1 stopped; reset asserted\n");
+ }
+ 
+ static const struct of_device_id n1_of_match[] = {
+@@ -1010,6 +1019,7 @@ static struct spi_driver n1_driver = {
+ 	},
+ 	.probe = n1_probe,
+ 	.remove = n1_remove,
++	.shutdown = n1_remove,
+ 	.id_table = n1_spi_ids,
+ };
+ module_spi_driver(n1_driver);
+@@ -1017,3 +1027,5 @@ module_spi_driver(n1_driver);
+ MODULE_DESCRIPTION("Apple J71t N1 SPI touchscreen");
+ MODULE_AUTHOR("linux-a9 contributors");
+ MODULE_LICENSE("GPL");
++MODULE_FIRMWARE("apple/j71t-n1.bin");
++MODULE_FIRMWARE("apple/j71t-n1-calibration.bin");

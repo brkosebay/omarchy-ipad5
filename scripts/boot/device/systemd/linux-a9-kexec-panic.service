@@ -1,0 +1,16 @@
+# Arm kexec-on-panic: a kernel panic boots a crash kernel (in the
+# crashkernel= reservation), which resets the hardware and kexecs the
+# default entry. Without it, panic=0 halts. docs/boot/warm-reboot.md
+[Unit]
+Description=linux-a9: restart Linux on a kernel panic (kexec crash kernel)
+After=local-fs.target
+ConditionPathExists=/sys/kernel/kexec_crash_size
+ConditionPathExists=/boot/linux-a9/default
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/linux-a9-kexec panic-load
+
+[Install]
+WantedBy=multi-user.target

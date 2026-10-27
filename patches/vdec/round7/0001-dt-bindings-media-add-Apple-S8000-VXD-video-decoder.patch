@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 16:57:58 +0000
+Subject: [PATCH 01/21] dt-bindings: media: add Apple S8000 VXD video decoder
+
+The Apple "vxd" node is an Imagination PowerVR MSVDX multi-standard video
+decoder driven by the resident DEVA firmware on its MTX (META) core.  The
+S8000/S8003 (A9, iPad 5) instance reports vxd-version 7 with a single
+1 MiB register region and H.264 level 4.2; the block has no DART - it
+carries its own two-level "GART" translation unit, programmed by the
+host through the MTX MMU registers.
+
+Interrupt 157 is level-triggered through the AIC; the vdec power/clock
+gates are PMGR ids 119 and 40 (ps_vdec in s800-0-3-pmgr.dtsi covers the
+former).
+
+Evidence and the rung ladder live in docs/periph/ds-video-decoder.md.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ .../devicetree/bindings/media/apple,s8000-vxd.yaml | 60 ++++++++++++++++++++++
+ 1 file changed, 60 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/media/apple,s8000-vxd.yaml b/Documentation/devicetree/bindings/media/apple,s8000-vxd.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..fc003e246627022f98f6782f888933acf9ea7d91
+--- /dev/null
++++ b/Documentation/devicetree/bindings/media/apple,s8000-vxd.yaml
+@@ -0,0 +1,60 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/media/apple,s8000-vxd.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Apple VXD hardware video decoder (Imagination PowerVR MSVDX)
++
++maintainers:
++  - Berkay Kosebay <maintainer@example.invalid>
++
++description: |
++  The Apple "VXD" peripheral is a multi-standard hardware video decoder,
++  an Imagination PowerVR MSVDX core running the resident DEVA firmware on
++  its MTX (META) microcontroller.  Apple has shipped this IP family since
++  the S5L8940X (A4); the S8000/S8003 (A9) in the iPad 5 reports
++  vxd-version 7.  The block has no IOMMU (DART): it carries its own
++  two-level "GART" translation unit, programmed by the host through the
++  MTX MMU registers.
++
++  Linux exposes it as a V4L2 stateless H.264 decoder.  The DEVA firmware
++  image must be supplied as /lib/firmware/apple/vxd-deva.bin.
++
++properties:
++  compatible:
++    items:
++      - const: apple,s8000-vxd
++
++  reg:
++    maxItems: 1
++
++  interrupts:
++    maxItems: 1
++
++  power-domains:
++    maxItems: 1
++
++required:
++  - compatible
++  - reg
++  - interrupts
++  - power-domains
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/interrupt-controller/apple-aic.h>
++
++    soc {
++      #address-cells = <2>;
++      #size-cells = <2>;
++
++      vxd@207f00000 {
++        compatible = "apple,s8000-vxd";
++        reg = <0x2 0x07f00000 0x0 0x100000>;
++        interrupts = <AIC_IRQ 157 IRQ_TYPE_LEVEL_HIGH>;
++        power-domains = <&ps_vdec>;
++      };
++    };

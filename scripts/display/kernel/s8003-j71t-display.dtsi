@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+
+/* Observer only: no clock, power-domain, reset or IOMMU consumers. */
+&{/soc} {
+	disp0: display-subsystem@206200000 {
+		compatible = "adbe0,s8000";
+		reg = <0x2 0x06200000 0 0x100000>,
+		      <0x2 0x06400000 0 0x8000>,
+		      <0x2 0x06440000 0 0x8000>,
+		      <0x2 0x06480000 0 0x8000>,
+		      <0x2 0x064c0000 0 0x8000>,
+		      <0x2 0x06500000 0 0x1c>;
+		interrupts = <AIC_IRQ 140 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 143 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 144 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 145 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 146 IRQ_TYPE_LEVEL_HIGH>;
+		memory-region = <&adbe_boot_vram>;
+	};
+};
+
+/*
+ * Live j71t ADT /vram: CPU 0x87c95c000, length 0x2400000 (36 MiB).
+ * Reserve it against allocation; this does not assert any DART mapping.
+ * D2 separately requires the operator to verify the current mapping span.
+ */
+/ {
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		adbe_boot_vram: framebuffer@87c95c000 {
+			reg = <0x8 0x7c95c000 0 0x2400000>;
+			no-map;
+		};
+	};
+};
+
+/* Also keep standalone a9/display builds safe, before the pcie merge. */
+&ps_disp0 {
+	apple,always-on;
+};
+
+&ps_dp {
+	apple,always-on;
+};

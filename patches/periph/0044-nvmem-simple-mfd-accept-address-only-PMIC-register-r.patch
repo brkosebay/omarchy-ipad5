@@ -1,0 +1,55 @@
+From 4bb7cdb0cbc236047de4247c453a3a5bf97ac262 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 12:23:33 +0000
+Subject: [PATCH 44/55] nvmem: simple-mfd: accept address-only PMIC register
+ ranges
+
+Read the explicit positive size when the parent has zero size cells,
+while retaining legacy base/size tuples. This lets J71t reject MMIO
+translation without losing RTC-offset NVMEM reads.
+---
+ drivers/nvmem/simple-mfd-nvmem.c | 21 ++++++++++++++++-----
+ 1 file changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/nvmem/simple-mfd-nvmem.c b/drivers/nvmem/simple-mfd-nvmem.c
+index 2ae862185b..00f4ef95f7 100644
+--- a/drivers/nvmem/simple-mfd-nvmem.c
++++ b/drivers/nvmem/simple-mfd-nvmem.c
+@@ -37,7 +37,8 @@ static int simple_mfd_nvmem_probe(struct platform_device *pdev)
+ {
+ 	struct simple_mfd_nvmem *nvmem;
+ 	const __be32 *addr;
+-	int len;
++	int len, ret;
++	u32 size;
+ 	struct nvmem_config nvmem_cfg = {
+ 		.dev = &pdev->dev,
+ 		.name = "simple_mfd_nvmem",
+@@ -66,13 +67,23 @@ static int simple_mfd_nvmem_probe(struct platform_device *pdev)
+ 		dev_err(&pdev->dev, "No reg property\n");
+ 		return -EINVAL;
+ 	}
+-	if (len != 2 * sizeof(u32)) {
+-		dev_err(&pdev->dev, "Invalid reg property\n");
+-		return -EINVAL;
++	/* Address-only PMIC buses describe register count separately. */
++	if (of_n_size_cells(pdev->dev.of_node) == 0 && len == sizeof(u32)) {
++		ret = of_property_read_u32(pdev->dev.of_node, "size", &size);
++		if (ret)
++			return dev_err_probe(&pdev->dev, ret, "Missing NVMEM size\n");
++	} else if (of_n_size_cells(pdev->dev.of_node) == 1 &&
++		   len == 2 * sizeof(u32)) {
++		/* Preserve the original <base size> binding for other boards. */
++		size = be32_to_cpup(&addr[1]);
++	} else {
++		return dev_err_probe(&pdev->dev, -EINVAL, "Invalid reg property\n");
+ 	}
++	if (!size)
++		return dev_err_probe(&pdev->dev, -EINVAL, "Empty NVMEM range\n");
+ 
+ 	nvmem->base = be32_to_cpup(&addr[0]);
+-	nvmem_cfg.size = be32_to_cpup(&addr[1]);
++	nvmem_cfg.size = size;
+ 
+ 	return PTR_ERR_OR_ZERO(devm_nvmem_register(&pdev->dev, &nvmem_cfg));
+ }

@@ -1,0 +1,10 @@
+# Keep the USB gadget network interface named usb0: the NBD root runs over it,
+# the DHCP unit and NetworkManager's unmanaged rule name it, and udev must not
+# give it a "predictable" name. (.link files are applied by udev, so this holds
+# even though Omarchy disables systemd-networkd.)
+[Match]
+OriginalName=usb0
+
+[Link]
+NamePolicy=
+Name=usb0

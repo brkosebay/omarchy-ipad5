@@ -1,0 +1,34 @@
+From 84b986a6991eece3f82c0b8d7b1b9646f626a063 Mon Sep 17 00:00:00 2001
+From: Paul Praschl <maintainer@example.invalid>
+Date: Mon, 27 Jul 2026 10:22:52 +0200
+Subject: [PATCH 12/55] dt-bindings: serial: samsung: add Apple T8010 UART
+
+The T8010 UART block uses the Apple S5L register layout, but it needs
+SoC-specific match data for baud-rate programming.
+
+Add an apple,t8010-uart compatible so the driver can select that data.
+Keep apple,s5l-uart as the fallback for the common register interface and
+existing S5L compatibility.
+
+Signed-off-by: Paul Praschl <maintainer@example.invalid>
+---
+ Documentation/devicetree/bindings/serial/samsung_uart.yaml | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/serial/samsung_uart.yaml b/Documentation/devicetree/bindings/serial/samsung_uart.yaml
+index 75ac2a08f2..df763d5aee 100644
+--- a/Documentation/devicetree/bindings/serial/samsung_uart.yaml
++++ b/Documentation/devicetree/bindings/serial/samsung_uart.yaml
+@@ -29,8 +29,10 @@ properties:
+           - samsung,exynos850-uart
+           - samsung,exynos8895-uart
+       - items:
+-          - enum:
+-              - samsung,exynos2200-uart
++          - const: apple,t8010-uart
++          - const: apple,s5l-uart
++      - items:
++          - const: samsung,exynos2200-uart
+           - const: google,gs101-uart
+       - items:
+           - enum:

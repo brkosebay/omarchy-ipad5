@@ -1,0 +1,28 @@
+From e6e56ca912393da23f2a5dafd52770142ce24ff9 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 13:15:48 +0000
+Subject: [PATCH 54/55] power: supply: retry unavailable thermal samples
+ quietly
+
+Translate a missing power-supply temperature sample from ENODATA to the
+thermal core EAGAIN convention. The core will poll again without a
+startup error message or broken-zone backoff. Preserve real transport
+errors and successful temperature conversion.
+---
+ drivers/power/supply/power_supply_core.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/drivers/power/supply/power_supply_core.c b/drivers/power/supply/power_supply_core.c
+index 00d8bc98d5..85caf3305e 100644
+--- a/drivers/power/supply/power_supply_core.c
++++ b/drivers/power/supply/power_supply_core.c
+@@ -1653,6 +1653,9 @@ static int power_supply_read_temp(struct thermal_zone_device *tzd,
+ 	WARN_ON(tzd == NULL);
+ 	psy = thermal_zone_device_priv(tzd);
+ 	ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_TEMP, &val);
++	/* The thermal core retries EAGAIN quietly instead of logging no data. */
++	if (ret == -ENODATA)
++		return -EAGAIN;
+ 	if (ret)
+ 		return ret;
+ 

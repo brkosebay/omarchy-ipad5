@@ -1,0 +1,724 @@
+diff --git a/src/drivers/sep/sep.c b/src/drivers/sep/sep.c
+index 6c7f599..34089ae 100644
+--- a/src/drivers/sep/sep.c
++++ b/src/drivers/sep/sep.c
+@@ -108,6 +108,621 @@ void sepfw_kpf(void* sepfw_bytes, size_t sepfw_size) {
+     }
+ }
+ static bool is_waiting_to_boot;
++bool sep_log_msgs = false;
++
++/* A9 bootstrap state: SEPROM opcode acks and the anti-replay token buffer. */
++static volatile uint8_t sep_seen_op[256];
++static volatile uint32_t sep_last_data[256];
++#define SEP_MSG_RING 256
++static volatile uint64_t sep_msg_ring[SEP_MSG_RING];
++static volatile uint32_t sep_msg_count;
++static volatile uint32_t sep_ping_count;
++#define SEP_DISC_HAVE_NAME 0x01
++#define SEP_DISC_HAVE_OOL  0x02
++struct sep_discovery_entry {
++    uint32_t name;
++    uint32_t ool;
++    uint8_t have;
++};
++static volatile struct sep_discovery_entry sep_discovery[256];
++static void *sep_art_buf;   /* DRAM: SEPROM cannot read pongoOS SRAM */
++static size_t sep_art_len;
++static void *sep_shmem_buf; /* optional minimal root shared-memory page */
++static bool sep_fw_adopted;
++static bool sep_xnu_attempted;
++/* Preserve the historical path until `sep xnu` explicitly selects one. */
++static bool sep_a9_split32_tx = true;
++
++/* defined further down; sep.c's A9 shell helpers are placed here for locality */
++void seprom_boot_tz0(void);
++void seprom_boot_tz0_async(void);
++void seprom_fwload(void);
++void seprom_execute_opcode(uint8_t operation, uint8_t param, uint32_t data);
++void sep_send_msg(uint8_t ep, uint8_t tag, uint8_t opcode, uint8_t param, uint32_t data);
++static void sep_dump_msg(uint64_t v, const char *label);
++static void mailbox_write_split32(uint64_t value);
++static void mailbox_write_a9_single64(uint64_t value);
++
++static uint32_t sep_recv_status(void)
++{
++    return is_sep64 ? mailboxregs64->recv_sts : mailboxregs32->recv_sts;
++}
++
++static void sep_capture_reset(void)
++{
++    disable_interrupts();
++    memset((void *)sep_msg_ring, 0, sizeof(sep_msg_ring));
++    memset((void *)sep_discovery, 0, sizeof(sep_discovery));
++    sep_msg_count = 0;
++    sep_ping_count = 0;
++    enable_interrupts();
++}
++
++static void sep_format_4cc(uint32_t value, char name[5])
++{
++    for (unsigned int i = 0; i < 4; i++) {
++        uint8_t c = value >> (24 - 8 * i);
++        name[i] = c >= 0x20 && c <= 0x7e ? c : '.';
++    }
++    name[4] = '\0';
++}
++
++static void sep_dump_discovery(void)
++{
++    unsigned int entries = 0;
++    unsigned int complete = 0;
++
++    iprintf("sep discovery: begin\n");
++    for (unsigned int id = 0; id < 256; id++) {
++        uint8_t have = sep_discovery[id].have;
++        uint32_t name_value;
++        uint32_t ool;
++        char name[5] = "....";
++
++        if (!have)
++            continue;
++        entries++;
++        name_value = sep_discovery[id].name;
++        ool = sep_discovery[id].ool;
++        if (have & SEP_DISC_HAVE_NAME)
++            sep_format_4cc(name_value, name);
++        if ((have & (SEP_DISC_HAVE_NAME | SEP_DISC_HAVE_OOL)) ==
++            (SEP_DISC_HAVE_NAME | SEP_DISC_HAVE_OOL))
++            complete++;
++
++        iprintf("SEP-DISC name=%s id=%02x in_min=%u in_max=%u "
++                "out_min=%u out_max=%u have_name=%u have_ool=%u\n",
++                name, id,
++                (uint8_t)ool, (uint8_t)(ool >> 8),
++                (uint8_t)(ool >> 16), (uint8_t)(ool >> 24),
++                !!(have & SEP_DISC_HAVE_NAME),
++                !!(have & SEP_DISC_HAVE_OOL));
++    }
++    iprintf("sep discovery: end entries=%u complete=%u\n", entries, complete);
++}
++
++static void sep_dump_capture(void)
++{
++    uint32_t n = sep_msg_count;
++    uint32_t retained = n > SEP_MSG_RING ? SEP_MSG_RING : n;
++    uint32_t start = n - retained;
++
++    iprintf("sep capture: total=%u retained=%u overwritten=%u ping=%u\n",
++            n, retained, n - retained, sep_ping_count);
++    for (uint32_t i = start; i < n; i++)
++        sep_dump_msg(sep_msg_ring[i & (SEP_MSG_RING - 1)], "sep capture: msg");
++}
++
++/*
++ * The SEP IRQ task continues draining while this shell command spins. After
++ * the boot notification, wait until both the hardware FIFO and the captured
++ * stream have been quiet for three continuous seconds, with a ten-second
++ * hard bound. This is observation only: no AP->SEP message is sent here.
++ */
++static void sep_capture_postboot(void)
++{
++    const int step_ms = 10;
++    const int quiet_target_ms = 3000;
++    const int bound_ms = 10000;
++    uint32_t last_count = sep_msg_count;
++    int elapsed_ms = 0;
++    int quiet_ms = 0;
++
++    iprintf("sep xnu: capturing post-boot stream (quiet=%d ms bound=%d ms)\n",
++            quiet_target_ms, bound_ms);
++    while (elapsed_ms < bound_ms && quiet_ms < quiet_target_ms) {
++        spin(step_ms * 1000);
++        elapsed_ms += step_ms;
++
++        uint32_t count = sep_msg_count;
++        if ((sep_recv_status() & 0x20000) && count == last_count)
++            quiet_ms += step_ms;
++        else
++            quiet_ms = 0;
++        last_count = count;
++    }
++
++    iprintf("sep xnu: post-boot capture %s elapsed=%d ms quiet=%d ms recv_sts=%x\n",
++            quiet_ms >= quiet_target_ms ? "quiescent" : "bounded",
++            elapsed_ms, quiet_ms, sep_recv_status());
++    sep_dump_capture();
++    /* Keep the discovery end marker last: the host uses it as flush-complete. */
++    sep_dump_discovery();
++}
++
++/*
++ * A9 (s8000/s8003) support: the current iBoot -> pongoOS chain leaves a
++ * personalized SEPFW in /chosen/memory-map but does not complete the SEP boot.
++ * The upload/adopt fallback is kept for chains without that entry; `sep xnu`
++ * should normally use iBoot's staged image.
++ */
++static void sep_adopt_uploaded_fw(const char* cmd, char* args)
++{
++    if (!loader_xfer_recv_count || !loader_xfer_recv_data) {
++        iprintf("no file uploaded; use /send <sep-firmware.img4> first\n");
++        return;
++    }
++    uint64_t pa = vatophys_static(loader_xfer_recv_data);
++    if (pa & 0xfff) {
++        iprintf("uploaded buffer is not page aligned (%llx), refusing\n", pa);
++        return;
++    }
++    gSEPFW = loader_xfer_recv_data;
++    gSEPFWLen = loader_xfer_recv_count;
++    sep_fw_adopted = true;
++    iprintf("sep fw adopted: pa=%llx len=%llx\n", pa, gSEPFWLen);
++}
++
++
++static bool sep_wait_op(uint8_t op, int ms)
++{
++    for (int i = 0; i < ms; i++) {
++        if (sep_seen_op[op]) {
++            sep_seen_op[op] = 0;
++            return true;
++        }
++        spin(1000);
++    }
++    return false;
++}
++
++static bool sep_send_expect(uint8_t ep, uint8_t tag, uint8_t op, uint8_t param,
++                            uint32_t data, uint8_t expect, int ms, const char *name)
++{
++    sep_seen_op[expect] = 0;
++    sep_last_data[expect] = UINT32_MAX;
++    iprintf("sep: -> %s ep=%x tag=%x op=%x param=%x data=%x\n",
++            name, ep, tag, op, param, data);
++    disable_interrupts();
++    sep_send_msg(ep, tag, op, param, data);
++    enable_interrupts();
++    if (!sep_wait_op(expect, ms)) {
++        iprintf("sep:    %s: no %02x ack\n", name, expect);
++        return false;
++    }
++    iprintf("sep:    %s: acked %02x data=%x\n",
++            name, expect, sep_last_data[expect]);
++    return true;
++}
++
++/*
++ * Stage an anti-replay token for the bootstrap. With no file uploaded this
++ * stages a zeroed page: on this iPad NVRAM reports the token as absent, so a
++ * zero token is the correct first experiment (iOS itself boots without one).
++ *
++ *   /send art.bin
++ *   sep art
++ */
++static void sep_art_cmd(const char *cmd, char *args)
++{
++    size_t len = loader_xfer_recv_count;
++
++    if (len && len != 20) {
++        iprintf("sep art: uploaded length=%llx, expected 0x14 (20 bytes); refusing\n",
++                (uint64_t)len);
++        return;
++    }
++
++    if (!sep_art_buf)
++        sep_art_buf = alloc_contig(0x4000);
++    if (!sep_art_buf) {
++        iprintf("sep art: allocation failed\n");
++        return;
++    }
++    memset(sep_art_buf, 0, 0x4000);
++    if (len) {
++        memcpy(sep_art_buf, loader_xfer_recv_data, len);
++    }
++    cache_clean_and_invalidate(sep_art_buf, 0x4000);
++    sep_art_len = len;
++    iprintf("sep art: pa=%llx len=%llx%s\n",
++            vatophys((uint64_t)sep_art_buf), (uint64_t)len,
++            len ? "" : " (zero page)");
++}
++
++/*
++ * The exact AppleSEPBooter::bootSEP order recovered from the iOS 16.7.10
++ * kernelcache (see docs/sep/driver-notes.md):
++ *
++ *   op 0x02 tag 1   status check 1        -> 0x66
++ *   op 0x24 tag 1   TMM manifest (opt.)   -> 0x88
++ *   op 0x25 tag 1   patches (opt.)        -> 0x89
++ *   op 0x05 tag 1   boot_tz0              -> 0x69, then event 0xd2
++ *   op 0x02 tag 1   status check 2        -> 0x66
++ *   op 0x07 tag 1   load ART (conditional)-> 0x6b
++ *   op 0x06 tag 1   load/boot sepOS image -> 0x6a
++ *   ep 0xfe tag 1   root shmem descriptor (sent immediately after op 0x06)
++ *
++ * Opcode 0x08 is not the cold-boot command. bootSEP emits it only when its
++ * AppleSEPFirmware argument is NULL (resume from RAM). The normal cold path
++ * ends with op 0x06 and waits; sending op 0x08 after the 0x6a reply was our
++ * previous, incorrect sequence.
++ */
++static void sep_xnu_cmd(const char *cmd, char *args)
++{
++    bool with_tmm = args && strstr(args, "tmm");
++    bool with_status = args && strstr(args, "status");
++    bool with_ping = args && strstr(args, "ping");
++    bool with_art = args && strstr(args, "art") && !strstr(args, "noart");
++    /* XNU normally supplies the root buffer; "noshmem" is a negative control. */
++    bool with_shmem = !(args && strstr(args, "noshmem"));
++    bool split32 = args && strstr(args, "split32");
++    uint8_t mode = args && strstr(args, "mode1") ? 1 : 0;
++
++    if (!gSEPFW) {
++        iprintf("sep xnu: no SEPFW staged\n");
++        return;
++    }
++    if (with_tmm) {
++        iprintf("sep xnu: TMM requires real manifest/patch physical addresses; refusing null-pointer probe\n");
++        return;
++    }
++    if (sep_xnu_attempted) {
++        iprintf("sep xnu: already attempted in this boot; reset/DFU before retrying\n");
++        return;
++    }
++    if (with_art && !sep_art_buf) {
++        sep_art_cmd(cmd, args);
++        if (!sep_art_buf) {
++            iprintf("sep xnu: ART requested but no valid 20-byte token was staged\n");
++            return;
++        }
++    }
++
++    sep_capture_reset();
++    sep_log_msgs = true;
++    sep_a9_split32_tx = split32;
++    iprintf("sep xnu: A9 AP->SEP TX=%s\n",
++            split32 ? "split32 legacy" : "single64 + dsb sy");
++    sep_seen_op[0x66] = sep_seen_op[0x69] = 0;
++    sep_seen_op[0x6a] = sep_seen_op[0x6b] = 0;
++    sep_seen_op[0x6c] = sep_seen_op[0xd2] = 0;
++    sep_seen_op[0x88] = sep_seen_op[0x89] = 0;
++
++    uint64_t pa = vatophys((uint64_t)gSEPFW);
++    uint32_t data = (uint32_t)(pa >> 12);
++    uint32_t art = 0;
++    if (with_art && sep_art_buf)
++        art = (uint32_t)(vatophys((uint64_t)sep_art_buf) >> 12);
++
++    uint32_t shmem_pa = 0;
++    /* j71t's SEP node has no "aarch64" property, so XNU uses a 4 KiB granule. */
++    uint32_t shmem_pages = 0x1000 >> 12;
++    if (with_shmem && !sep_shmem_buf)
++        sep_shmem_buf = alloc_contig(0x1000);
++    if (with_shmem && !sep_shmem_buf) {
++        iprintf("sep xnu: root shmem allocation failed; stopping\n");
++        return;
++    }
++    if (with_shmem) {
++        memset(sep_shmem_buf, 0, 0x1000);
++        *(uint32_t *)sep_shmem_buf = 0x6e756c6c; /* bytes "llun": tag 'null' */
++        cache_clean_and_invalidate(sep_shmem_buf, 0x1000);
++        uint64_t shmem_phys = vatophys((uint64_t)sep_shmem_buf);
++        if (shmem_phys & 0xfff) {
++            iprintf("sep xnu: root shmem is not page-aligned (%llx); stopping\n",
++                    shmem_phys);
++            return;
++        }
++        shmem_pa = (uint32_t)(shmem_phys >> 12);
++    }
++
++    /* From here on every failure consumes this SEPROM boot state. */
++    sep_xnu_attempted = true;
++
++    iprintf("sep xnu: tz0 %s base=%llx size=%llx\n",
++            tz0_is_locked() ? "locked" : "UNLOCKED",
++            tz0_base(), tz0_size());
++    if (!tz0_is_locked()) {
++        /*
++         * Cold boot fallback: iBoot normally programs this window before
++         * handing over, but a bootrom-only path may leave it at the reset
++         * value. 0xcf8000 is the size declared by this sep-firmware IM4P's
++         * tz0s property (and the size iBoot used on the warm boots).
++         */
++        iprintf("sep xnu: tz0 unlocked, programming 87bc64000+cf8000\n");
++        tz0_set_phys(0x87bc64000ULL, 0xcf8000ULL);
++        tz_lockdown();
++        iprintf("sep xnu: tz0 now base=%llx size=%llx\n",
++                tz0_base(), tz0_size());
++    }
++    if (with_art)
++        iprintf("sep xnu: image pa=%llx art pa=%llx len=%llx\n",
++                pa, vatophys((uint64_t)sep_art_buf), (uint64_t)sep_art_len);
++    else
++        iprintf("sep xnu: image pa=%llx (no ART, A9 default)\n", pa);
++
++    /*
++     * The 0x20100-style constants in bootSEP are command descriptors: the
++     * transport sends them on the SEPROM endpoint 0xff. Sending them with
++     * ep=0 (the literal first byte) got no reply at all on A9. The old
++     * sep sboot path proved ep=0xff works for boot_tz0/fwload.
++     *
++     * Status checks are opt-in ("sep xnu status"): they are not needed to
++     * get 0x69/0x6a, and a rejected op 2 would wedge the ROM early.
++     *
++     * The ping is opt-in too. On 2026-10-25 the ep=0xff build sent ping
++     * (acked 0x65) followed by boot_tz0 (acked 0x69), and SEPROM then
++     * panicked. The old sep sboot never pinged and boot_tz0 worked, so on
++     * A9 the ping is not a safe pre-boot_tz0 step (it is the A10+ pwned
++     * path's ping).
++     */
++    /*
++     * The stock A9 path (seprom_boot_tz0_async) calls fuse_lock() before
++     * boot_tz0. Skipping it made SEPROM ack 0x69 and then panic. Lock it
++     * once here, before any optional status/ping message.
++     */
++    fuse_lock();
++    if (with_ping)
++        sep_send_expect(0xff, 0, 0x01, 0, 0, 0x65, 1000, "ping");
++    if (with_status) {
++        if (!sep_send_expect(0xff, 1, 0x02, 0, 0, 0x66, 50000, "status 1"))
++            return;
++        if (sep_last_data[0x66] != 1) {
++            iprintf("sep xnu: status 1 returned data=%x, expected 1; stopping\n",
++                    sep_last_data[0x66]);
++            return;
++        }
++    }
++    sep_seen_op[0xd2] = 0;
++    sep_last_data[0xd2] = UINT32_MAX;
++    if (!sep_send_expect(0xff, 1, 0x05, mode, 0, 0x69, 60000, "boot_tz0"))
++        return;
++    if (!sep_wait_op(0xd2, 3000)) {
++        iprintf("sep xnu: no unsolicited status-2 (d2); checking status directly\n");
++    } else if (sep_last_data[0xd2] != 2) {
++        iprintf("sep xnu: unsolicited d2 returned data=%x, expected 2; stopping\n",
++                sep_last_data[0xd2]);
++        return;
++    }
++    if (with_status) {
++        if (!sep_send_expect(0xff, 1, 0x02, 0, 0, 0x66, 50000, "status 2"))
++            return;
++        if (sep_last_data[0x66] != 2) {
++            iprintf("sep xnu: status 2 returned data=%x, expected 2; stopping\n",
++                    sep_last_data[0x66]);
++            return;
++        }
++    }
++    if (with_art) {
++        /* bootSEP loads ART before it submits the firmware (0x06). */
++        if (!sep_send_expect(0xff, 1, 0x07, 0, art, 0x6b, 60000, "artload")) {
++            iprintf("sep xnu: ART was requested but ROM did not accept it; stopping\n");
++            return;
++        }
++    } else {
++        iprintf("sep xnu: no ART step (A9 default; use 'sep xnu art' to force)\n");
++    }
++
++    /*
++     * Match bootSEP's cold path: submit op 0x06 and do not wait yet. XNU may
++     * immediately send a root-shared-memory descriptor on endpoint 0xfe,
++     * then waits for the ROM command to finish. Use the minimal buffer layout
++     * produced by AppleSEPSharedMemoryBuffer for zero channels: a 4 KiB DRAM
++     * buffer beginning with its 16-byte "null" terminator. The endpoint-fe
++     * message encodes {size_pages in bits 16..31, phys_page in bits 32..63}.
++     */
++    sep_seen_op[0x6a] = 0;
++    iprintf("sep: -> fwload/boot ep=ff tag=1 op=6 param=%x data=%x\n",
++            mode, data);
++    disable_interrupts();
++    sep_send_msg(0xff, 1, 0x06, mode, data);
++    enable_interrupts();
++
++    if (with_shmem) {
++        iprintf("sep: -> root shmem ep=fe tag=1 pages=%u data=%x\n",
++                shmem_pages, shmem_pa);
++        disable_interrupts();
++        sep_send_msg(0xfe, 1, (uint8_t)shmem_pages,
++                     (uint8_t)(shmem_pages >> 8), shmem_pa);
++        enable_interrupts();
++    } else {
++        iprintf("sep xnu: no root shmem descriptor (noshmem negative control)\n");
++    }
++
++    if (!sep_wait_op(0x6a, 60000)) {
++        iprintf("sep:    fwload/boot: no 6a ack after 60s\n");
++        return;
++    }
++    iprintf("sep:    fwload/boot: acked 6a (command complete; sepOS liveness unconfirmed)\n");
++
++    /*
++     * XNU's default boot timeout is boot-timeout-ms = 60000. The A9 sepOS
++     * boot is slow (the screen photo shows the ROM still answering acks in
++     * a burst after the shell returned), so wait the full minute and do not
++     * send op 0x08 or otherwise poke the mailbox while it may be booting.
++     */
++    int waited = 0;
++    while (!sep_has_booted && waited < 60000) {
++        spin(10000);
++        waited += 10;
++        if ((waited % 5000) == 0)
++            iprintf("sep xnu: waiting for sepOS (%d ms)\n", waited);
++    }
++    if (sep_has_booted) {
++        iprintf("sep xnu: SEPOS BOOTED\n");
++        sep_capture_postboot();
++    } else {
++        iprintf("sep xnu: cold op 6 completed; no unsolicited sepOS control message after 60s\n");
++    }
++}
++
++
++static void sep_force_boot(const char* cmd, char* args)
++{
++    iprintf("sep sboot: legacy alias for the corrected cold path\n");
++    sep_xnu_cmd(cmd, args);
++}
++
++static void sep_dump_msg(uint64_t v, const char *label)
++{
++    iprintf("%s ep=%x tag=%x op=%x param=%x data=%x (raw=%llx)\n",
++            label,
++            (uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16),
++            (uint8_t)(v >> 24), (uint32_t)(v >> 32), v);
++}
++
++static void sep_stat_cmd(const char* cmd, char* args)
++{
++    uint32_t recv_sts = sep_recv_status();
++    uint32_t snd_sts  = is_sep64 ? mailboxregs64->snd_sts  : mailboxregs32->snd_sts;
++    uint32_t n = sep_msg_count;
++    uint32_t start = n > SEP_MSG_RING ? n - SEP_MSG_RING : 0;
++
++    iprintf("sep stat: recv_sts=%x snd_sts=%x total=%u ping=%u fifo_peek=0\n",
++            recv_sts, snd_sts, n, sep_ping_count);
++    if (recv_sts & 0xc0000) {
++        iprintf("sep stat: OUTBOX FAULT overflow=%u underflow=%u\n",
++                !!(recv_sts & 0x40000), !!(recv_sts & 0x80000));
++    }
++    for (uint32_t i = start; i < n; i++)
++        sep_dump_msg(sep_msg_ring[i & (SEP_MSG_RING - 1)], "sep stat: ring");
++}
++
++static void sep_info_cmd(const char* cmd, char* args)
++{
++    iprintf("sep: tz0 %s base=%llx size=%llx\n",
++            tz0_is_locked() ? "locked" : "unlocked", tz0_base(), tz0_size());
++    iprintf("sep: staged SEPFW %p len=0x%llx (%llu)%s\n",
++            gSEPFW, gSEPFWLen, gSEPFWLen,
++            gSEPFW ? (sep_fw_adopted ? " (uploaded/adopted)" :
++                      " (from /chosen/memory-map)") :
++                     " (none: /send + sep adopt)");
++    if (gSEPFW) {
++        iprintf("sep: staged SEPFW first 64 bytes:\n");
++        hexdump(gSEPFW, gSEPFWLen < 64 ? (unsigned int)gSEPFWLen : 64);
++        if (gSEPFWLen >= 0x34010c + 64) {
++            iprintf("sep: staged SEPFW bytes at +0x34010c (IM4M candidate):\n");
++            hexdump((uint8_t *)gSEPFW + 0x34010c, 64);
++        }
++        if (gSEPFWLen >= 0x341900 + 64) {
++            iprintf("sep: staged SEPFW bytes at +0x341900 (trailer):\n");
++            hexdump((uint8_t *)gSEPFW + 0x341900, 64);
++        }
++    }
++}
++
++static void sep_msg_cmd(const char* cmd, char* args)
++{
++    /* sep msg <ep> <tag> <op> <param> <data>, all hex */
++    if (!*args) {
++        iprintf("usage: sep msg <ep> <tag> <op> <param> <data>\n");
++        return;
++    }
++    char* a[4];
++    char* p = args;
++    for (int i = 0; i < 4; i++) {
++        a[i] = command_tokenize(p, 0x1ff - (p - cmd));
++        if (!*a[i]) { iprintf("need 5 arguments\n"); return; }
++        p = a[i];
++    }
++    uint8_t ep = strtoul(args, NULL, 16);
++    uint8_t tag = strtoul(a[0], NULL, 16);
++    uint8_t op = strtoul(a[1], NULL, 16);
++    uint8_t param = strtoul(a[2], NULL, 16);
++    uint32_t data = strtoul(a[3], NULL, 16);
++    sep_log_msgs = true;
++    union sep_message_u msg = { .msg = {
++        .ep = ep, .tag = tag, .opcode = op, .param = param, .data = data,
++    }};
++    iprintf("AP->SEP split32 ep=%x tag=%x op=%x param=%x data=%x\n",
++            ep, tag, op, param, data);
++    disable_interrupts();
++    mailbox_write_split32(msg.val);
++    enable_interrupts();
++    for (int i = 0; i < 100; i++) {
++        spin(1000);
++    }
++}
++
++static void sep_msg64_cmd(const char* cmd, char* args)
++{
++    /* sep msg64 <ep> <tag> <op> <param> <data>, all hex; A9 only. */
++    if (!*args) {
++        iprintf("usage: sep msg64 <ep> <tag> <op> <param> <data>\n");
++        return;
++    }
++    char* a[4];
++    char* p = args;
++    for (int i = 0; i < 4; i++) {
++        a[i] = command_tokenize(p, 0x1ff - (p - cmd));
++        if (!*a[i]) { iprintf("need 5 arguments\n"); return; }
++        p = a[i];
++    }
++    union sep_message_u msg = { .msg = {
++        .ep = strtoul(args, NULL, 16),
++        .tag = strtoul(a[0], NULL, 16),
++        .opcode = strtoul(a[1], NULL, 16),
++        .param = strtoul(a[2], NULL, 16),
++        .data = strtoul(a[3], NULL, 16),
++    }};
++
++    if (is_sep64) {
++        iprintf("sep msg64: A9 32-bit wrapper layout only; refusing\n");
++        return;
++    }
++
++    uint32_t snd_sts = mailboxregs32->snd_sts;
++    if (!(snd_sts & 0x20000)) {
++        iprintf("sep msg64: AP->SEP FIFO not empty (snd_sts=%x); not sent\n",
++                snd_sts);
++        return;
++    }
++    sep_log_msgs = true;
++    iprintf("AP->SEP64 ep=%x tag=%x op=%x param=%x data=%x raw=%llx\n",
++            msg.msg.ep, msg.msg.tag, msg.msg.opcode, msg.msg.param,
++            msg.msg.data, msg.val);
++    disable_interrupts();
++    mailbox_write_a9_single64(msg.val);
++    enable_interrupts();
++    for (int i = 0; i < 100; i++) {
++        spin(1000);
++    }
++}
++
++
++static void mailbox_write_split32(uint64_t value)
++{
++    if (is_sep64) {
++        mailboxregs64->snd0 = value;
++        mailboxregs64->snd1 = 0;
++    } else {
++        mailboxregs32->snd0 = value & 0xffffffff;
++        mailboxregs32->snd1 = (value >> 32ULL) & 0xffffffff;
++    }
++}
++
++/*
++ * AppleA7IOPV2::postMailbox uses one 64-bit MMIO transaction at +0x4010.
++ * Keep this noinline so the built image can be audited for exactly one STR X,
++ * followed by DSB SY, independently of callers.
++ */
++__attribute__((noinline))
++static void mailbox_write_a9_single64(uint64_t value)
++{
++    *((volatile uint64_t *)&mailboxregs32->snd0) = value;
++    __asm__ volatile("dsb sy" ::: "memory");
++}
+ 
+ static inline void mailbox_write(uint64_t value) {
+ #ifdef SEP_DEBUG
+@@ -119,9 +734,10 @@ static inline void mailbox_write(uint64_t value) {
+     if (is_sep64) {
+         mailboxregs64->snd0 = value;
+         mailboxregs64->snd1 = 0;
++    } else if (sep_a9_split32_tx) {
++        mailbox_write_split32(value);
+     } else {
+-        mailboxregs32->snd0 = value & 0xffffffff;
+-        mailboxregs32->snd1 = (value >> 32ULL) & 0xffffffff;
++        mailbox_write_a9_single64(value);
+     }
+ }
+ static inline uint64_t mailbox_read(void) {
+@@ -184,8 +800,9 @@ void sep_send_msg(uint8_t ep, uint8_t tag, uint8_t opcode, uint8_t param, uint32
+ void seprom_execute_opcode(uint8_t operation, uint8_t param, uint32_t data) {
+     sep_send_msg(255, 0x0, operation, param, data);
+ }
+-
+ void sep_handle_msg_from_seprom(union sep_message_u msg) {
++    sep_last_data[msg.msg.opcode] = msg.msg.data;
++    sep_seen_op[msg.msg.opcode] = 1;
+     if (msg.msg.opcode == 255) {
+         fiprintf(stderr, "SEPROM panic!\n");
+         sep_has_panicked = true;
+@@ -220,6 +837,24 @@ uint64_t * SEP_PANIC_PTR = (uint64_t*)&SEP_PANIC;
+ uint32_t SEP_PANIC_CNT = 0;
+ 
+ void sep_handle_msg_from_sep(union sep_message_u msg) {
++    /* Keep every message; the enlarged ring covers the complete cold stream. */
++    sep_msg_ring[sep_msg_count++ & (SEP_MSG_RING - 1)] = msg.val;
++    if (msg.msg.ep == 0xff && msg.msg.opcode == 0x65)
++        sep_ping_count++;
++    if (msg.msg.ep == 0xfd) {
++        volatile struct sep_discovery_entry *entry = &sep_discovery[msg.msg.param];
++        if (msg.msg.opcode == 0) {
++            entry->name = msg.msg.data;
++            entry->have |= SEP_DISC_HAVE_NAME;
++        } else if (msg.msg.opcode == 1) {
++            entry->ool = msg.msg.data;
++            entry->have |= SEP_DISC_HAVE_OOL;
++        }
++    }
++    if (sep_log_msgs) {
++        fiprintf(stderr, "SEP->AP ep=%x tag=%x op=%x param=%x data=%x\n",
++                 msg.msg.ep, msg.msg.tag, msg.msg.opcode, msg.msg.param, msg.msg.data);
++    }
+     if (msg.msg.ep == 0xff) {
+         // SEPROM
+         sep_handle_msg_from_seprom(msg);
+@@ -1144,6 +1779,14 @@ static struct sep_command command_table[] = {
+     SEP_COMMAND("poke", "write a 32 bit value", sep_pwned_poke),
+     SEP_COMMAND("jump", "jump to address", sep_pwned_jump),
+     SEP_COMMAND("boot", "boot pwned tz0 image", sep_pwned_boot),
++    SEP_COMMAND("adopt", "use the uploaded file as sep-firmware", sep_adopt_uploaded_fw),
++    SEP_COMMAND("sboot", "legacy alias for corrected cold boot", sep_force_boot),
++    SEP_COMMAND("art", "stage an anti-replay token from the uploaded file", sep_art_cmd),
++    SEP_COMMAND("xnu", "AppleSEPBooter cold path [status art noshmem mode1 split32]", sep_xnu_cmd),
++    SEP_COMMAND("msg", "legacy split32 raw message: <ep> <tag> <op> <param> <data>", sep_msg_cmd),
++    SEP_COMMAND("msg64", "single-store A9 raw message: <ep> <tag> <op> <param> <data>", sep_msg64_cmd),
++    SEP_COMMAND("stat", "print mailbox status without waiting", sep_stat_cmd),
++    SEP_COMMAND("info", "tz0 range and staged SEPFW", sep_info_cmd),
+ #endif
+     SEP_COMMAND("encrypt", "encrypt a kbag (requires pwned SEPROM)", sep_aes_encrypt),
+     SEP_COMMAND("decrypt", "decrypt a kbag (requires pwned SEPROM)", sep_aes_decrypt),
+diff --git a/src/drivers/tz/tz.c b/src/drivers/tz/tz.c
+index 9de7746..ad221e7 100644
+--- a/src/drivers/tz/tz.c
++++ b/src/drivers/tz/tz.c
+@@ -70,6 +70,17 @@ static void tz_command(const char* cmd, char* args) {
+             raw[3], real[3]);
+ }
+ 
++void tz0_set_phys(uint64_t base, uint64_t size) {
++    if (socnum == 0x8960) {
++        return;
++    }
++    if (gTZRegbase[4]) {
++        return;
++    }
++    gTZRegbase[0] = (uint32_t)((base - 0x800000000ULL) >> 12);
++    gTZRegbase[1] = (uint32_t)(((base + size - 0x800000000ULL) >> 12) - 1);
++}
++
+ void tz_lockdown(void) {
+     bool have_tz0, have_tz1;
+     if(socnum == 0x8960)
+diff --git a/src/drivers/tz/tz.h b/src/drivers/tz/tz.h
+index dbf0ad4..91afd78 100644
+--- a/src/drivers/tz/tz.h
++++ b/src/drivers/tz/tz.h
+@@ -30,6 +30,7 @@
+ 
+ void tz_setup(void);
+ void tz_lockdown(void);
++void tz0_set_phys(uint64_t base, uint64_t size);
+ bool tz_blackbird(void);
+ void *tz0_calculate_encrypted_block_addr(uint64_t offset);
+ bool tz0_is_locked(void);

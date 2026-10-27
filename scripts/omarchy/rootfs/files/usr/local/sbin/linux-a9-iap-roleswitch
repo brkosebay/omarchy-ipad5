@@ -1,0 +1,438 @@
+#!/usr/bin/python3
+"""FunctionFS iAP HID facade used by linux-a9-usb-host listen.
+
+The public entry point is ``serve``.  The host helper imports this file so the
+50 ms role-switch callback stays in the process which owns the normal host
+safety/revert path.  Running this file directly is intentionally diagnostic:
+it exposes the function and logs requests, but has no authority to change the
+Lightning role.
+"""
+import argparse
+import datetime
+import errno
+import os
+from pathlib import Path
+import struct
+import subprocess
+import time
+
+
+GADGET = Path('/sys/kernel/config/usb_gadget/g1')
+CONFIG = GADGET / 'configs/c.2'
+FUNCTION = GADGET / 'functions/ffs.iap'
+LINK = CONFIG / 'iap'
+MOUNT = Path('/run/linux-a9-usb-host/ffs-iap')
+ROLE = Path('/sys/class/usb_role/lightning-role-switch/role')
+UDC_CLASS = Path('/sys/class/udc')
+
+FUNCTIONFS_DESCRIPTORS_MAGIC_V2 = 3
+FUNCTIONFS_STRINGS_MAGIC = 2
+FUNCTIONFS_HAS_FS_DESC = 1
+FUNCTIONFS_HAS_HS_DESC = 2
+FUNCTIONFS_ALL_CTRL_RECIP = 64
+
+FUNCTIONFS_BIND = 0
+FUNCTIONFS_UNBIND = 1
+FUNCTIONFS_ENABLE = 2
+FUNCTIONFS_DISABLE = 3
+FUNCTIONFS_SETUP = 4
+FUNCTIONFS_SUSPEND = 5
+FUNCTIONFS_RESUME = 6
+EVENT_SIZE = 12
+
+# Bytes at kernelcache fffffff007b3c6d1, registered for speed mask 1.
+REPORT_DESCRIPTOR_FS = bytes.fromhex(
+    '06 00 ff 09 01 a1 01 75 08 26 80 00 15 00 '
+    '09 01 85 01 95 0c 82 02 01 '
+    '09 01 85 02 95 0e 82 02 01 '
+    '09 01 85 03 95 14 82 02 01 '
+    '09 01 85 04 95 3f 82 02 01 '
+    '09 01 85 05 95 08 92 02 01 '
+    '09 01 85 06 95 0a 92 02 01 '
+    '09 01 85 07 95 0e 92 02 01 '
+    '09 01 85 08 95 14 92 02 01 '
+    '09 01 85 09 95 3f 92 02 01 c0')
+
+# Bytes at kernelcache fffffff007b3c73a, registered for speed mask 0x0e.
+REPORT_DESCRIPTOR_OTHER = bytes.fromhex(
+    '06 00 ff 09 01 a1 01 75 08 26 80 00 15 00 '
+    '09 01 85 01 95 05 82 02 01 '
+    '09 01 85 02 95 09 82 02 01 '
+    '09 01 85 03 95 0d 82 02 01 '
+    '09 01 85 04 95 11 82 02 01 '
+    '09 01 85 05 95 19 82 02 01 '
+    '09 01 85 06 95 31 82 02 01 '
+    '09 01 85 07 95 5f 82 02 01 '
+    '09 01 85 08 95 c1 82 02 01 '
+    '09 01 85 09 96 01 01 82 02 01 '
+    '09 01 85 0a 96 81 01 82 02 01 '
+    '09 01 85 0b 96 01 02 82 02 01 '
+    '09 01 85 0c 96 ff 02 82 02 01 '
+    '09 01 85 0d 95 05 92 02 01 '
+    '09 01 85 0e 95 09 92 02 01 '
+    '09 01 85 0f 95 0d 92 02 01 '
+    '09 01 85 10 95 11 92 02 01 '
+    '09 01 85 11 95 19 92 02 01 '
+    '09 01 85 12 95 31 92 02 01 '
+    '09 01 85 13 95 5f 92 02 01 '
+    '09 01 85 14 95 c1 92 02 01 '
+    '09 01 85 15 95 ff 92 02 01 c0')
+
+HID_DESCRIPTOR_FS = bytes.fromhex('09 21 11 01 00 01 22 60 00')
+HID_DESCRIPTOR_OTHER = bytes.fromhex('09 21 11 01 00 01 22 d0 00')
+
+
+def descriptor_set(hid_descriptor):
+    """One HID interface, its class descriptor, and interrupt IN ep1."""
+    interface = bytes.fromhex('09 04 00 00 01 03 00 00 00')
+    endpoint = bytes.fromhex('07 05 81 03 40 00 01')
+    return interface + hid_descriptor + endpoint
+
+
+def descriptor_blob():
+    fs = descriptor_set(HID_DESCRIPTOR_FS)
+    hs = descriptor_set(HID_DESCRIPTOR_OTHER)
+    flags = (FUNCTIONFS_HAS_FS_DESC | FUNCTIONFS_HAS_HS_DESC |
+             FUNCTIONFS_ALL_CTRL_RECIP)
+    body = struct.pack('<II', 3, 3) + fs + hs
+    return struct.pack('<III', FUNCTIONFS_DESCRIPTORS_MAGIC_V2,
+                       12 + len(body), flags) + body
+
+
+def strings_blob():
+    # IOAccessoryPortUSB never calls the interface-string setter.  The
+    # separate configuration description is "iPod USB Interface".
+    return struct.pack('<IIII', FUNCTIONFS_STRINGS_MAGIC, 16, 0, 0)
+
+
+def parse_setup(event):
+    if len(event) != EVENT_SIZE or event[8] != FUNCTIONFS_SETUP:
+        raise ValueError('not a FunctionFS SETUP event')
+    request_type, request, value, index, length = struct.unpack_from('<BBHHH', event)
+    return request_type, request, value, index, length
+
+
+def event_bytes(event_type, request_type=0, request=0, value=0, index=0, length=0):
+    """Offline-test helper; the kernel uses the same packed 12-byte layout."""
+    return struct.pack('<BBHHHBBBB', request_type, request, value, index, length,
+                       event_type, 0, 0, 0)
+
+
+class Ep0Transport:
+    def __init__(self, fd):
+        self.fd = fd
+
+    def reply(self, _setup, data):
+        os.write(self.fd, data)
+
+    def receive(self, setup):
+        return os.read(self.fd, setup[4])
+
+    def stall(self, setup):
+        # FunctionFS deliberately stalls when ep0 is used in the direction
+        # opposite to the pending control transfer.
+        try:
+            if setup[0] & 0x80:
+                os.read(self.fd, setup[4])
+            else:
+                os.write(self.fd, b'')
+        except OSError as error:
+            if error.errno not in (errno.EPIPE, errno.EL2HLT):
+                raise
+
+
+class Responder:
+    def __init__(self, log_path, role_switch=None, enabled=None,
+                 value_mask=0, index_mask=0, sleep=time.sleep, speed=None):
+        self.log_path = Path(log_path)
+        self.role_switch = role_switch
+        self.enabled = enabled
+        self.value_mask = value_mask & 0xffff
+        self.index_mask = index_mask & 0xffff
+        self.sleep = sleep
+        self.speed = speed or (lambda: 'full-speed')
+
+    def log(self, text):
+        stamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self.log_path.open('a') as handle:
+            handle.write(f'{stamp} {text}\n')
+            handle.flush()
+
+    def speed_descriptors(self):
+        speed = self.speed()
+        if speed in ('high-speed', 'super-speed', 'super-speed-plus'):
+            return HID_DESCRIPTOR_OTHER, REPORT_DESCRIPTOR_OTHER
+        return HID_DESCRIPTOR_FS, REPORT_DESCRIPTOR_FS
+
+    def handle_setup(self, setup, transport):
+        request_type, request, value, index, length = setup
+        self.log(f'SETUP bmRequestType=0x{request_type:02x} bRequest=0x{request:02x} '
+                 f'wValue=0x{value:04x} wIndex=0x{index:04x} wLength={length}')
+
+        # Standard interface GET_DESCRIPTOR for HID or HID report descriptor.
+        if request_type == 0x81 and request == 0x06 and index == 0:
+            hid, report = self.speed_descriptors()
+            descriptor_type = value >> 8
+            if descriptor_type == 0x21:
+                transport.reply(setup, hid[:length])
+                return 'hid-descriptor'
+            if descriptor_type == 0x22:
+                transport.reply(setup, report[:length])
+                return 'report-descriptor'
+
+        # The iOS handler accepts HID SET_REPORT, then passes bytes after the
+        # two-byte HID report prefix to its iAP parser.  Logging the payload is
+        # enough to reveal whether the adapter requires pre-switch traffic.
+        if (length > 0 and not (request_type & 0x80) and
+                (request_type & 0x60) == 0x20 and request == 0x09):
+            payload = transport.receive(setup)
+            self.log(f'SET_REPORT payload={payload.hex(" ")}')
+            return 'set-report'
+
+        if (request_type == 0x40 and request == 0x51 and length == 0 and
+                index & (~self.index_mask & 0xffff) == 0 and
+                value & (~self.value_mask & 0xffff) == 0):
+            transport.receive(setup)  # zero-byte OUT read ACKs delayed status
+            self.log('ROLE_SWITCH accepted and ACKed; delay=50ms')
+            self.sleep(0.050)
+            if self.role_switch is not None:
+                self.role_switch()
+            return 'role-switch'
+
+        if (request_type == 0xc0 and request == 0x53 and value == 0 and
+                index == 0 and length == 4):
+            # iOS rotates the uint32 holding {index_mask, value_mask}; on the
+            # little-endian bus that is value_mask followed by index_mask.
+            transport.reply(setup, struct.pack('<HH', self.value_mask, self.index_mask))
+            return 'capabilities'
+
+        transport.stall(setup)
+        self.log('STALL')
+        return 'stall'
+
+    def handle_event(self, event, transport):
+        if len(event) != EVENT_SIZE:
+            raise ValueError('short FunctionFS event')
+        event_type = event[8]
+        names = ('BIND', 'UNBIND', 'ENABLE', 'DISABLE', 'SETUP', 'SUSPEND', 'RESUME')
+        if event_type == FUNCTIONFS_SETUP:
+            return self.handle_setup(parse_setup(event), transport)
+        name = names[event_type] if event_type < len(names) else f'UNKNOWN-{event_type}'
+        self.log(f'EVENT {name}')
+        if event_type == FUNCTIONFS_ENABLE and self.enabled is not None:
+            self.enabled()
+        return name.lower()
+
+
+def mounted(path):
+    target = str(path.resolve())
+    try:
+        for line in Path('/proc/self/mountinfo').read_text().splitlines():
+            if len(line.split()) > 4 and line.split()[4] == target:
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def current_speed(gadget=GADGET):
+    try:
+        udc = (gadget / 'UDC').read_text().strip()
+        if udc:
+            return (Path('/sys/class/udc') / udc / 'current_speed').read_text().strip()
+    except OSError:
+        pass
+    return 'unknown'
+
+
+def discover_udc(gadget=GADGET, udc_class=UDC_CLASS):
+    """Return the gadget's UDC, recovering from an empty configfs UDC file."""
+    current = (Path(gadget) / 'UDC').read_text().strip()
+    if current:
+        return current
+    candidates = sorted(path.name for path in Path(udc_class).iterdir())
+    if len(candidates) != 1:
+        raise RuntimeError(f'expected one available UDC, found {candidates}')
+    return candidates[0]
+
+
+def soft_reconnect(gadget=GADGET, udc_class=UDC_CLASS, sleep=time.sleep,
+                   write_udc=None):
+    """Give the attached host a fresh address-zero attempt after GetID."""
+    gadget = Path(gadget)
+    udc = discover_udc(gadget, udc_class)
+    if write_udc is None:
+        write_udc = lambda value: (gadget / 'UDC').write_text(value + '\n')
+    if (gadget / 'UDC').read_text().strip():
+        write_udc('')
+    sleep(0.100)
+    write_udc(udc)
+
+
+class FunctionFS:
+    def __init__(self, gadget=GADGET, config=CONFIG, function=FUNCTION,
+                 link=LINK, mount=MOUNT, role=ROLE, udc_class=UDC_CLASS):
+        self.gadget = Path(gadget)
+        self.config = Path(config)
+        self.function = Path(function)
+        self.link = Path(link)
+        self.mount = Path(mount)
+        self.role = Path(role)
+        self.udc_class = Path(udc_class)
+        self.udc = ''
+        self.ep0 = None
+        self.ep1 = None
+
+    def write_udc(self, value):
+        # A newline-only sysfs write is the configfs equivalent of
+        # ``echo '' > UDC`` and actually invokes the unbind store callback.
+        (self.gadget / 'UDC').write_text(value + '\n')
+
+    def _device_mode(self):
+        try:
+            return self.role.read_text().strip() == 'device'
+        except OSError:
+            return True
+
+    def _close_endpoints(self):
+        for name in ('ep1', 'ep0'):
+            fd = getattr(self, name)
+            if fd is not None:
+                os.close(fd)
+                setattr(self, name, None)
+
+    def _remove_artifacts(self):
+        """Remove only the temporary c.2/ffs.iap objects owned here."""
+        errors = []
+        if self.link.is_symlink():
+            try:
+                self.link.unlink()
+            except OSError as error:
+                errors.append(f'unlink {self.link}: {error}')
+        self._close_endpoints()
+        if mounted(self.mount):
+            result = subprocess.run(('umount', str(self.mount)), check=False,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True)
+            if result.returncode:
+                errors.append(f'umount {self.mount}: {result.stdout.strip()}')
+        for path in (self.function, self.config / 'strings/0x409', self.config,
+                     self.mount):
+            try:
+                path.rmdir()
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                errors.append(f'rmdir {path}: {error}')
+        if errors:
+            raise RuntimeError('; '.join(errors))
+
+    def cleanup(self, rebind=True):
+        """Remove a stale listener and, in device mode, restore config c.1."""
+        if not self.gadget.is_dir() or not (self.gadget / 'UDC').is_file():
+            raise RuntimeError(f'missing configfs gadget: {self.gadget}')
+        if not self.udc:
+            self.udc = discover_udc(self.gadget, self.udc_class)
+        current = (self.gadget / 'UDC').read_text().strip()
+        if current:
+            self.write_udc('')
+        error = None
+        try:
+            self._remove_artifacts()
+        except BaseException as caught:
+            error = caught
+        if rebind and self._device_mode() and not (self.gadget / 'UDC').read_text().strip():
+            try:
+                self.write_udc(self.udc)
+            except OSError as caught:
+                message = (f'cannot bind {self.udc}; boot usb-host4 so legacy g_ffs '
+                           f'does not own FunctionFS: {caught}')
+                if error is None:
+                    error = RuntimeError(message)
+                else:
+                    error = RuntimeError(f'{error}; {message}')
+        if error is not None:
+            raise error
+
+    def open(self):
+        if not self.gadget.is_dir() or not (self.gadget / 'UDC').is_file():
+            raise RuntimeError(f'missing configfs gadget: {self.gadget}')
+        if Path('/sys/module/g_ffs').exists():
+            raise RuntimeError('legacy g_ffs owns FunctionFS; boot the usb-host4 entry')
+        self.udc = discover_udc(self.gadget, self.udc_class)
+        if (self.gadget / 'UDC').read_text().strip():
+            self.write_udc('')
+        try:
+            # A killed/failed prior listener may have left all three objects.
+            self._remove_artifacts()
+            # c.1 remains the ACM/ECM Mac-tether profile.  The Camera Adapter
+            # is documented to select the iUI profile at configuration 2.
+            self.config.mkdir(exist_ok=True)
+            (self.config / 'bmAttributes').write_text('0xc0\n')
+            (self.config / 'MaxPower').write_text('0\n')
+            language = self.config / 'strings/0x409'
+            language.mkdir(mode=0o755, parents=True, exist_ok=True)
+            (language / 'configuration').write_text('iPod USB Interface\n')
+            self.function.mkdir(exist_ok=True)
+            self.mount.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if not mounted(self.mount):
+                subprocess.run(('mount', '-t', 'functionfs', 'iap', str(self.mount)),
+                               check=True)
+            self.ep0 = os.open(self.mount / 'ep0', os.O_RDWR)
+            os.write(self.ep0, descriptor_blob())
+            os.write(self.ep0, strings_blob())
+            # ep1 exists after descriptors are accepted.  Keeping it open is
+            # required even though role switching uses only ep0.
+            self.ep1 = os.open(self.mount / 'ep1', os.O_RDWR)
+            if not self.link.is_symlink():
+                # configfs resolves the target against the caller's cwd, not
+                # the link's directory: a relative target fails with ENOENT.
+                self.link.symlink_to(self.function.resolve())
+            self.write_udc(self.udc)
+            return self.ep0
+        except BaseException:
+            self.cleanup(rebind=True)
+            raise
+
+    def close(self):
+        self.cleanup(rebind=True)
+
+
+def repair_gadget(functionfs=None):
+    """Idempotent stop repair used by ``linux-a9-usb-host device``."""
+    (functionfs or FunctionFS()).cleanup(rebind=True)
+
+
+def serve(log_path, role_switch=None, enabled=None, ready=None, functionfs=None):
+    functionfs = functionfs or FunctionFS()
+    ep0 = functionfs.open()
+    responder = Responder(log_path, role_switch=role_switch, enabled=enabled,
+                          speed=lambda: current_speed(functionfs.gadget))
+    transport = Ep0Transport(ep0)
+    try:
+        if ready is not None:
+            ready()
+        while True:
+            data = os.read(ep0, EVENT_SIZE * 8)
+            if not data:
+                raise RuntimeError('FunctionFS ep0 closed')
+            if len(data) % EVENT_SIZE:
+                raise RuntimeError(f'partial FunctionFS event stream: {len(data)} bytes')
+            for offset in range(0, len(data), EVENT_SIZE):
+                responder.handle_event(data[offset:offset + EVENT_SIZE], transport)
+    finally:
+        functionfs.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--log', type=Path, required=True)
+    args = parser.parse_args()
+    if os.geteuid() != 0:
+        parser.error('run with sudo')
+    args.log.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    serve(args.log)
+
+
+if __name__ == '__main__':
+    main()

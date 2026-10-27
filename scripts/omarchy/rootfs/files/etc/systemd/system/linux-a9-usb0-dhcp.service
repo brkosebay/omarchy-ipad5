@@ -1,0 +1,20 @@
+[Unit]
+Description=linux-a9 DHCP server for the Mac on the USB gadget link (usb0)
+# Omarchy disables systemd-networkd at first boot (install/hardware/network.sh)
+# and NetworkManager leaves usb0 alone (90-linux-a9-usb0.conf), so this unit
+# owns usb0's address and the Mac's lease.
+Wants=sys-subsystem-net-devices-usb0.device
+After=sys-subsystem-net-devices-usb0.device
+
+[Service]
+Type=simple
+# Idempotent: the initramfs already set this address; "replace" only
+# refreshes it.
+ExecStartPre=/usr/bin/ip link set usb0 up
+ExecStartPre=/usr/bin/ip address replace 172.16.42.1/24 dev usb0
+ExecStart=/usr/bin/dnsmasq --keep-in-foreground --conf-file=/etc/linux-a9/usb0-dhcp.conf
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

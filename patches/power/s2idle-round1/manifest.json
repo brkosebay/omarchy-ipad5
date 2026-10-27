@@ -1,0 +1,30 @@
+{
+  "branches": {
+    "a9/pcie": {
+      "base": "2752fedbbfe3f4f80ed586ca438acdf292e3cc66",
+      "head": "47a949be4f52211410a19dd519de6cc3af79c1d1"
+    },
+    "a9/boot": {
+      "base": "7954324dfa200be83f40b099c3bc40a556e151af",
+      "head": "c54e4085b53fd29ae321b15cb6a55cab70432c89"
+    },
+    "a9/touch": {
+      "base": "6ca4db775649909602763aa6bfd7bcbbe867285a",
+      "head": "1454b30266090ab3ddab4d4cb86557915759a4ab"
+    }
+  },
+  "patches": {
+    "0001-dt-bindings-mfd-apple-describe-the-D2365-event-inter.patch": "1251e310d5ede0e0c5a738bb99ae671bd4621bac3717dcd5533ac800e730d511",
+    "0002-arm64-dts-apple-describe-the-iPad-5-D2365-wake-event.patch": "c5fdb1e859d923531a266d15a0d75b3f478bbdc626d5e57c944de13690e511ed",
+    "0003-dt-bindings-backlight-apple-dwi-describe-the-S8000-b.patch": "77bc915c2b2fa2da7de43f551f0968cd1f725e96b04f372f800cdae7f686a9c9",
+    "0004-backlight-apple-dwi-replay-J71t-block-init-at-probe-.patch": "630d088ca8e734d95ff7cc6b49ef4798dbb94a925973c969f7a0251cb4b1f448",
+    "0005-nvme-PCI-apple-ans-pair-system-sleep-stop-with-full-.patch": "e7e9daf80b8f9d692973d77d1b41bcc8d3a253856ed415deb0235a1b7a48a380",
+    "0006-input-apple_n1-quiesce-sleep-IRQs-and-bound-runtime-.patch": "5707451dfc21c2a219a77269415f3c956267046e2e03754547570f08a4f645c5"
+  },
+  "integration_base": "726d067231dbbdb8c352cc3d259b39a793fb0e83",
+  "boot_baseline": "7954324dfa200be83f40b099c3bc40a556e151af",
+  "device_access": false,
+  "hardware_tested": false,
+  "pmu_event_irqchip_implemented": false,
+  "rtc_alarm_implemented": false
+}

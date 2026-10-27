@@ -1,0 +1,1140 @@
+From 58b8042da099abc7fb1f54a5dd096bbbc38b4a8c Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 02:36:19 +0000
+Subject: [PATCH 3/5] ASoC: cs42l81: add DMIC capture, headphone output and
+ jack reporting
+
+Capture: the two built-in mics are digital mics on the codec (ADT
+dmic1a-intmic, dmic1b-intmic). An "ADC" DAPM widget between DMIC1A/
+DMIC1B and a new ASP TX AIF writes what iOS updateRouting writes for
+the dmic1a + dmic1b routes, in its order: ASP TX slots 0/1 = ADC A/B
+(0x0014.., sources 0x0115/0x0116, slot-pair rates 0x0124.., byte-lane
+mask 0x001e..0x0021), ADC sources 0x011f/0x0120 = 0x18/0x1c with the
+analog input bits of 0x0205 clear, the DMIC gain (0x0204/0x0210 boost,
+0x0208/0x0212), 0x0203 = 0xc0 (0xc4 is the no-input value), ASP TX
+power (0x0011 bit 6), DMIC1 control 0x0215 and the ADC path power
+(0x000e bits 6 and 5). 0x000d stays clear: iOS sets those bits only
+for the analog mics mic1/mic3/mic4, which J71t does not have. The
+capture DAI is 2 channels, same rates and formats as playback; both
+directions share the ASP clock, so the DAI is symmetric in rate and
+sample bits. Controls: "Capture Volume" (1 dB steps, -96..+32 dB, iOS
+turns the +20 dB boost on from +12 dB) and "Capture Switch".
+
+Headphones: an "HP Amp" widget to HPOUT does iOS's speaker-to-headphone
+route change: OUT_CTL 0xe0, HP driver on and line driver off (0x0220),
+speakers powered down with OUT_CTL bit 5 dropped around it, 20 ms, a
+start at most -9 dB, 60 ms settle, then the charge pump (0xc96f 0x0e,
+0x0219 1, 155 us, 0xc96f 0x1e) once the gain is above -9 dB. The gain
+follows iOS setHeadphoneVolume: 1 dB in 0x0227 plus a 0.5 dB trim in
+0x0225 (also written to 0x0226, which iOS leaves alone). Controls
+"Headphone Playback Volume" (0.5 dB steps, -50..+12 dB, default
+-30 dB) and "Headphone Playback Switch". iOS never drives speakers and
+headphones together, so each amp stays off while the other one is on.
+
+Jack: a "Headphone Jack" (SND_JACK_HEADPHONE). A plug report disables
+SPKOUT and enables HPOUT, an unplug the reverse, so playback moves
+between speakers and headphones; HPOUT starts disabled. The pins are
+switched by the driver rather than registered as jack pins, which would
+add "HPOUT Jack"/"SPKOUT Jack" controls instead of the "Headphone Jack"
+userspace looks for. iOS detects the plug with a timer, not with the
+codec interrupt, and the status bit is not known yet. So detection is
+a poll of the latched status registers, off unless jack_poll_ms is
+set: without jack_reg/jack_mask it only logs every change together
+with the hs-switch levels (the plug survey), with them it debounces
+that bit over two polls and reports it. debugfs cs42l81-jack shows the
+state and the status bits seen, and can force a plug or unplug for
+headphone tests before the bit is known. The status registers are read
+to clear, so the poll, the register dump and the PDN_DONE wait share a
+mutex. The hs-switch GPIOs are taken as they are and only read.
+
+The debugfs register dump covers the new registers, and the debugfs
+files are removed on unbind.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ sound/soc/codecs/cs42l81.c | 818 ++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 799 insertions(+), 19 deletions(-)
+
+diff --git a/sound/soc/codecs/cs42l81.c b/sound/soc/codecs/cs42l81.c
+index 454ba21d8d..a19ce1db5d 100644
+--- a/sound/soc/codecs/cs42l81.c
++++ b/sound/soc/codecs/cs42l81.c
+@@ -1,12 +1,14 @@
+ // SPDX-License-Identifier: GPL-2.0-only OR MIT
+ /*
+- * Cirrus Logic CS42L81 (Apple 338S-series) codec, speaker playback path.
++ * Cirrus Logic CS42L81 (Apple 338S-series) codec: speaker and headphone
++ * playback, built-in DMIC capture, headphone jack.
+  *
+  * The CS42L81 is an Apple-specific Cirrus codec with integrated speaker
+  * drivers, used on the A9 iPad 5 (J71t). There is no public datasheet; the
+  * register sequences below were reconstructed from iOS 16.7.10's
+- * AppleCS42L81Audio driver (see docs/audio/playback-path.md in linux-a9).
+- * Register names are descriptive guesses.
++ * AppleCS42L81Audio driver (see docs/audio/playback-path.md and
++ * docs/audio/ds-capture-and-jack.md in linux-a9). Register names are
++ * descriptive guesses.
+  *
+  * Control port: SPI, 16-bit register address (page << 8 | reg), 8-bit
+  * data, framed as   write: 6C page reg 00 val
+@@ -19,12 +21,15 @@
+ #include <linux/delay.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/of.h>
+ #include <linux/regmap.h>
+ #include <linux/seq_file.h>
+ #include <linux/slab.h>
+ #include <linux/spi/spi.h>
+ #include <linux/uaccess.h>
++#include <linux/workqueue.h>
++#include <sound/jack.h>
+ #include <sound/pcm.h>
+ #include <sound/pcm_params.h>
+ #include <sound/soc.h>
+@@ -43,8 +48,17 @@
+ #define CS42L81_PWR_CTL1_FREEZE		BIT(6)	/* set after PDN_DONE */
+ #define CS42L81_PWR_CTL1_REVA0		BIT(7)
+ #define CS42L81_PWR_CTL2	0x0007
++/*
++ * Bits 1/3/5 power the bias of the analog mics mic1/mic3/mic4. iOS sets
++ * them only for mics with a "<mic>-bias" or "<mic>-intmic" ADT property,
++ * so on J71t (DMICs only) it never touches them.
++ */
+ #define CS42L81_ADC_PWR		0x000d
+-#define CS42L81_PATH_PWR	0x000e	/* bit 7 DAC PDN, 6 ADC PDN, 5 ? */
++/* iOS updateRouting: 7 cleared for output, 6 for input, 5 for either */
++#define CS42L81_PATH_PWR	0x000e
++#define CS42L81_PATH_PWR_DAC_PDN	BIT(7)
++#define CS42L81_PATH_PWR_ADC_PDN	BIT(6)
++#define CS42L81_PATH_PWR_COMMON_PDN	BIT(5)
+ #define CS42L81_CLK_CTL		0x000f	/* [3:0] rate code, bit 7 see below */
+ /*
+  * iOS enableAudio writes CLK_CTL[7:6,3:0] = 0x80 when the IIS link's
+@@ -55,7 +69,14 @@
+ #define CS42L81_CLK_CTL_CODEC_MASTER	0x80
+ #define CS42L81_CLK_CTL_CODEC_SLAVE	0x0c
+ #define CS42L81_ASP_PWR		0x0011	/* bit 7 ASP RX PDN, 6 ASP TX PDN */
++#define CS42L81_ASP_PWR_RX_PDN		BIT(7)
++#define CS42L81_ASP_PWR_TX_PDN		BIT(6)
+ #define CS42L81_ASP_CLK		0x0012	/* bit 7 ASP clock master, [3:0] rate */
++/* ASP TX slot n: byte offset in the frame, bit 7 = slot unused (no width) */
++#define CS42L81_ASP_TX_SLOT(n)	(0x0014 + (n))	/* n = 0..9 */
++#define CS42L81_ASP_TX_SLOT_EMPTY	BIT(7)
++/* ASP TX byte-lane enable mask, frame byte 0 = bit 0 of 0x0021 */
++#define CS42L81_ASP_TX_EN(n)	(0x001e + (n))	/* n = 0..3, MSB first */
+ #define CS42L81_ASP_RX_SLOT(n)	(0x0022 + (n))	/* n = 0..9 */
+ #define CS42L81_INT_STATUS1	0x002e
+ #define CS42L81_INT_STATUS2	0x002f
+@@ -64,18 +85,38 @@
+ #define CS42L81_INT_STATUS4	0x007b
+ #define CS42L81_INT_STATUS5	0x007c
+ #define CS42L81_INT_STATUS6	0x0106
++/* ASP TX slot n source: 0x18 = ADC A, 0x1c = ADC B (0x20/0x24 = DMIC2A/B) */
++#define CS42L81_ASP_TX_SRC(n)	(0x0115 + (n))	/* n = 0..9 */
++/* ADC channel n source, same codes as ASP_TX_SRC */
++#define CS42L81_ADC_SRC(n)	(0x011f + (n))	/* n = 0..1 */
+ #define CS42L81_SRC_RATE_A	0x0123
++#define CS42L81_ASP_TX_PAIR_RATE(p)	(0x0124 + (p))	/* slot pair p = 0..4 */
+ #define CS42L81_ASP_PAIR_RATE(p)	(0x0129 + (p))	/* channel pair p = 0..4 */
+ #define CS42L81_ASP_TX_RATE	0x012e
+ #define CS42L81_ASP_RX_RATE	0x012f
+ #define CS42L81_ASP_CTL		0x0131
+ #define CS42L81_OUT_CTL		0x0201
++/*
++ * ADC input select. iOS starts at 0x04 and, per DMIC route, clears bit 2
++ * and toggles 0x40 (dmic1a) / 0x80 (dmic1b); 0xc4 is its no-input value.
++ */
+ #define CS42L81_ADC_ROUTE	0x0203
+-#define CS42L81_ADC_CTL_A	0x0204
+-#define CS42L81_ADC_RATE_A	0x0205
++#define CS42L81_ADC_ROUTE_NONE		0xc4
++#define CS42L81_ADC_ROUTE_DMIC1		0xc0
++#define CS42L81_ADC_CTL_A	0x0204	/* [1:0] ADC A +20 dB boost (inferred) */
++#define CS42L81_ADC_RATE_A	0x0205	/* [3:0] rate, [7:4] analog inputs */
++#define CS42L81_ADC_PGA_A	0x0206	/* analog PGA, 0 for DMICs */
++#define CS42L81_ADC_PGA_B	0x0207
++#define CS42L81_ADC_VOL_A	0x0208	/* signed, 1 dB (inferred), 0x80 mute */
+ #define CS42L81_ADC_CTL_B	0x020f
+-#define CS42L81_ADC_CTL_C	0x0210
++#define CS42L81_ADC_CTL_C	0x0210	/* [1:0] ADC B boost (inferred) */
+ #define CS42L81_ADC_RATE_B	0x0211
++#define CS42L81_ADC_VOL_B	0x0212
++#define CS42L81_ADC_BOOST		GENMASK(1, 0)
++#define CS42L81_ADC_VOL_MUTE		0x80
++/* DMIC1 (1A + 1B) control: bit 7 = iOS control 0x188, [6:4] by rate */
++#define CS42L81_DMIC1_CTL	0x0215
++#define CS42L81_DMIC2_CTL	0x0216
+ #define CS42L81_HPCP_CTL	0x0219
+ #define CS42L81_DRV_PDN		0x0220	/* bit 5 HP PDN, bit 3 line PDN */
+ #define CS42L81_DRV_PDN_HP		BIT(5)
+@@ -109,15 +150,62 @@
+ #define CS42L81_VOL_MAX_CTL	228	/* +12 dB */
+ #define CS42L81_HP_MUTE		0x40
+ 
++/* Headphone control: 0.5 dB steps, 0 = -50 dB, 100 = 0 dB, 124 = +12 dB */
++#define CS42L81_HP_VOL_0DB	100
++#define CS42L81_HP_VOL_MAX	124
++#define CS42L81_HP_VOL_DEFAULT	40	/* -30 dB */
++/* iOS keeps the HP charge pump off at or below -9 dB and while settling */
++#define CS42L81_HP_CP_MIN_DB	(-9)
++
++/* Capture control: 1 dB steps (inferred), 0 = -96 dB, 96 = 0 dB, +32 dB max */
++#define CS42L81_ADC_VOL_0DB	96
++#define CS42L81_ADC_VOL_MAX	128
++
+ #define CS42L81_PDN_POLL_US	10000
+ #define CS42L81_PDN_TIMEOUT_US	1000000	/* iOS: 100 x 10 ms */
+ 
++/*
++ * Headphone jack (docs/audio/ds-capture-and-jack.md section 3). iOS polls
++ * the plug state on a timer; the codec status bit is not known yet, so
++ * polling is off by default and, without jack_reg, only logs which status
++ * bits change (test T1).
++ */
++static unsigned int jack_poll_ms;
++module_param(jack_poll_ms, uint, 0644);
++MODULE_PARM_DESC(jack_poll_ms,
++		 "poll the codec status registers every N ms (0 = off, min 100)");
++static unsigned int jack_reg;
++module_param(jack_reg, uint, 0644);
++MODULE_PARM_DESC(jack_reg, "status register with the plug bit (0 = unknown, log only)");
++static unsigned int jack_mask;
++module_param(jack_mask, uint, 0644);
++MODULE_PARM_DESC(jack_mask, "plug bit(s) in jack_reg");
++static bool jack_invert;
++module_param(jack_invert, bool, 0644);
++MODULE_PARM_DESC(jack_invert, "plug bit is set while unplugged");
++/* iOS reads control 0x188 with default 1; J71t publishes no such control */
++static bool dmic_bit7 = true;
++module_param(dmic_bit7, bool, 0644);
++MODULE_PARM_DESC(dmic_bit7, "set DMIC1 control (0x0215) bit 7 at capture start");
++
++#define CS42L81_JACK_POLL_MIN_MS	100
++#define CS42L81_JACK_DEBOUNCE		2	/* equal polls before a report */
++
++/* latched (read-to-clear) status registers, as iOS enableAudio clears them */
++static const u16 cs42l81_status_regs[] = {
++	0x002e, 0x002f, 0x0033, 0x007b, 0x007c, 0x0106, 0x0528,
++};
++
++/* ASP TX slot 0/1 and ADC channel 0/1 sources: ADC A (DMIC1A), ADC B (DMIC1B) */
++static const u8 cs42l81_adc_src[2] = { 0x18, 0x1c };
++
+ struct cs42l81 {
+ 	struct device *dev;
+ 	struct spi_device *spi;
+ 	struct regmap *regmap;
+ 	struct clk *mclk;
+ 	struct gpio_desc *mute_gpio;
++	struct gpio_descs *hs_switch;	/* ext_sw1/2, read only */
+ 	u8 *xfer_buf;		/* 2 x 5 bytes, DMA-safe */
+ 
+ 	unsigned int rate_code;
+@@ -130,6 +218,32 @@ struct cs42l81 {
+ 	bool clk_provider;	/* codec drives BCLK/LRCK (set_fmt) */
+ 	unsigned int dbg_reg;	/* debugfs cs42l81-reg selection */
+ 	u32 spk_mode;		/* 2 = stereo speakers (both outputs) */
++
++	/* headphones */
++	unsigned int hp_vol;	/* control value, 0..CS42L81_HP_VOL_MAX */
++	unsigned int hp_switch;
++	bool hp_on;
++	bool hp_settled;	/* 60 ms after the HP driver came up */
++	bool hp_cp_on;		/* charge pump */
++
++	/* capture */
++	unsigned int adc_vol;	/* control value, 0..CS42L81_ADC_VOL_MAX */
++	unsigned int adc_switch;
++	bool adc_on;
++
++	/* jack */
++	struct snd_soc_component *component;
++	struct snd_soc_jack jack;
++	struct delayed_work jack_work;
++	struct mutex status_lock;	/* read-to-clear status vs PDN_DONE poll */
++	struct mutex jack_lock;		/* jack_* below, reports */
++	bool jack_ready;
++	int jack_forced;	/* -1 = detect, else forced state */
++	bool jack_state;	/* last reported */
++	bool jack_pending;
++	unsigned int jack_stable;
++	u8 status_last[ARRAY_SIZE(cs42l81_status_regs)];
++	u8 status_seen[ARRAY_SIZE(cs42l81_status_regs)];
+ };
+ 
+ /* --- SPI regmap bus ------------------------------------------------------ */
+@@ -257,6 +371,167 @@ static void cs42l81_apply_spk_volume(struct cs42l81 *cs)
+ 	regmap_write(cs->regmap, CS42L81_MAIN_VOL, CS42L81_VOL_MUTE);
+ }
+ 
++/* --- capture: DMIC1A/1B -> ADC A/B -> ASP TX slots 0/1 -------------------- */
++
++/* iOS updateRouting: 0x0215 = control 0x188 << 7 | divider from the rate */
++static unsigned int cs42l81_dmic_ctl(struct cs42l81 *cs)
++{
++	unsigned int div;
++
++	switch (cs->rate_code) {
++	case 0x1 ... 0x8:
++		div = 0x70;	/* 8..24 kHz */
++		break;
++	case 0x9:
++		div = 0x40;	/* 32 kHz */
++		break;
++	case 0xa:
++	case 0xb:
++		div = 0x10;	/* 44.1 kHz */
++		break;
++	default:
++		div = 0;	/* 48 kHz: iOS writes no divider */
++		break;
++	}
++	return (READ_ONCE(dmic_bit7) ? 0x80 : 0) | div;
++}
++
++/*
++ * iOS DMIC gain (control 0x170, 0x60 = 0 dB): from +12 dB on the ADC
++ * +20 dB boost is on and the digital volume carries the rest.
++ */
++static void cs42l81_apply_adc_volume(struct cs42l81 *cs)
++{
++	struct regmap *map = cs->regmap;
++	int db = (int)cs->adc_vol - CS42L81_ADC_VOL_0DB;
++	unsigned int boost = 0, vol = CS42L81_ADC_VOL_MUTE;
++
++	if (cs->adc_switch) {
++		if (db >= 12) {
++			boost = CS42L81_ADC_BOOST;
++			db -= 20;
++		}
++		vol = db & 0xff;
++	}
++
++	regmap_update_bits(map, CS42L81_ADC_CTL_A, 0x73, boost);
++	regmap_write(map, CS42L81_ADC_PGA_A, 0);
++	regmap_write(map, CS42L81_ADC_PGA_B, 0);
++	regmap_write(map, CS42L81_ADC_VOL_A, vol);
++	regmap_update_bits(map, CS42L81_ADC_CTL_C, 0x43, boost);
++	regmap_write(map, CS42L81_ADC_VOL_B, vol);
++}
++
++/* iOS updateRouting, input slots: ADC A/B in slots 0/1, slots 2..9 unused */
++static void cs42l81_set_asp_tx(struct cs42l81 *cs)
++{
++	struct regmap *map = cs->regmap;
++	unsigned int c = cs->rate_code, b = cs->slot_bytes, n;
++	u32 lanes = GENMASK(2 * b - 1, 0);	/* frame bytes of slots 0/1 */
++
++	for (n = 0; n < 10; n++) {
++		regmap_write(map, CS42L81_ASP_TX_SLOT(n),
++			     n * b | (n < 2 ? 0 : CS42L81_ASP_TX_SLOT_EMPTY));
++		regmap_write(map, CS42L81_ASP_TX_PAIR_RATE(n / 2), c | c << 4);
++		if (n < 2)
++			regmap_write(map, CS42L81_ASP_TX_SRC(n),
++				     cs42l81_adc_src[n]);
++	}
++	/* iOS writes these as one 4-byte burst of the byte-swapped mask */
++	for (n = 0; n < 4; n++)
++		regmap_write(map, CS42L81_ASP_TX_EN(n),
++			     (lanes >> (24 - 8 * n)) & 0xff);
++}
++
++/* iOS updateRouting with the input stream active, routes dmic1a + dmic1b */
++static void cs42l81_capture_power_up(struct cs42l81 *cs)
++{
++	struct regmap *map = cs->regmap;
++	unsigned int ch;
++
++	cs42l81_set_asp_tx(cs);
++	for (ch = 0; ch < 2; ch++) {
++		/* digital input: no analog input select bits */
++		regmap_update_bits(map, CS42L81_ADC_RATE_A, ch ? 0xc0 : 0x30, 0);
++		regmap_write(map, CS42L81_ADC_SRC(ch), cs42l81_adc_src[ch]);
++	}
++	cs42l81_apply_adc_volume(cs);
++	/* CS42L81_ADC_PWR (analog mic bias) stays as it is, as on iOS */
++	regmap_write(map, CS42L81_ADC_ROUTE, CS42L81_ADC_ROUTE_DMIC1);
++	regmap_write(map, CS42L81_ADC_CTL_B, 0x04);
++	regmap_clear_bits(map, CS42L81_ASP_PWR, CS42L81_ASP_PWR_TX_PDN);
++	regmap_set_bits(map, CS42L81_ASP_CTL, 0x01);
++	regmap_write(map, CS42L81_DMIC1_CTL, cs42l81_dmic_ctl(cs));
++	regmap_clear_bits(map, CS42L81_PATH_PWR, CS42L81_PATH_PWR_ADC_PDN |
++			  CS42L81_PATH_PWR_COMMON_PDN);
++	cs->adc_on = true;
++}
++
++/* iOS updateRouting once the input stream is gone; 0x0215 is left as is */
++static void cs42l81_capture_power_down(struct cs42l81 *cs)
++{
++	struct regmap *map = cs->regmap;
++
++	cs->adc_on = false;
++	regmap_write(map, CS42L81_ADC_ROUTE, CS42L81_ADC_ROUTE_NONE);
++	regmap_write(map, CS42L81_ADC_CTL_B, 0x04);
++	regmap_set_bits(map, CS42L81_ASP_PWR, CS42L81_ASP_PWR_TX_PDN);
++	regmap_set_bits(map, CS42L81_PATH_PWR, CS42L81_PATH_PWR_ADC_PDN);
++}
++
++/* --- headphones ------------------------------------------------------------ */
++
++static void cs42l81_hp_cp_on(struct cs42l81 *cs)
++{
++	/* iOS setHeadphoneVolume */
++	regmap_write(cs->regmap, CS42L81_TRIM3, 0x0e);
++	regmap_write(cs->regmap, CS42L81_HPCP_CTL, 0x01);
++	usleep_range(155, 200);		/* iOS IODelay(155) */
++	regmap_write(cs->regmap, CS42L81_TRIM3, 0x1e);
++	cs->hp_cp_on = true;
++}
++
++static void cs42l81_hp_cp_off(struct cs42l81 *cs)
++{
++	/* iOS updateRouting with the headphone route gone */
++	regmap_write(cs->regmap, CS42L81_TRIM3, 0x0e);
++	usleep_range(1000, 2000);
++	regmap_write(cs->regmap, CS42L81_HPCP_CTL, 0x00);
++	cs->hp_cp_on = false;
++}
++
++/*
++ * iOS setHeadphoneVolume without a line out (J71t): the HP driver gain in
++ * 1 dB steps (0x0227, 7-bit signed, 0x40 = mute) plus a 0.5 dB trim in the
++ * digital volume (0x0225). Until the driver has settled, and at or below
++ * -9 dB, the charge pump stays off and the gain is at most -9 dB.
++ */
++static void cs42l81_apply_hp_volume(struct cs42l81 *cs)
++{
++	struct regmap *map = cs->regmap;
++	int g = (int)cs->hp_vol - CS42L81_HP_VOL_0DB;	/* 0.5 dB */
++	int gain = g / 2, trim = g - 2 * gain;
++
++	if (!cs->hp_on)
++		return;
++
++	if (!cs->hp_switch) {
++		regmap_write(map, CS42L81_HP_VOL_A, CS42L81_HP_MUTE);
++		return;
++	}
++
++	regmap_write(map, CS42L81_SPK_VOL_A, trim & 0xff);
++	/* iOS leaves 0x0226 alone here; keep both channels equal (inferred) */
++	regmap_write(map, CS42L81_SPK_VOL_B, trim & 0xff);
++	if (gain > CS42L81_HP_CP_MIN_DB) {
++		if (!cs->hp_settled)
++			gain = CS42L81_HP_CP_MIN_DB;
++		else if (!cs->hp_cp_on)
++			cs42l81_hp_cp_on(cs);
++	}
++	regmap_write(map, CS42L81_HP_VOL_A, gain & 0x7f);
++}
++
+ /* --- power sequences (DAPM) ---------------------------------------------- */
+ 
+ static int cs42l81_core_power_up(struct cs42l81 *cs)
+@@ -277,6 +552,7 @@ static int cs42l81_core_power_up(struct cs42l81 *cs)
+ 	regmap_write(map, CS42L81_UNLOCK, 0x00);
+ 
+ 	/* read to clear latched status */
++	mutex_lock(&cs->status_lock);
+ 	regmap_read(map, CS42L81_INT_STATUS1, &val);
+ 	regmap_read(map, CS42L81_INT_STATUS2, &val);
+ 	regmap_read(map, CS42L81_INT_STATUS3, &val);
+@@ -284,6 +560,7 @@ static int cs42l81_core_power_up(struct cs42l81 *cs)
+ 	regmap_read(map, CS42L81_INT_STATUS5, &val);
+ 	regmap_read(map, CS42L81_INT_STATUS6, &val);
+ 	regmap_read(map, CS42L81_INT_STATUS7, &val);
++	mutex_unlock(&cs->status_lock);
+ 
+ 	ret = regmap_read(map, CS42L81_REVID, &rev);
+ 	if (ret)
+@@ -307,6 +584,7 @@ static int cs42l81_core_power_up(struct cs42l81 *cs)
+ 	regmap_write(map, CS42L81_TRIM1, 0xff);
+ 	regmap_write(map, CS42L81_TRIM2, 0x0f);
+ 	regmap_write(map, CS42L81_TRIM3, 0x0e);
++	cs->hp_cp_on = false;
+ 	regmap_set_bits(map, CS42L81_DRV_CTL1, 0x20);
+ 	regmap_write(map, CS42L81_DRV_CTL2, 0x08);
+ 	regmap_write(map, CS42L81_DRV_CTL3, 0x09);
+@@ -335,9 +613,11 @@ static int cs42l81_core_power_up(struct cs42l81 *cs)
+ 	{
+ 		unsigned int st[4] = {};
+ 
++		mutex_lock(&cs->status_lock);
+ 		regmap_read(map, CS42L81_INT_STATUS1, &st[0]);
+ 		regmap_read(map, CS42L81_INT_STATUS2, &st[1]);
+ 		regmap_read(map, CS42L81_INT_STATUS3, &st[2]);
++		mutex_unlock(&cs->status_lock);
+ 		regmap_read(map, CS42L81_CLK_CTL, &st[3]);
+ 		dev_info(cs->dev,
+ 			 "powered up: rev %#x clk_ctl %#x status 2e=%#x 2f=%#x 33=%#x\n",
+@@ -368,6 +648,8 @@ static void cs42l81_core_power_down(struct cs42l81 *cs)
+ 	regmap_write(map, CS42L81_DRV_PDN, 0x28);
+ 	regmap_write(map, CS42L81_SPK_PDN, 0x18);
+ 
++	/* the jack poll must not consume PDN_DONE (read to clear) */
++	mutex_lock(&cs->status_lock);
+ 	regmap_read(map, CS42L81_INT_STATUS2, &val);
+ 	if (val & CS42L81_INT_STATUS2_PDN_DONE)
+ 		dev_dbg(cs->dev, "PDN_DONE already set before power down\n");
+@@ -380,6 +662,7 @@ static void cs42l81_core_power_down(struct cs42l81 *cs)
+ 				       val & CS42L81_INT_STATUS2_PDN_DONE,
+ 				       CS42L81_PDN_POLL_US,
+ 				       CS42L81_PDN_TIMEOUT_US);
++	mutex_unlock(&cs->status_lock);
+ 	if (ret)
+ 		dev_warn(cs->dev, "timed out waiting for codec shutdown\n");
+ 
+@@ -419,6 +702,15 @@ static int cs42l81_spk_event(struct snd_soc_dapm_widget *w,
+ 
+ 	switch (event) {
+ 	case SND_SOC_DAPM_PRE_PMU:
++		/*
++		 * iOS never drives speakers and headphones together (it mutes
++		 * the speakers when the headphones take the volume); the jack
++		 * pins keep the two exclusive, this only guards a manual mix.
++		 */
++		if (cs->hp_on) {
++			dev_warn(cs->dev, "headphones active, speakers stay off\n");
++			break;
++		}
+ 		gpiod_set_value_cansleep(cs->mute_gpio, 1);
+ 		regmap_update_bits(map, CS42L81_SPK_MODE, CS42L81_SPK_MODE_MASK,
+ 				   cs->spk_mode == 2 ? 0 : 0x10);
+@@ -435,9 +727,12 @@ static int cs42l81_spk_event(struct snd_soc_dapm_widget *w,
+ 		msleep((cs->spk_vol + 27) / 2);
+ 		break;
+ 	case SND_SOC_DAPM_POST_PMU:
+-		gpiod_set_value_cansleep(cs->mute_gpio, 0);
++		if (cs->spk_on)
++			gpiod_set_value_cansleep(cs->mute_gpio, 0);
+ 		break;
+ 	case SND_SOC_DAPM_PRE_PMD:
++		if (!cs->spk_on)
++			break;
+ 		gpiod_set_value_cansleep(cs->mute_gpio, 1);
+ 		cs->spk_on = false;
+ 		regmap_write(map, CS42L81_SPK_VOL_A, CS42L81_VOL_MUTE);
+@@ -450,6 +745,83 @@ static int cs42l81_spk_event(struct snd_soc_dapm_widget *w,
+ 	return 0;
+ }
+ 
++/* iOS updateRouting: speaker route -> headphone route, and back */
++static int cs42l81_hp_event(struct snd_soc_dapm_widget *w,
++			    struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *component =
++		snd_soc_dapm_to_component(w->dapm);
++	struct cs42l81 *cs = snd_soc_component_get_drvdata(component);
++	struct regmap *map = cs->regmap;
++	unsigned int pdn = CS42L81_SPK_PDN_A | CS42L81_SPK_PDN_B, old = pdn;
++
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		if (cs->spk_on) {
++			dev_warn(cs->dev, "speakers active, headphones stay off\n");
++			break;
++		}
++		gpiod_set_value_cansleep(cs->mute_gpio, 1);
++		regmap_write(map, CS42L81_OUT_CTL, 0xe0);
++		/* HP driver on, line driver off */
++		regmap_update_bits(map, CS42L81_DRV_PDN,
++				   CS42L81_DRV_PDN_HP | CS42L81_DRV_PDN_LINE,
++				   CS42L81_DRV_PDN_LINE);
++		/* speakers off; iOS drops OUT_CTL bit 5 around the change */
++		regmap_read(map, CS42L81_SPK_PDN, &old);
++		if (~old & pdn) {
++			regmap_write(map, CS42L81_OUT_CTL, 0xc0);
++			regmap_update_bits(map, CS42L81_SPK_PDN, pdn, pdn);
++			regmap_write(map, CS42L81_OUT_CTL, 0xe0);
++			msleep(20);
++		}
++		cs->hp_on = true;
++		cs->hp_settled = false;
++		cs42l81_apply_hp_volume(cs);	/* at most -9 dB, pump off */
++		msleep(60);
++		cs->hp_settled = true;
++		cs42l81_apply_hp_volume(cs);
++		break;
++	case SND_SOC_DAPM_PRE_PMD:
++		if (!cs->hp_on)
++			break;
++		cs->hp_on = false;
++		cs->hp_settled = false;
++		regmap_write(map, CS42L81_LINE_VOL_A, CS42L81_HP_MUTE);
++		regmap_write(map, CS42L81_HP_VOL_A, CS42L81_HP_MUTE);
++		regmap_write(map, CS42L81_SPK_VOL_A, CS42L81_VOL_MUTE);
++		regmap_write(map, CS42L81_SPK_VOL_B, CS42L81_VOL_MUTE);
++		regmap_update_bits(map, CS42L81_DRV_PDN,
++				   CS42L81_DRV_PDN_HP | CS42L81_DRV_PDN_LINE,
++				   CS42L81_DRV_PDN_HP | CS42L81_DRV_PDN_LINE);
++		msleep(20);
++		if (cs->hp_cp_on)
++			cs42l81_hp_cp_off(cs);
++		break;
++	}
++
++	return 0;
++}
++
++static int cs42l81_adc_event(struct snd_soc_dapm_widget *w,
++			     struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *component =
++		snd_soc_dapm_to_component(w->dapm);
++	struct cs42l81 *cs = snd_soc_component_get_drvdata(component);
++
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		cs42l81_capture_power_up(cs);
++		break;
++	case SND_SOC_DAPM_POST_PMD:
++		cs42l81_capture_power_down(cs);
++		break;
++	}
++
++	return 0;
++}
++
+ /* --- controls ------------------------------------------------------------- */
+ 
+ /* 0.5 dB steps; control 0 = -102 dB. Max is limited by spkr-gain-db. */
+@@ -522,6 +894,67 @@ static int cs42l81_spk_sw_put(struct snd_kcontrol *kcontrol,
+ 	return 1;
+ }
+ 
++/* Headphone and capture controls: the soc_mixer_control reg is the field */
++enum {
++	CS42L81_CTL_HP_VOL,
++	CS42L81_CTL_HP_SW,
++	CS42L81_CTL_ADC_VOL,
++	CS42L81_CTL_ADC_SW,
++};
++
++static unsigned int *cs42l81_ctl_field(struct cs42l81 *cs, unsigned int id)
++{
++	switch (id) {
++	case CS42L81_CTL_HP_VOL:
++		return &cs->hp_vol;
++	case CS42L81_CTL_HP_SW:
++		return &cs->hp_switch;
++	case CS42L81_CTL_ADC_VOL:
++		return &cs->adc_vol;
++	default:
++		return &cs->adc_switch;
++	}
++}
++
++static int cs42l81_ctl_get(struct snd_kcontrol *kcontrol,
++			   struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
++	struct cs42l81 *cs = snd_soc_component_get_drvdata(component);
++	struct soc_mixer_control *mc =
++		(struct soc_mixer_control *)kcontrol->private_value;
++
++	ucontrol->value.integer.value[0] = *cs42l81_ctl_field(cs, mc->reg);
++	return 0;
++}
++
++static int cs42l81_ctl_put(struct snd_kcontrol *kcontrol,
++			   struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
++	struct cs42l81 *cs = snd_soc_component_get_drvdata(component);
++	struct soc_mixer_control *mc =
++		(struct soc_mixer_control *)kcontrol->private_value;
++	unsigned int *field = cs42l81_ctl_field(cs, mc->reg);
++	long v = ucontrol->value.integer.value[0];
++
++	if (v < 0 || v > mc->max)
++		return -EINVAL;
++	if (v == *field)
++		return 0;
++
++	*field = v;
++	if (mc->reg == CS42L81_CTL_HP_VOL || mc->reg == CS42L81_CTL_HP_SW)
++		cs42l81_apply_hp_volume(cs);
++	else if (cs->adc_on)
++		cs42l81_apply_adc_volume(cs);
++	return 1;
++}
++
++/* HP: 0.5 dB steps from -50 dB. Capture: 1 dB steps from -96 dB (inferred) */
++static const DECLARE_TLV_DB_SCALE(cs42l81_hp_tlv, -5000, 50, 0);
++static const DECLARE_TLV_DB_SCALE(cs42l81_adc_tlv, -9600, 100, 0);
++
+ static const struct snd_kcontrol_new cs42l81_controls[] = {
+ 	{
+ 		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+@@ -535,6 +968,16 @@ static const struct snd_kcontrol_new cs42l81_controls[] = {
+ 	},
+ 	SOC_SINGLE_BOOL_EXT("Speaker Playback Switch", 0,
+ 			    cs42l81_spk_sw_get, cs42l81_spk_sw_put),
++	SOC_SINGLE_EXT_TLV("Headphone Playback Volume", CS42L81_CTL_HP_VOL, 0,
++			   CS42L81_HP_VOL_MAX, 0, cs42l81_ctl_get,
++			   cs42l81_ctl_put, cs42l81_hp_tlv),
++	SOC_SINGLE_EXT("Headphone Playback Switch", CS42L81_CTL_HP_SW, 0, 1, 0,
++		       cs42l81_ctl_get, cs42l81_ctl_put),
++	SOC_SINGLE_EXT_TLV("Capture Volume", CS42L81_CTL_ADC_VOL, 0,
++			   CS42L81_ADC_VOL_MAX, 0, cs42l81_ctl_get,
++			   cs42l81_ctl_put, cs42l81_adc_tlv),
++	SOC_SINGLE_EXT("Capture Switch", CS42L81_CTL_ADC_SW, 0, 1, 0,
++		       cs42l81_ctl_get, cs42l81_ctl_put),
+ };
+ 
+ static const struct snd_soc_dapm_widget cs42l81_widgets[] = {
+@@ -545,13 +988,31 @@ static const struct snd_soc_dapm_widget cs42l81_widgets[] = {
+ 			       cs42l81_spk_event,
+ 			       SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMU |
+ 			       SND_SOC_DAPM_PRE_PMD),
++	SND_SOC_DAPM_OUT_DRV_E("HP Amp", SND_SOC_NOPM, 0, 0, NULL, 0,
++			       cs42l81_hp_event,
++			       SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_PRE_PMD),
+ 	SND_SOC_DAPM_OUTPUT("SPKOUT"),
++	SND_SOC_DAPM_OUTPUT("HPOUT"),
++
++	/* the two built-in DMICs (ADT dmic1a-intmic, dmic1b-intmic) */
++	SND_SOC_DAPM_INPUT("DMIC1A"),
++	SND_SOC_DAPM_INPUT("DMIC1B"),
++	SND_SOC_DAPM_ADC_E("ADC", NULL, SND_SOC_NOPM, 0, 0, cs42l81_adc_event,
++			   SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
++	SND_SOC_DAPM_AIF_OUT("ASPTX", "ASP Capture", 0, SND_SOC_NOPM, 0, 0),
+ };
+ 
+ static const struct snd_soc_dapm_route cs42l81_routes[] = {
+ 	{ "ASPRX", NULL, "Core" },
+ 	{ "Speaker Amp", NULL, "ASPRX" },
+ 	{ "SPKOUT", NULL, "Speaker Amp" },
++	{ "HP Amp", NULL, "ASPRX" },
++	{ "HPOUT", NULL, "HP Amp" },
++
++	{ "ADC", NULL, "Core" },
++	{ "ADC", NULL, "DMIC1A" },
++	{ "ADC", NULL, "DMIC1B" },
++	{ "ASPTX", NULL, "ADC" },
+ };
+ 
+ /* --- DAI ------------------------------------------------------------------ */
+@@ -593,6 +1054,10 @@ static int cs42l81_hw_params(struct snd_pcm_substream *substream,
+ 		cs42l81_set_rate(cs);
+ 		cs42l81_set_asp(cs);
+ 	}
++	if (cs->adc_on) {
++		cs42l81_set_asp_tx(cs);
++		regmap_write(cs->regmap, CS42L81_DMIC1_CTL, cs42l81_dmic_ctl(cs));
++	}
+ 	return 0;
+ }
+ 
+@@ -613,10 +1078,173 @@ static struct snd_soc_dai_driver cs42l81_dai = {
+ 			 SNDRV_PCM_RATE_48000,
+ 		.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S32_LE,
+ 	},
++	.capture = {
++		.stream_name = "ASP Capture",
++		.channels_min = 2,
++		.channels_max = 2,
++		.rates = SNDRV_PCM_RATE_8000 | SNDRV_PCM_RATE_11025 |
++			 SNDRV_PCM_RATE_16000 | SNDRV_PCM_RATE_22050 |
++			 SNDRV_PCM_RATE_32000 | SNDRV_PCM_RATE_44100 |
++			 SNDRV_PCM_RATE_48000,
++		.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S32_LE,
++	},
+ 	.ops = &cs42l81_dai_ops,
++	/* one ASP clock and one slot width for both directions */
++	.symmetric_rate = 1,
++	.symmetric_sample_bits = 1,
+ };
+ 
++/* --- headphone jack -------------------------------------------------------- */
++
++/*
++ * A plug moves playback from SPKOUT to HPOUT. The pins are switched here,
++ * not as jack pins, because snd_soc_jack_add_pins() would add a "<pin>
++ * Jack" control per pin; userspace looks for "Headphone Jack".
++ */
++static void cs42l81_jack_report(struct cs42l81 *cs, bool plugged)
++{
++	struct snd_soc_dapm_context *dapm =
++		snd_soc_component_to_dapm(cs->component);
++
++	cs->jack_state = plugged;
++	dev_info(cs->dev, "headphones %s\n", plugged ? "plugged" : "unplugged");
++	if (plugged) {
++		snd_soc_dapm_disable_pin(dapm, "SPKOUT");
++		snd_soc_dapm_enable_pin(dapm, "HPOUT");
++	} else {
++		snd_soc_dapm_disable_pin(dapm, "HPOUT");
++		snd_soc_dapm_enable_pin(dapm, "SPKOUT");
++	}
++	snd_soc_dapm_sync(dapm);
++	snd_soc_jack_report(&cs->jack, plugged ? SND_JACK_HEADPHONE : 0,
++			    SND_JACK_HEADPHONE);
++}
++
++/* hs-switch lines (ADT function-ext_sw1/2) are only read, never driven */
++static int cs42l81_hs_switch_str(struct cs42l81 *cs, char *buf, size_t len)
++{
++	unsigned int i;
++	int n = 0;
++
++	for (i = 0; cs->hs_switch && i < cs->hs_switch->ndescs; i++) {
++		struct gpio_desc *d = cs->hs_switch->desc[i];
++
++		n += scnprintf(buf + n, len - n, " ext_sw%u %s=%d", i + 1,
++			       gpiod_get_direction(d) ? "in" : "out",
++			       gpiod_get_raw_value_cansleep(d));
++	}
++	if (!n && len)
++		buf[0] = '\0';
++	return n;
++}
++
++/*
++ * Survey (test T1): log every change of the latched status registers with
++ * the hs-switch levels. With jack_reg/jack_mask set, also debounce that bit
++ * and report it through the jack, whose pins switch HPOUT and SPKOUT.
++ */
++static void cs42l81_jack_work(struct work_struct *work)
++{
++	struct cs42l81 *cs = container_of(to_delayed_work(work),
++					  struct cs42l81, jack_work);
++	unsigned int period = READ_ONCE(jack_poll_ms);
++	unsigned int reg = READ_ONCE(jack_reg), mask = READ_ONCE(jack_mask);
++	unsigned int i, val, det = 0;
++	bool have_det = false, plugged, rearm;
++	char sw[64];
++
++	if (!period)
++		return;
++
++	mutex_lock(&cs->status_lock);
++	for (i = 0; i < ARRAY_SIZE(cs42l81_status_regs); i++) {
++		if (regmap_read(cs->regmap, cs42l81_status_regs[i], &val))
++			continue;
++		cs->status_seen[i] |= val;
++		if (val != cs->status_last[i]) {
++			cs42l81_hs_switch_str(cs, sw, sizeof(sw));
++			dev_info_ratelimited(cs->dev,
++					     "status %04x: %02x -> %02x%s\n",
++					     cs42l81_status_regs[i],
++					     cs->status_last[i], val, sw);
++			cs->status_last[i] = val;
++		}
++		if (cs42l81_status_regs[i] == reg) {
++			det = val;
++			have_det = true;
++		}
++	}
++	mutex_unlock(&cs->status_lock);
++
++	/* reports take the DAPM mutex: never under status_lock */
++	mutex_lock(&cs->jack_lock);
++	if (cs->jack_ready && have_det && mask && cs->jack_forced < 0) {
++		plugged = !!(det & mask) ^ READ_ONCE(jack_invert);
++		if (plugged != cs->jack_pending) {
++			cs->jack_pending = plugged;
++			cs->jack_stable = 1;
++		} else if (cs->jack_stable < CS42L81_JACK_DEBOUNCE) {
++			cs->jack_stable++;
++		}
++		if (cs->jack_stable >= CS42L81_JACK_DEBOUNCE &&
++		    plugged != cs->jack_state)
++			cs42l81_jack_report(cs, plugged);
++	}
++	/* component remove clears jack_ready, then cancels: no requeue after */
++	rearm = cs->jack_ready;
++	mutex_unlock(&cs->jack_lock);
++
++	if (rearm)
++		schedule_delayed_work(&cs->jack_work,
++				      msecs_to_jiffies(max(period,
++							   CS42L81_JACK_POLL_MIN_MS)));
++}
++
++static int cs42l81_component_probe(struct snd_soc_component *component)
++{
++	struct cs42l81 *cs = snd_soc_component_get_drvdata(component);
++	int ret;
++
++	cs->component = component;
++	ret = snd_soc_card_jack_new(component->card, "Headphone Jack",
++				    SND_JACK_HEADPHONE, &cs->jack);
++	if (ret)
++		return dev_err_probe(cs->dev, ret, "cannot create jack\n");
++
++	/*
++	 * Until something reports a plug (the poll, once test T1 names the
++	 * bit, or debugfs cs42l81-jack) the speakers stay selected.
++	 */
++	ret = snd_soc_dapm_disable_pin(snd_soc_component_to_dapm(component),
++				       "HPOUT");
++	if (ret)
++		dev_warn(cs->dev, "cannot deselect the headphones: %d\n", ret);
++
++	mutex_lock(&cs->jack_lock);
++	cs->jack_state = false;
++	cs->jack_pending = false;
++	cs->jack_stable = 0;
++	cs->jack_forced = -1;
++	cs->jack_ready = true;
++	mutex_unlock(&cs->jack_lock);
++	if (READ_ONCE(jack_poll_ms))
++		schedule_delayed_work(&cs->jack_work, 0);
++	return 0;
++}
++
++static void cs42l81_component_remove(struct snd_soc_component *component)
++{
++	struct cs42l81 *cs = snd_soc_component_get_drvdata(component);
++
++	mutex_lock(&cs->jack_lock);
++	cs->jack_ready = false;
++	mutex_unlock(&cs->jack_lock);
++	cancel_delayed_work_sync(&cs->jack_work);
++}
++
+ static const struct snd_soc_component_driver cs42l81_component = {
++	.probe = cs42l81_component_probe,
++	.remove = cs42l81_component_remove,
+ 	.controls = cs42l81_controls,
+ 	.num_controls = ARRAY_SIZE(cs42l81_controls),
+ 	.dapm_widgets = cs42l81_widgets,
+@@ -628,15 +1256,20 @@ static const struct snd_soc_component_driver cs42l81_component = {
+ 
+ /* --- debugfs (bring-up) ---------------------------------------------------- */
+ 
+-/* every register the driver touches, plus the latched status registers */
++/*
++ * Every register the driver touches, plus the latched status registers
++ * (0x002e, 0x002f, 0x0033, 0x007b, 0x007c, 0x0106, 0x0528: read to clear).
++ */
+ static const u16 cs42l81_dbg_regs[] = {
+ 	0x0001, 0x0002, 0x0003, 0x0005, 0x0006, 0x0007, 0x000d, 0x000e,
+-	0x000f, 0x0011, 0x0012, 0x0022, 0x0023, 0x002e, 0x002f, 0x0033,
+-	0x007b, 0x007c, 0x0106, 0x0123, 0x0129, 0x012e, 0x012f, 0x0131,
+-	0x0201, 0x0203, 0x0204, 0x0205, 0x020f, 0x0210, 0x0211, 0x0219,
+-	0x0220, 0x0221, 0x0222, 0x0223, 0x0224, 0x0225, 0x0226, 0x0227,
+-	0x0229, 0x022e, 0x022f, 0x0230, 0x0231, 0x0232, 0x0528, 0x9901,
+-	0xc81f, 0xc85f, 0xc96f,
++	0x000f, 0x0011, 0x0012, 0x0014, 0x0015, 0x0016, 0x001e, 0x001f,
++	0x0020, 0x0021, 0x0022, 0x0023, 0x002e, 0x002f, 0x0033, 0x007b,
++	0x007c, 0x0106, 0x0115, 0x0116, 0x011f, 0x0120, 0x0123, 0x0124,
++	0x0129, 0x012e, 0x012f, 0x0131, 0x0201, 0x0203, 0x0204, 0x0205,
++	0x0206, 0x0207, 0x0208, 0x020f, 0x0210, 0x0211, 0x0212, 0x0215,
++	0x0216, 0x0219, 0x0220, 0x0221, 0x0222, 0x0223, 0x0224, 0x0225,
++	0x0226, 0x0227, 0x0228, 0x0229, 0x022e, 0x022f, 0x0230, 0x0231,
++	0x0232, 0x0528, 0x9901, 0xc81f, 0xc85f, 0xc96f,
+ };
+ 
+ static int cs42l81_regs_show(struct seq_file *s, void *unused)
+@@ -644,18 +1277,112 @@ static int cs42l81_regs_show(struct seq_file *s, void *unused)
+ 	struct cs42l81 *cs = dev_get_drvdata(s->private);
+ 	unsigned int i, val;
+ 
+-	seq_printf(s, "core_on %d spk_on %d clk_provider %d rate %#x slot %u\n",
+-		   cs->core_on, cs->spk_on, cs->clk_provider, cs->rate_code,
+-		   cs->slot_bytes);
++	seq_printf(s, "core_on %d spk_on %d hp_on %d (cp %d) adc_on %d clk_provider %d rate %#x slot %u\n",
++		   cs->core_on, cs->spk_on, cs->hp_on, cs->hp_cp_on, cs->adc_on,
++		   cs->clk_provider, cs->rate_code, cs->slot_bytes);
++	mutex_lock(&cs->status_lock);
+ 	for (i = 0; i < ARRAY_SIZE(cs42l81_dbg_regs); i++) {
+ 		if (regmap_read(cs->regmap, cs42l81_dbg_regs[i], &val))
+ 			seq_printf(s, "%04x = (err)\n", cs42l81_dbg_regs[i]);
+ 		else
+ 			seq_printf(s, "%04x = %02x\n", cs42l81_dbg_regs[i], val);
+ 	}
++	mutex_unlock(&cs->status_lock);
++	return 0;
++}
++
++/*
++ * cs42l81-jack. Read: poll settings, jack state, the OR of every status
++ * value the poll has seen (cleared by the read) and the hs-switch levels.
++ * Write: "1"/"0" force a plug/unplug report (tests T3/T4 before the status
++ * bit is known), "auto" returns to the poll, "poll" restarts the poll after
++ * jack_poll_ms changed.
++ */
++static int cs42l81_jack_show(struct seq_file *s, void *unused)
++{
++	struct cs42l81 *cs = s->private;
++	unsigned int i;
++	char sw[64];
++
++	seq_printf(s, "poll %u ms, reg %#x mask %#x invert %d\n",
++		   READ_ONCE(jack_poll_ms), READ_ONCE(jack_reg),
++		   READ_ONCE(jack_mask), READ_ONCE(jack_invert));
++	mutex_lock(&cs->jack_lock);
++	seq_printf(s, "jack %s, reported %s\n",
++		   !cs->jack_ready ? "not created" :
++		   cs->jack_forced < 0 ? "auto" :
++		   cs->jack_forced ? "forced plugged" : "forced unplugged",
++		   cs->jack_state ? "plugged" : "unplugged");
++	mutex_unlock(&cs->jack_lock);
++
++	mutex_lock(&cs->status_lock);
++	seq_puts(s, "seen:");
++	for (i = 0; i < ARRAY_SIZE(cs42l81_status_regs); i++) {
++		seq_printf(s, " %04x=%02x", cs42l81_status_regs[i],
++			   cs->status_seen[i]);
++		cs->status_seen[i] = 0;
++	}
++	mutex_unlock(&cs->status_lock);
++
++	cs42l81_hs_switch_str(cs, sw, sizeof(sw));
++	seq_printf(s, "\nhs-switch:%s\n", sw[0] ? sw : " (none)");
+ 	return 0;
+ }
+ 
++static int cs42l81_jack_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, cs42l81_jack_show, inode->i_private);
++}
++
++static ssize_t cs42l81_jack_write(struct file *f, const char __user *ubuf,
++				  size_t len, loff_t *ppos)
++{
++	struct cs42l81 *cs = ((struct seq_file *)f->private_data)->private;
++	char buf[16] = {}, *cmd;
++	int forced;
++
++	if (len >= sizeof(buf))
++		return -EINVAL;
++	if (copy_from_user(buf, ubuf, len))
++		return -EFAULT;
++	cmd = strim(buf);
++
++	if (!strcmp(cmd, "1") || !strcmp(cmd, "plug"))
++		forced = 1;
++	else if (!strcmp(cmd, "0") || !strcmp(cmd, "unplug"))
++		forced = 0;
++	else if (!strcmp(cmd, "auto"))
++		forced = -1;
++	else if (!strcmp(cmd, "poll"))
++		forced = -2;	/* only restart the poll */
++	else
++		return -EINVAL;
++
++	mutex_lock(&cs->jack_lock);
++	if (!cs->jack_ready) {
++		mutex_unlock(&cs->jack_lock);
++		return -ENODEV;
++	}
++	if (forced != -2) {
++		cs->jack_forced = forced;
++		cs->jack_stable = 0;
++		if (forced >= 0 && forced != cs->jack_state)
++			cs42l81_jack_report(cs, forced);
++	}
++	if (READ_ONCE(jack_poll_ms))
++		mod_delayed_work(system_wq, &cs->jack_work, 0);
++	mutex_unlock(&cs->jack_lock);
++	return len;
++}
++
++static const struct file_operations cs42l81_jack_fops = {
++	.open = cs42l81_jack_open,
++	.read = seq_read,
++	.write = cs42l81_jack_write,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
+ /* write "REG" to select, "REG VAL" to write; read prints the selection */
+ static ssize_t cs42l81_reg_write(struct file *f, const char __user *ubuf,
+ 				 size_t len, loff_t *ppos)
+@@ -701,6 +1428,18 @@ static const struct file_operations cs42l81_reg_fops = {
+ 
+ /* --- probe ---------------------------------------------------------------- */
+ 
++static void cs42l81_debugfs_remove(void *dentry)
++{
++	debugfs_remove(dentry);
++}
++
++static void cs42l81_cancel_jack_work(void *data)
++{
++	struct cs42l81 *cs = data;
++
++	cancel_delayed_work_sync(&cs->jack_work);
++}
++
+ static int cs42l81_check_id(struct cs42l81 *cs)
+ {
+ 	unsigned int id[3] = {}, rev = 0;
+@@ -752,6 +1491,18 @@ static int cs42l81_spi_probe(struct spi_device *spi)
+ 		return -ENOMEM;
+ 	spi_set_drvdata(spi, cs);
+ 
++	ret = devm_mutex_init(dev, &cs->status_lock);
++	if (ret)
++		return ret;
++	ret = devm_mutex_init(dev, &cs->jack_lock);
++	if (ret)
++		return ret;
++	INIT_DELAYED_WORK(&cs->jack_work, cs42l81_jack_work);
++	ret = devm_add_action(dev, cs42l81_cancel_jack_work, cs);
++	if (ret)
++		return ret;
++	cs->jack_forced = -1;
++
+ 	cs->regmap = devm_regmap_init(dev, &cs42l81_bus, cs, &cs42l81_regmap);
+ 	if (IS_ERR(cs->regmap))
+ 		return dev_err_probe(dev, PTR_ERR(cs->regmap), "regmap init failed\n");
+@@ -766,6 +1517,20 @@ static int cs42l81_spi_probe(struct spi_device *spi)
+ 		return dev_err_probe(dev, PTR_ERR(cs->mute_gpio),
+ 				     "failed to get mute GPIO\n");
+ 
++	/*
++	 * Headset switch lines: their direction is not known (iOS may drive
++	 * them), so take them as they are and only read them for the jack log.
++	 * GPIOD_ASIS does not touch the pad.
++	 */
++	cs->hs_switch = devm_gpiod_get_array_optional(dev, "hs-switch",
++						      GPIOD_ASIS);
++	if (IS_ERR(cs->hs_switch)) {
++		if (PTR_ERR(cs->hs_switch) == -EPROBE_DEFER)
++			return -EPROBE_DEFER;
++		dev_warn(dev, "hs-switch GPIOs unavailable: %pe\n", cs->hs_switch);
++		cs->hs_switch = NULL;
++	}
++
+ 	cs->spk_mode = 2;
+ 	of_property_read_u32(dev->of_node, "apple,speaker-mode", &cs->spk_mode);
+ 
+@@ -788,13 +1553,28 @@ static int cs42l81_spi_probe(struct spi_device *spi)
+ 	cs->clk_provider = true;
+ 	cs->rate_code = 0xc;
+ 	cs->slot_bytes = 2;
++	cs->hp_vol = CS42L81_HP_VOL_DEFAULT;
++	cs->hp_switch = 1;
++	cs->adc_vol = CS42L81_ADC_VOL_0DB;
++	cs->adc_switch = 1;
+ 
+ 	ret = cs42l81_check_id(cs);
+ 	if (ret)
+ 		return ret;
+ 
+ 	debugfs_create_devm_seqfile(dev, "cs42l81-regs", NULL, cs42l81_regs_show);
+-	debugfs_create_file("cs42l81-reg", 0600, NULL, cs, &cs42l81_reg_fops);
++	ret = devm_add_action_or_reset(dev, cs42l81_debugfs_remove,
++				       debugfs_create_file("cs42l81-reg", 0600,
++							   NULL, cs,
++							   &cs42l81_reg_fops));
++	if (ret)
++		return ret;
++	ret = devm_add_action_or_reset(dev, cs42l81_debugfs_remove,
++				       debugfs_create_file("cs42l81-jack", 0600,
++							   NULL, cs,
++							   &cs42l81_jack_fops));
++	if (ret)
++		return ret;
+ 
+ 	return devm_snd_soc_register_component(dev, &cs42l81_component,
+ 					       &cs42l81_dai, 1);
+-- 
+2.56.0
+

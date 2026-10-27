@@ -1,0 +1,878 @@
+From 5afd1e091d5a9dad905f776b0c7bd1faa81d0f80 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 17:53:23 +0000
+Subject: [PATCH 2/2] nvme/apple-ans: add iOS warm handoff modes and a pre-root
+ health gate
+
+Preserve a SHST-certified enabled controller for handoff, or pair port teardown with complete DART/NVMMU reactivation. Retain the Round 7 PCIe/NVMe sequence as a selectable control. Read NSID 1 MBR/GPT and root data through the normal queue before publishing disks, record failures before teardown, and allow one alternate-mode recovery. Keep DMA blocked until stopped-controller translation setup completes.
+---
+ drivers/nvme/host/pci-apple-ans.c       |  51 +++-
+ drivers/nvme/host/pci-internal.h        |   7 +-
+ drivers/nvme/host/pci.c                 | 184 ++++++++++++-
+ drivers/pci/controller/pcie-apple-h9p.c | 346 +++++++++++++++++++++++-
+ 4 files changed, 571 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/nvme/host/pci-apple-ans.c b/drivers/nvme/host/pci-apple-ans.c
+index 8c543b932e..cb586378f2 100644
+--- a/drivers/nvme/host/pci-apple-ans.c
++++ b/drivers/nvme/host/pci-apple-ans.c
+@@ -554,6 +554,11 @@ static int nvme_pci_apple_ans_preinit(struct nvme_dev *dev)
+ 				     csts);
+ 	}
+ 	dev_info(dev->dev, "Apple ANS: controller stopped (CSTS=%#x), rebuilding DMA\n", csts);
++	if (apple_ans_boot_mode(dev->dev) != APPLE_ANS_ROUND7) {
++		ret = apple_ans_dart_set_active(dev->dev, true);
++		if (ret)
++			return ret;
++	}
+ 	ret = nvme_pci_apple_ans_reset_dma(dev);
+ 	if (ret)
+ 		return dev_err_probe(dev->dev, ret,
+@@ -827,7 +832,7 @@ static int nvme_pci_apple_ans_read_csts(struct nvme_dev *dev, u32 *csts)
+  * Finish the standard controller reset while its old DART/NVMMU mappings
+  * still exist. SHN alone leaves EN set and is insufficient for kexec.
+  */
+-static void nvme_pci_apple_ans_shutdown(struct nvme_dev *dev, int shutdown_ret)
++static void nvme_pci_apple_ans_shutdown_round7(struct nvme_dev *dev, int shutdown_ret)
+ {
+ 	struct apple_ans_nvme *ans = nvme_pci_apple_ans(dev);
+ 	struct pci_dev *pdev = to_pci_dev(dev->dev);
+@@ -854,6 +859,34 @@ static void nvme_pci_apple_ans_shutdown(struct nvme_dev *dev, int shutdown_ret)
+ 	pci_clear_master(pdev);
+ }
+ 
++static void nvme_pci_apple_ans_shutdown(struct nvme_dev *dev, int shutdown_ret)
++{
++	enum apple_ans_boot_mode mode = apple_ans_boot_mode(dev->dev);
++	u32 csts = ~0U;
++	int ret;
++
++	if (mode == APPLE_ANS_ROUND7) {
++		nvme_pci_apple_ans_shutdown_round7(dev, shutdown_ret);
++		return;
++	}
++	ret = nvme_pci_apple_ans_read_csts(dev, &csts);
++	if (shutdown_ret || ret || (csts & NVME_CSTS_SHST_MASK) != NVME_CSTS_SHST_CMPLT) {
++		apple_ans_host_dump(dev->dev, "SHST failed; refusing kexec");
++		panic("Apple ANS: SHN failed %d/%d CSTS %#x; refusing unsafe handoff",
++		      shutdown_ret, ret, csts);
++	}
++	/* SHN completion is the gate: leave CC.EN and all translation state.
++	 * PCI core blocks BME later too. No endpoint MMIO after this point.
++	 */
++	pci_clear_master(to_pci_dev(dev->dev));
++	if (mode == APPLE_ANS_FULL_CYCLE) {
++		ret = apple_ans_dart_set_active(dev->dev, false);
++		if (ret)
++			panic("Apple ANS: DART inactive failed %d; refusing kexec", ret);
++	}
++	dev_info(dev->dev, "Apple ANS: SHST complete; CC.EN retained mode %u\n", mode);
++}
++
+ static blk_status_t nvme_pci_apple_ans_alloc_req(struct nvme_dev *dev,
+ 						 struct apple_ans_nvme_req **req,
+ 						 unsigned int *tag)
+@@ -1104,3 +1137,19 @@ const struct nvme_pci_dma_ops nvme_pci_apple_ans_ops = {
+ 	.queue_depth	= nvme_pci_apple_ans_queue_depth,
+ 	.max_hw_sectors = nvme_pci_apple_ans_max_hw_sectors,
+ };
++
++/* Old queues are synchronized, BME is blocked; no BAR access until rearmed. */
++int nvme_pci_apple_ans_recover(struct nvme_dev *dev)
++{
++	struct apple_ans_nvme *ans = nvme_pci_apple_ans(dev);
++	int ret = apple_ans_restart_port(dev->dev);
++
++	if (ret)
++		return ret;
++	pci_restore_state(to_pci_dev(dev->dev));
++	ans->host_fault = false;
++	ans->cc_base_valid = false;
++	ans->cc_written = false;
++	ans->dart_fault_logged = false;
++	return 0;
++}
+diff --git a/drivers/nvme/host/pci-internal.h b/drivers/nvme/host/pci-internal.h
+index ba2cc4c700..9c63318eb5 100644
+--- a/drivers/nvme/host/pci-internal.h
++++ b/drivers/nvme/host/pci-internal.h
+@@ -84,7 +84,11 @@ struct nvme_dev {
+ 	struct nvme_ctrl ctrl;
+ 	u32 last_ps;
+ 	bool hmb;
+-	unsigned long apple_ans_flags; /* bit 0: one automatic timeout reset used */
++	unsigned long apple_ans_flags;
++#define ANS_RECOVERY_USED	0
++#define ANS_HEALTH_ACTIVE	1
++#define ANS_RECOVERY_PENDING	2
++#define ANS_HEALTH_FAILED	3
+ 	struct sg_table *hmb_sgt;
+ 	mempool_t *dmavec_mempool;
+ 	const struct nvme_pci_dma_ops *dma_ops;
+@@ -205,5 +209,6 @@ extern const struct nvme_pci_dma_ops nvme_pci_apple_ans_ops;
+ bool nvme_pci_apple_ans_match(struct pci_dev *pdev);
+ bool nvme_pci_apple_ans_probe_allowed(struct pci_dev *pdev);
+ void nvme_pci_apple_ans_log_msi(struct nvme_dev *dev);
++int nvme_pci_apple_ans_recover(struct nvme_dev *dev);
+ 
+ #endif /* _NVME_PCI_INTERNAL_H */
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 64aea16dd3..f9d5d74d81 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <linux/acpi.h>
++#include <linux/console.h>
+ #include <linux/apple-ans.h>
+ #include <linux/async.h>
+ #include <linux/blkdev.h>
+@@ -2010,6 +2011,103 @@ static void nvme_apple_ans_dump(struct nvme_dev *dev, const char *reason)
+ 	}
+ }
+ 
++/* Five seconds per command, NOWAIT tag allocation, no retry/abort loop.
++ * The timeout callback blocks DMA and cancels requests before the buffers can
++ * be freed. This runs in reset_work before nvme_start_ctrl publishes disks.
++ */
++static int nvme_apple_ans_health_cmd(struct request_queue *q,
++				     struct nvme_command *cmd, void *buffer,
++				     unsigned int size)
++{
++	struct request *req;
++	int ret;
++
++	req = blk_mq_alloc_request(q, nvme_req_op(cmd), BLK_MQ_REQ_NOWAIT);
++	if (IS_ERR(req))
++		return PTR_ERR(req);
++	nvme_init_request(req, cmd);
++	req->timeout = 5 * HZ;
++	ret = blk_rq_map_kern(req, buffer, size, GFP_KERNEL);
++	if (!ret)
++		ret = nvme_execute_rq(req, false);
++	blk_mq_free_request(req);
++	return ret;
++}
++
++static int nvme_apple_ans_health(struct nvme_dev *dev)
++{
++	struct queue_limits lim = { .max_hw_sectors = 16, .max_segments = 1 };
++	struct nvme_command cmd = { };
++	struct request_queue *q;
++	struct nvme_id_ns *id;
++	void *buffer;
++	u64 data_lba;
++	u32 lbs;
++	u8 format;
++	int ret;
++
++	if (dev->online_queues < 2 || !dev->ctrl.tagset)
++		return -ENODEV;
++	id = kzalloc_obj(*id);
++	buffer = kzalloc(8192, GFP_KERNEL);
++	if (!id || !buffer) {
++		ret = -ENOMEM;
++		goto free;
++	}
++	set_bit(ANS_HEALTH_ACTIVE, &dev->apple_ans_flags);
++	cmd.identify.opcode = nvme_admin_identify;
++	cmd.identify.nsid = cpu_to_le32(1);
++	cmd.identify.cns = NVME_ID_CNS_NS;
++	ret = nvme_apple_ans_health_cmd(dev->ctrl.admin_q, &cmd, id, sizeof(*id));
++	if (ret)
++		goto done;
++	format = nvme_lbaf_index(id->flbas);
++	if (id->lbaf[format].ms || id->lbaf[format].ds < 9 ||
++	    id->lbaf[format].ds > 12) {
++		ret = -EINVAL;
++		goto done;
++	}
++	lbs = 1U << id->lbaf[format].ds;
++	lim.logical_block_size = lbs;
++	lim.physical_block_size = lbs;
++	q = blk_mq_alloc_queue(&dev->tagset, &lim, NULL);
++	if (IS_ERR(q)) {
++		ret = PTR_ERR(q);
++		goto done;
++	}
++	/* NSID 1 only. Read MBR/GPT, then a block inside the existing root
++	 * write window (or LBA 8 on read-only boots). Never send writes.
++	 */
++	data_lba = nvme_pci_write_window_active() && write_window.nsid == 1 ?
++		write_window.first : 8;
++	if (data_lba >= le64_to_cpu(id->nsze) ||
++	    4096 / lbs > le64_to_cpu(id->nsze) - data_lba) {
++		ret = -ERANGE;
++		goto destroy;
++	}
++	memset(&cmd, 0, sizeof(cmd));
++	cmd.rw.opcode = nvme_cmd_read;
++	cmd.rw.nsid = cpu_to_le32(1);
++	/* Both MBR and GPT header even with a native 4K logical block. */
++	cmd.rw.length = cpu_to_le16(8192 / lbs - 1);
++	ret = nvme_apple_ans_health_cmd(q, &cmd, buffer, 8192);
++	if (!ret) {
++		cmd.rw.slba = cpu_to_le64(data_lba);
++		cmd.rw.length = cpu_to_le16(4096 / lbs - 1);
++		ret = nvme_apple_ans_health_cmd(q, &cmd, buffer, 4096);
++	}
++destroy:
++	blk_mq_destroy_queue(q);
++	blk_put_queue(q);
++done:
++	clear_bit(ANS_HEALTH_ACTIVE, &dev->apple_ans_flags);
++free:
++	kfree(buffer);
++	kfree(id);
++	dev_info(dev->dev, "Apple ANS: health gate partition/data NSID 1 result %d\n", ret);
++	return ret;
++}
++
+ static enum blk_eh_timer_return nvme_timeout(struct request *req)
+ {
+ 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+@@ -2028,6 +2126,16 @@ static enum blk_eh_timer_return nvme_timeout(struct request *req)
+ 			 req->tag, nvme_cid(req), nvmeq->qid,
+ 			 nvme_req(req)->cmd->common.opcode);
+ 		nvme_apple_ans_dump(dev, "timeout before CSTS");
++		if (test_bit(ANS_HEALTH_ACTIVE, &dev->apple_ans_flags)) {
++			/* Evidence reaches console/netconsole before teardown. No
++			 * endpoint read or nested admin deletion on a failed gate.
++			 */
++			pr_flush(1000, false);
++			set_bit(ANS_HEALTH_FAILED, &dev->apple_ans_flags);
++			pci_clear_master(pdev);
++			nvme_dev_disable(dev, false);
++			return BLK_EH_DONE;
++		}
+ 		if (dev->ctrl.ops->reg_read32(&dev->ctrl, NVME_REG_CSTS, &csts))
+ 			goto disable;
+ 		dev_warn(dev->dev, "Apple ANS: timeout CSTS %#x tag %d qid %u\n",
+@@ -2117,6 +2225,8 @@ static enum blk_eh_timer_return nvme_timeout(struct request *req)
+ 			nvme_change_ctrl_state(&dev->ctrl, NVME_CTRL_DELETING);
+ 		} else {
+ 			dev_warn(dev->dev, "Apple ANS: first timeout; reset without admin abort\n");
++			if (apple_ans_boot_mode(dev->dev) != APPLE_ANS_ROUND7)
++				set_bit(ANS_RECOVERY_PENDING, &dev->apple_ans_flags);
+ 		}
+ 		goto disable;
+ 	}
+@@ -3428,7 +3538,9 @@ static int nvme_pci_enable(struct nvme_dev *dev)
+ 	if (pci_enable_device_mem(pdev))
+ 		return result;
+ 
+-	pci_set_master(pdev);
++	if (dev->dma_ops != &nvme_pci_apple_ans_ops ||
++	    apple_ans_boot_mode(dev->dev) == APPLE_ANS_ROUND7)
++		pci_set_master(pdev);
+ 
+ 	{
+ 		u32 csts;
+@@ -3498,6 +3610,7 @@ static int nvme_pci_enable(struct nvme_dev *dev)
+ 			goto free_irq;
+ 	}
+ 
++	pci_set_master(pdev);
+ 	nvme_map_cmb(dev);
+ 
+ 	pci_save_state(pdev);
+@@ -3526,6 +3639,9 @@ static bool nvme_pci_ctrl_is_dead(struct nvme_dev *dev)
+ 	struct pci_dev *pdev = to_pci_dev(dev->dev);
+ 	u32 csts;
+ 
++	if (test_bit(ANS_HEALTH_FAILED, &dev->apple_ans_flags))
++		return true;
++
+ 	if (!pci_is_enabled(pdev) || !pci_device_is_present(pdev))
+ 		return true;
+ 	if (pdev->error_state != pci_channel_io_normal)
+@@ -3545,6 +3661,10 @@ static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
+ 
+ 	mutex_lock(&dev->shutdown_lock);
+ 	dead = nvme_pci_ctrl_is_dead(dev);
++	if (dead && shutdown && kexec_in_progress &&
++	    dev->dma_ops == &nvme_pci_apple_ans_ops &&
++	    apple_ans_boot_mode(dev->dev) != APPLE_ANS_ROUND7)
++		panic("Apple ANS: dead outgoing controller; refusing kexec");
+ 	if (state == NVME_CTRL_LIVE || state == NVME_CTRL_RESETTING) {
+ 		if (pci_is_enabled(pdev))
+ 			nvme_start_freeze(&dev->ctrl);
+@@ -3552,13 +3672,28 @@ static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
+ 		 * Give the controller a chance to complete all entered requests
+ 		 * if doing a safe shutdown.
+ 		 */
+-		if (!dead && shutdown)
+-			nvme_wait_freeze_timeout(&dev->ctrl);
++		if (!dead && shutdown) {
++			ret = nvme_wait_freeze_timeout(&dev->ctrl);
++			if (ret <= 0 && kexec_in_progress &&
++			    dev->dma_ops == &nvme_pci_apple_ans_ops &&
++			    apple_ans_boot_mode(dev->dev) != APPLE_ANS_ROUND7)
++				panic("Apple ANS: outgoing I/O did not drain; refusing kexec");
++		}
+ 	}
+ 
+ 	nvme_quiesce_io_queues(&dev->ctrl);
+ 
+ 	if (!dead && dev->ctrl.queue_count > 0) {
++		if (shutdown && kexec_in_progress &&
++		    dev->dma_ops == &nvme_pci_apple_ans_ops &&
++		    apple_ans_boot_mode(dev->dev) != APPLE_ANS_ROUND7) {
++			nvme_sync_io_queues(&dev->ctrl);
++			ret = apple_ans_nvmmu_drain(dev->dev);
++			if (ret) {
++				nvme_apple_ans_dump(dev, "outgoing drain failed");
++				panic("Apple ANS: outgoing drain failed %d; refusing kexec", ret);
++			}
++		}
+ 		nvme_delete_io_queues(dev);
+ 		if (shutdown && kexec_in_progress && dev->dma_ops &&
+ 		    dev->dma_ops->shutdown)
+@@ -3633,6 +3768,19 @@ static void nvme_pci_free_ctrl(struct nvme_ctrl *ctrl)
+ 	kfree(dev);
+ }
+ 
++static bool nvme_apple_ans_retry(struct nvme_dev *dev)
++{
++	if (dev->dma_ops != &nvme_pci_apple_ans_ops ||
++	    apple_ans_boot_mode(dev->dev) == APPLE_ANS_ROUND7 ||
++	    nvme_state_terminal(&dev->ctrl) ||
++	    test_and_set_bit(ANS_RECOVERY_USED, &dev->apple_ans_flags))
++		return false;
++	nvme_apple_ans_dump(dev, "health/enable failed before recovery");
++	pr_flush(1000, false);
++	set_bit(ANS_RECOVERY_PENDING, &dev->apple_ans_flags);
++	return true;
++}
++
+ static void nvme_reset_work(struct work_struct *work)
+ {
+ 	struct nvme_dev *dev =
+@@ -3647,6 +3795,7 @@ static void nvme_reset_work(struct work_struct *work)
+ 		goto out;
+ 	}
+ 
++retry:
+ 	/*
+ 	 * If we're called to reset a live controller first shut it down before
+ 	 * moving on.
+@@ -3654,6 +3803,13 @@ static void nvme_reset_work(struct work_struct *work)
+ 	if (dev->ctrl.ctrl_config & NVME_CC_ENABLE)
+ 		nvme_dev_disable(dev, false);
+ 	nvme_sync_queues(&dev->ctrl);
++	if (test_and_clear_bit(ANS_RECOVERY_PENDING, &dev->apple_ans_flags)) {
++		pci_clear_master(to_pci_dev(dev->dev));
++		result = nvme_pci_apple_ans_recover(dev);
++		if (result)
++			goto out;
++		clear_bit(ANS_HEALTH_FAILED, &dev->apple_ans_flags);
++	}
+ 
+ 	mutex_lock(&dev->shutdown_lock);
+ 	result = nvme_pci_enable(dev);
+@@ -3673,7 +3829,8 @@ static void nvme_reset_work(struct work_struct *work)
+ 	 * Introduce CONNECTING state from nvme-fc/rdma transports to mark the
+ 	 * initializing procedure here.
+ 	 */
+-	if (!nvme_change_ctrl_state(&dev->ctrl, NVME_CTRL_CONNECTING)) {
++	if (nvme_ctrl_state(&dev->ctrl) != NVME_CTRL_CONNECTING &&
++	    !nvme_change_ctrl_state(&dev->ctrl, NVME_CTRL_CONNECTING)) {
+ 		dev_warn(dev->ctrl.device,
+ 			"failed to mark controller CONNECTING\n");
+ 		result = -EBUSY;
+@@ -3710,7 +3867,15 @@ static void nvme_reset_work(struct work_struct *work)
+ 	if (dev->online_queues > 1) {
+ 		nvme_dbbuf_set(dev);
+ 		nvme_unquiesce_io_queues(&dev->ctrl);
+-		nvme_wait_freeze(&dev->ctrl);
++		if (dev->dma_ops == &nvme_pci_apple_ans_ops &&
++		    apple_ans_boot_mode(dev->dev) != APPLE_ANS_ROUND7) {
++			if (nvme_wait_freeze_timeout(&dev->ctrl) <= 0) {
++				result = -ETIMEDOUT;
++				goto out;
++			}
++		} else {
++			nvme_wait_freeze(&dev->ctrl);
++		}
+ 		if (!nvme_pci_update_nr_queues(dev))
+ 			goto out;
+ 		nvme_unfreeze(&dev->ctrl);
+@@ -3722,6 +3887,13 @@ static void nvme_reset_work(struct work_struct *work)
+ 		nvme_free_tagset(dev);
+ 	}
+ 
++	if (dev->dma_ops == &nvme_pci_apple_ans_ops &&
++	    apple_ans_boot_mode(dev->dev) != APPLE_ANS_ROUND7) {
++		result = nvme_apple_ans_health(dev);
++		if (result)
++			goto out;
++	}
++
+ 	/*
+ 	 * If only admin queue live, keep it to do further investigation or
+ 	 * recovery.
+@@ -3739,6 +3911,8 @@ static void nvme_reset_work(struct work_struct *work)
+  out_unlock:
+ 	mutex_unlock(&dev->shutdown_lock);
+  out:
++	if (nvme_apple_ans_retry(dev))
++		goto retry;
+ 	/*
+ 	 * Set state to deleting now to avoid blocking nvme_wait_reset(), which
+ 	 * may be holding this pci_dev's device lock.
+diff --git a/drivers/pci/controller/pcie-apple-h9p.c b/drivers/pci/controller/pcie-apple-h9p.c
+index 274433b04a..34f0409539 100644
+--- a/drivers/pci/controller/pcie-apple-h9p.c
++++ b/drivers/pci/controller/pcie-apple-h9p.c
+@@ -332,10 +332,41 @@ struct apple_h9p_hw {
+ 	void (*port_off)(struct apple_h9p_pcie *pcie, unsigned int port);
+ };
+ 
++/* Round 8 is a supervised trial; round7 retains the previous sequence. */
++static enum apple_ans_boot_mode ans_boot_mode = APPLE_ANS_HANDOFF;
++static const char * const ans_boot_modes[] = { "round7", "handoff", "full-cycle" };
++
++static int ans_boot_mode_set(const char *val, const struct kernel_param *kp)
++{
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(ans_boot_modes); i++) {
++		if (!sysfs_streq(val, ans_boot_modes[i]))
++			continue;
++		*(enum apple_ans_boot_mode *)kp->arg = i;
++		return 0;
++	}
++	return -EINVAL;
++}
++
++static int ans_boot_mode_get(char *buf, const struct kernel_param *kp)
++{
++	return sysfs_emit(buf, "%s\n",
++		ans_boot_modes[*(enum apple_ans_boot_mode *)kp->arg]);
++}
++
++static const struct kernel_param_ops ans_boot_mode_ops = {
++	.set = ans_boot_mode_set,
++	.get = ans_boot_mode_get,
++};
++module_param_cb(ans_boot_mode, &ans_boot_mode_ops, &ans_boot_mode, 0444);
++MODULE_PARM_DESC(ans_boot_mode, "j71t ANS warm boot: handoff (trial default), full-cycle, round7");
++
+ struct apple_h9p_nvmmu {
+ 	struct apple_h9p_pcie *pcie;
+ 	void __iomem *base;
+ 	bool ready;
++	bool active; /* iOS setActive(false) only records state; no MMIO */
+ 	bool sart;
+ 	bool poisoned; /* failed invalidate: never reuse a cached translation */
+ 	/* ADT invalidate-fifo-workaround: 0 none, 1 poll FIFO, 2 delay */
+@@ -395,6 +426,8 @@ struct apple_h9p_pcie {
+ 	u32 lane_cfg;
+ 
+ 	struct apple_h9p_nvmmu nvmmu;
++	enum apple_ans_boot_mode ans_mode;
++	bool ans_inherited;
+ 
+ 	struct device **pd_dev;
+ 	struct device_link **pd_link;
+@@ -1019,9 +1052,14 @@ static int apple_h9p_setup_nvmmu(struct apple_h9p_pcie *pcie)
+ 	if (!nvmmu->tcb_sgl)
+ 		return -ENOMEM;
+ 
+-	ret = apple_h9p_nvmmu_program(pcie);
+-	if (ret)
+-		return dev_err_probe(dev, ret, "NVMMU: TCB init timeout\n");
++	/* Never replace inherited tables under an enabled controller. preinit
++	 * first stops it with CC=0, then programs our allocations.
++	 */
++	if (!pcie->ans_inherited) {
++		ret = apple_h9p_nvmmu_program(pcie);
++		if (ret)
++			return ret;
++	}
+ 
+ 	irq = platform_get_irq_byname_optional(pcie->pdev, "nvmmu");
+ 	if (irq > 0) {
+@@ -1036,6 +1074,7 @@ static int apple_h9p_setup_nvmmu(struct apple_h9p_pcie *pcie)
+ 	apple_h9p_map_dart(pcie);
+ 
+ 	nvmmu->ready = true;
++	nvmmu->active = !pcie->ans_inherited;
+ 	if (nvmmu->sart)
+ 		dev_info(dev, "NVMMU: ready, SART window %#x -> %pa size %#x, invalidate-fifo %u\n",
+ 			 nvmmu->va_base, &nvmmu->pa_base, nvmmu->size,
+@@ -1092,6 +1131,41 @@ static struct apple_h9p_pcie *apple_ans_host(struct device *dev)
+ 	return apple_h9p_pcie_lookup(host_dev->parent);
+ }
+ 
++enum apple_ans_boot_mode apple_ans_boot_mode(struct device *dev)
++{
++	struct apple_h9p_pcie *pcie = apple_ans_host(dev);
++
++	return pcie ? pcie->ans_mode : APPLE_ANS_ROUND7;
++}
++EXPORT_SYMBOL_GPL(apple_ans_boot_mode);
++
++/* Caller has frozen/drained I/O; no new data mappings can be submitted. */
++int apple_ans_nvmmu_drain(struct device *dev)
++{
++	struct apple_h9p_pcie *pcie = apple_ans_host(dev);
++	struct apple_h9p_nvmmu *nvmmu;
++	u32 val;
++	int ret = 0;
++
++	if (!pcie || !pcie->nvmmu.ready)
++		return -ENODEV;
++	nvmmu = &pcie->nvmmu;
++	/* Retire completions, not just queued invalidates: used tags at rest
++	 * mean a request never released its mapping. Never silently clear them.
++	 */
++	if (READ_ONCE(nvmmu->poisoned) ||
++	    !bitmap_empty(nvmmu->used, APPLE_ANS_NVMMU_MAX_REQS))
++		return -EBUSY;
++	if (nvmmu->inv_fifo == 1)
++		ret = readl_poll_timeout(pcie->base_port[0] +
++				S8003_PORT_NVMMU_INV_FIFO, val,
++				val & S8003_PORT_NVMMU_INV_FIFO_EMPTY,
++				10, S8003_NVMMU_INV_FIFO_TIMEOUT_US);
++	dev_info(dev, "Apple ANS: outgoing NVMMU FIFO empty check (20ms) result %d\n", ret);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(apple_ans_nvmmu_drain);
++
+ /*
+  * Is the endpoint's link still up? A BAR access over a dead link can stall
+  * the CPU forever on these root complexes, so the ANS glue checks this before
+@@ -1366,6 +1440,7 @@ int apple_ans_nvmmu_reset(struct device *dev)
+ 	}
+ 	bitmap_zero(nvmmu->used, APPLE_ANS_NVMMU_MAX_REQS);
+ 	WRITE_ONCE(nvmmu->poisoned, false);
++	nvmmu->active = true;
+ 	dev_info(dev, "NVMMU: stopped-controller cache/SART rebuilt\n");
+ 	return 0;
+ }
+@@ -1584,7 +1659,9 @@ static int apple_s8003_init_common(struct apple_h9p_pcie *pcie)
+ 	writel(H9P_RC_COMMON_CTL_INIT |
+ 	       FIELD_PREP(H9P_RC_COMMON_CTL_LANE_CFG, pcie->lane_cfg),
+ 	       pcie->base_rc + S8003_RC_LANE_CFG);
+-	h9p_rmw(pcie->base_rc + S8003_RC_PORT_PWR(0), 0, S8003_RC_PORT_PWR_ON);
++	if (pcie->ans_mode == APPLE_ANS_ROUND7)
++		h9p_rmw(pcie->base_rc + S8003_RC_PORT_PWR(0), 0,
++			S8003_RC_PORT_PWR_ON);
+ 
+ 	ret = apple_h9p_wait(pcie->base_rc + S8003_RC_STAT,
+ 			     S8003_RC_STAT_COMMON_READY,
+@@ -1718,8 +1795,8 @@ static void apple_s8003_port_stop(struct apple_h9p_pcie *pcie, unsigned int port
+ }
+ 
+ /* AppleEmbeddedPCIEPort::enableGated + AppleS800xPCIePort::enablePortHardware */
+-static int apple_s8003_setup_port_once(struct apple_h9p_pcie *pcie,
+-				       unsigned int port)
++static int apple_s8003_setup_port_round7(struct apple_h9p_pcie *pcie,
++					 unsigned int port)
+ {
+ 	void __iomem *rc = pcie->base_rc;
+ 	void __iomem *pb = pcie->base_port[port];
+@@ -1874,6 +1951,222 @@ static int apple_s8003_setup_port_once(struct apple_h9p_pcie *pcie,
+ 	return 0;
+ }
+ 
++static int apple_s8003_setup_port_full(struct apple_h9p_pcie *pcie,
++				       unsigned int port)
++{
++	void __iomem *rc = pcie->base_rc;
++	void __iomem *pb = pcie->base_port[port];
++	struct device *dev = pcie->dev;
++	u32 lanes = apple_s8003_lane_mask(pcie, port);
++	u32 speed = pcie->max_speed[port];
++	u16 lnkcap2_speeds;
++	u64 cap;
++	u32 val;
++	int ret;
++
++	if (pcie->lane_cfg == 3 && port == 3)
++		return dev_err_probe(dev, -EINVAL,
++				     "port 3 is unusable with lane-cfg 3\n");
++
++	/* No port-block access before the port is powered (iOS doesn't) */
++	dev_info(dev, "port %u: bringing up link (Gen%u, lanes %#x)\n", port,
++		 speed, lanes);
++
++	/* The endpoint stays in reset (PERST# was asserted at GPIO request) */
++	ret = gpiod_direction_output(pcie->perst[port], 1);
++	if (ret)
++		return dev_err_probe(dev, ret,
++				     "failed to assert port %u PERST#\n", port);
++
++	/* disablePortHardware: force_active(false) records inactive. No live
++	 * tables are zeroed; reactivation is mandatory in endpoint preinit.
++	 * rc+124 reset, 60us, rc+114 refclk, rc+100 power (not the legacy
++	 * helper's misleading CTL/PWR/REFCLK names).
++	 */
++	if (readl(rc + S8003_RC_PORT_CTL(port)) & S8003_RC_PORT_CTL_ENABLE)
++		apple_s8003_port_stop(pcie, port);
++	h9p_rmw(rc + S8003_RC_PORT_REFCLK(port), S8003_RC_PORT_REFCLK_ON, 0);
++	udelay(S8003_PERST_TO_REFCLK_US);
++	h9p_rmw(rc + S8003_RC_PORT_PWR(port), S8003_RC_PORT_PWR_ON, 0);
++	h9p_rmw(rc + S8003_RC_PORT_CTL(port), S8003_RC_PORT_CTL_ENABLE, 0);
++	usleep_range(10000, 11000);
++	if (pcie->nvme_mode[port]) {
++		writel(1, rc + S8003_RC_NVME_MODE0);
++		usleep_range(100, 200);
++		h9p_writel_flush(1, rc + S8003_RC_NVME_MODE1);
++	}
++	ret = apple_s8003_port_power_on(pcie, port);
++	if (ret)
++		return dev_err_probe(dev, ret, "port %u full-cycle power timeout\n", port);
++	apple_s8003_port_stop(pcie, port);
++	writel(3, rc + S8003_RC_PORT_LSCNT(port));
++	val = readl(pb + S8003_PORT_LINKPMGRSTS);
++	if (val)
++		writel(val, pb + S8003_PORT_LINKPMGRSTS);
++
++	cap = apple_h9p_read_pci_cap(pcie, port << 3, PCI_CAP_ID_EXP);
++	if (!cap)
++		return dev_err_probe(dev, -ENODEV,
++				     "port %u root port has no PCIe capability\n",
++				     port);
++	/* Clamp to LNKCAP2 like iOS setMaximumLinkSpeed */
++	lnkcap2_speeds = (readl(pcie->base_config + port * H9P_CFG_PORT_STRIDE +
++				cap + PCI_EXP_LNKCAP2) >> 1) & 0x7f;
++	while (speed > H9P_LINK_SPEED_2_5GT &&
++	       !(lnkcap2_speeds & BIT(speed - 1)))
++		speed--;
++	dev_info(dev, "port %u: restart LNKCTL %#x LNKCTL2 %#x\n", port,
++		 readw(pcie->base_config + port * H9P_CFG_PORT_STRIDE + cap +
++		       PCI_EXP_LNKCTL),
++		 readw(pcie->base_config + port * H9P_CFG_PORT_STRIDE + cap +
++		       PCI_EXP_LNKCTL2));
++	h9p_rmww(pcie->base_config + port * H9P_CFG_PORT_STRIDE + cap +
++		 PCI_EXP_LNKCTL, PCI_EXP_LNKCTL_ASPMC | PCI_EXP_LNKCTL_LD |
++		 PCI_EXP_LNKCTL_RL, 0);
++	h9p_rmww(pcie->base_config + port * H9P_CFG_PORT_STRIDE + cap +
++		 PCI_EXP_LNKCTL2, PCI_EXP_LNKCTL2_TLS | PCI_EXP_LNKCTL2_ENTER_COMP,
++		 speed);
++
++	/* iOS: pcie-rc-tunables (root port config), apcie-config-tunables */
++	ret = apple_h9p_apply_tunables(pcie, pcie->port_nodes[port],
++				       "apple,tunable-rc",
++				       pcie->base_config +
++				       port * H9P_CFG_PORT_STRIDE,
++				       H9P_CFG_SIZE, "root port");
++	if (ret)
++		return ret;
++	ret = apple_h9p_apply_tunables(pcie, pcie->port_nodes[port],
++				       "apple,tunable-config", pb,
++				       H9P_PORT_SIZE, "port");
++	if (ret)
++		return ret;
++
++	writel(H9P_PORT_IRQMASK_PRE_LINK, pb + H9P_PORT_IRQMASK);
++	writel(H9P_PORT_IRQSTAT_PRE_LINK, pb + H9P_PORT_IRQSTAT);
++	h9p_rmw(pb + H9P_PORT_ENABLE, 0, H9P_PORT_ENABLE_APPLE);
++	writel(1 | ilog2(H9P_MSI_PER_PORT) << 4, pb + S8003_PORT_MSICTL);
++	writel(port * 0x10001 * H9P_MSI_PER_PORT, pb + H9P_PORT_MSIVECBASE);
++
++	/* Clock is stable and reset is held even when GPIO ownership survived. */
++	msleep(S8003_PORT_RESET_MS);
++	ret = gpiod_direction_output(pcie->perst[port], 0);
++	if (ret)
++		return dev_err_probe(dev, ret,
++				     "failed to deassert port %u PERST#\n", port);
++
++	ret = apple_h9p_wait(pcie->base_phy + H9P_PHY_PORTMASK, lanes, lanes,
++			     lanes, 250000);
++	if (ret)
++		return dev_err_probe(dev, ret,
++				     "port %u PHY lanes %#x not ready (%#x)\n",
++				     port, lanes,
++				     readl(pcie->base_phy + H9P_PHY_PORTMASK));
++
++	apple_s8003_phy_ip_init(pcie, port, lanes, speed);
++
++	writel(H9P_PORT_IRQMASK_LINK_UP, pb + H9P_PORT_IRQMASK);
++	h9p_rmw(pb + H9P_PORT_LTSSMCTL, 0, H9P_PORT_LTSSM_ENABLE);
++
++	ret = readl_poll_timeout(pb + S8003_PORT_LINKSTS, val,
++				 val & S8003_PORT_LINKSTS_UP, 1000, 500000);
++	val = FIELD_GET(S8003_PORT_LINKCDMSTS_LTSSM,
++			readl(pb + S8003_PORT_LINKCDMSTS));
++	if (ret) {
++		apple_s8003_port_dump(pcie, port, "training timeout");
++		return dev_err_probe(dev, ret,
++				     "port %u link did not come up (LTSSM %#x)\n",
++				     port, val);
++	}
++
++	/* Link-up is reported during the Gen2 recovery; let it settle in L0 */
++	ret = readl_poll_timeout(pb + S8003_PORT_LINKCDMSTS, val,
++				 FIELD_GET(S8003_PORT_LINKCDMSTS_LTSSM, val) ==
++				 S8003_LTSSM_L0, 100, 100000);
++	if (ret || !(readl(pb + S8003_PORT_LINKSTS) & S8003_PORT_LINKSTS_UP)) {
++		apple_s8003_port_dump(pcie, port, "L0 timeout");
++		return -ETIMEDOUT;
++	}
++	dev_info(dev, "port %u: link up (LTSSM %#lx)\n", port,
++		 FIELD_GET(S8003_PORT_LINKCDMSTS_LTSSM, val));
++	return 0;
++}
++
++/* iOS enableGated uses software _state, unavailable across kernels.
++ * This hardware equivalent is deliberately stricter. Never read an off port.
++ */
++static bool apple_s8003_port_already_enabled(struct apple_h9p_pcie *pcie)
++{
++	void __iomem *rc = pcie->base_rc;
++	void __iomem *pb = pcie->base_port[0];
++
++	if (!(readl(rc + S8003_RC_PORT_CTL(0)) & S8003_RC_PORT_CTL_ENABLE) ||
++	    !(readl(rc + S8003_RC_PORT_PWR(0)) & S8003_RC_PORT_PWR_ON) ||
++	    !(readl(rc + S8003_RC_PORT_REFCLK(0)) & S8003_RC_PORT_REFCLK_ON) ||
++	    !(readl(rc + S8003_RC_PORT_READY(0)) & 1) ||
++	    gpiod_get_value_cansleep(pcie->perst[0]) != 0)
++		return false;
++	return (readl(pb + S8003_PORT_LINKSTS) & S8003_PORT_LINKSTS_UP) &&
++		FIELD_GET(S8003_PORT_LINKCDMSTS_LTSSM,
++			  readl(pb + S8003_PORT_LINKCDMSTS)) == S8003_LTSSM_L0;
++}
++
++static int apple_s8003_setup_port_once(struct apple_h9p_pcie *pcie,
++				       unsigned int port)
++{
++	void __iomem *pb = pcie->base_port[port];
++
++	if (port || pcie->ans_mode == APPLE_ANS_ROUND7)
++		return apple_s8003_setup_port_round7(pcie, port);
++	if (pcie->ans_mode == APPLE_ANS_HANDOFF &&
++	    apple_s8003_port_already_enabled(pcie)) {
++		pcie->ans_inherited = true;
++		/* Host IRQ routing belongs to the new kernel. Do not touch
++		 * PERST, LTSSM, clocks, power, DART or NVMMU on this path.
++		 */
++		writel(H9P_PORT_IRQSTAT_PRE_LINK, pb + H9P_PORT_IRQSTAT);
++		writel(H9P_PORT_IRQMASK_LINK_UP, pb + H9P_PORT_IRQMASK);
++		h9p_rmw(pb + H9P_PORT_ENABLE, 0, H9P_PORT_ENABLE_APPLE);
++		writel(1 | ilog2(H9P_MSI_PER_PORT) << 4, pb + S8003_PORT_MSICTL);
++		writel(0, pb + H9P_PORT_MSIVECBASE);
++		dev_info(pcie->dev, "Apple ANS: handoff already-enabled L0; no port reset\n");
++		return 0;
++	}
++	pcie->ans_inherited = false;
++	dev_info(pcie->dev, "Apple ANS: %s full port bring-up\n",
++		 ans_boot_modes[pcie->ans_mode]);
++	return apple_s8003_setup_port_full(pcie, port);
++}
++
++/* Queues synchronized and bus mastering off. Exactly one caller owns the
++ * recovery quota; never reset a shared PMGR domain or the Wi-Fi port.
++ */
++int apple_ans_restart_port(struct device *dev)
++{
++	struct apple_h9p_pcie *pcie = apple_ans_host(dev);
++	int ret;
++
++	if (!pcie || pcie->ans_mode == APPLE_ANS_ROUND7)
++		return -EOPNOTSUPP;
++	pcie->ans_mode = pcie->ans_mode == APPLE_ANS_HANDOFF ?
++		APPLE_ANS_FULL_CYCLE : APPLE_ANS_HANDOFF;
++	dev_warn(dev, "Apple ANS: one recovery using %s bring-up\n",
++		 ans_boot_modes[pcie->ans_mode]);
++	if (pcie->ans_mode == APPLE_ANS_FULL_CYCLE) {
++		ret = apple_ans_dart_set_active(dev, false);
++		if (ret)
++			return ret;
++		pcie->nvmmu.active = false;
++	}
++	/* Handoff needs a linked port. If the previous enable failed, the
++	 * hardware predicate falls back to a complete enable sequence.
++	 */
++	ret = apple_s8003_setup_port_once(pcie, 0);
++	if (ret)
++		WRITE_ONCE(pcie->down_ports, pcie->down_ports | BIT(0));
++	return ret;
++}
++EXPORT_SYMBOL_GPL(apple_ans_restart_port);
++
+ /* Both initial NVMe and late Wi-Fi ports recover from retained state. */
+ static int apple_s8003_setup_port(struct apple_h9p_pcie *pcie, unsigned int port)
+ {
+@@ -2267,7 +2560,8 @@ static int apple_h9p_pcie_get_gpios(struct apple_h9p_pcie *pcie)
+ 
+ 		fwnode = of_fwnode_handle(pcie->port_nodes[i]);
+ 		gpio = devm_fwnode_gpiod_get(dev, fwnode, "reset",
+-					     GPIOD_OUT_HIGH, "PERST#");
++					     !i && pcie->ans_mode == APPLE_ANS_HANDOFF ?
++					     GPIOD_ASIS : GPIOD_OUT_HIGH, "PERST#");
+ 		pcie->perst[i] = gpio;
+ 		if (IS_ERR(pcie->perst[i]))
+ 			return dev_err_probe(dev, PTR_ERR(pcie->perst[i]),
+@@ -2325,6 +2619,8 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
+ 	pcie->dev = dev;
+ 	pcie->pdev = pdev;
+ 	pcie->bridge = bridge;
++	pcie->ans_mode = of_machine_is_compatible("apple,j71t") ?
++		ans_boot_mode : APPLE_ANS_ROUND7;
+ 	pcie->hw = of_device_get_match_data(dev);
+ 	if (!pcie->hw)
+ 		return -ENODEV;
+@@ -2697,8 +2993,8 @@ static int apple_h9p_pcie_resume_noirq(struct device *dev)
+  * PME_TO/L2 and clock removal gained no DMA safety and broke retraining in
+  * test 2. The incoming probe now restarts the port itself before scanning.
+  */
+-static void apple_h9p_pcie_park(struct apple_h9p_pcie *pcie,
+-				unsigned long ports)
++static void apple_h9p_pcie_park_round7(struct apple_h9p_pcie *pcie,
++				       unsigned long ports)
+ {
+ 	unsigned int port;
+ 
+@@ -2726,6 +3022,35 @@ static void apple_h9p_pcie_park(struct apple_h9p_pcie *pcie,
+ 	dev_info(pcie->dev, "kexec: PCIe PERST asserted, LTSSM stopped, ports powered; NVMMU SART disabled\n");
+ }
+ 
++static void apple_h9p_pcie_park(struct apple_h9p_pcie *pcie,
++				unsigned long ports)
++{
++	void __iomem *rc = pcie->base_rc;
++	void __iomem *cfg = pcie->base_config;
++
++	if (pcie->ans_mode != APPLE_ANS_ROUND7 && (ports & BIT(0))) {
++		cancel_delayed_work_sync(&pcie->late_work);
++		writew(0, cfg + PCI_COMMAND);
++		h9p_rmw(cfg + PCI_PRIMARY_BUS, GENMASK(23, 8), 0);
++		if (pcie->ans_mode == APPLE_ANS_FULL_CYCLE) {
++			/* Endpoint shutdown already set DART/NVMMU inactive. */
++			pcie->nvmmu.active = false;
++			gpiod_direction_output(pcie->perst[0], 1);
++			apple_s8003_port_stop(pcie, 0);
++			h9p_rmw(rc + S8003_RC_PORT_REFCLK(0),
++				S8003_RC_PORT_REFCLK_ON, 0);
++			udelay(S8003_PERST_TO_REFCLK_US);
++			h9p_rmw(rc + S8003_RC_PORT_PWR(0), S8003_RC_PORT_PWR_ON, 0);
++			h9p_rmw(rc + S8003_RC_PORT_CTL(0), S8003_RC_PORT_CTL_ENABLE, 0);
++		}
++		dev_info(pcie->dev, "Apple ANS: kexec %s; CC.EN/SHST retained\n",
++			 ans_boot_modes[pcie->ans_mode]);
++		ports &= ~BIT(0);
++	}
++	/* Other ports keep the established Round 7 shutdown. */
++	apple_h9p_pcie_park_round7(pcie, ports);
++}
++
+ static void apple_h9p_pcie_shutdown(struct platform_device *pdev)
+ {
+ 	struct apple_h9p_pcie *pcie = apple_h9p_pcie_lookup(&pdev->dev);
+@@ -2823,7 +3148,8 @@ static ssize_t crash_quiesce_store(struct device *dev,
+ 		return -EBUSY;
+ 	/* Isolation is still required after a bounded RDY timeout. */
+ 	/* Wi-Fi stays linked until its own shutdown callback has run. */
+-	apple_h9p_pcie_park(pcie, BIT(0));
++	/* Panic recovery has no SHST-certified handoff. Keep its isolation. */
++	apple_h9p_pcie_park_round7(pcie, BIT(0));
+ 	dev_info(dev, "phoenix: ANS/PCIe quiesced (controller found %d result %d)\n",
+ 		 state.found, state.result);
+ 	return count;
+-- 
+2.56.0
+

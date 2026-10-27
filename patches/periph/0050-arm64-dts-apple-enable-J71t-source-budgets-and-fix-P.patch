@@ -1,0 +1,63 @@
+From c7c3eb2d34fa75a29de764cc6c560dd6bc673d2f Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 12:23:34 +0000
+Subject: [PATCH 50/55] arm64: dts: apple: enable J71t source budgets and fix
+ PMIC cells
+
+Keep the changes in the board peripheral include. Describe internal PMIC
+offsets with zero size cells and consistent child addresses, preserve
+NVMEM length and make it read-only. Wire Tristar to D2365 and the opted-
+in UDC for automatic guarded source budgets.
+---
+ .../boot/dts/apple/s8003-j71t-periph.dtsi     | 23 +++++++++++++++++--
+ 1 file changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/apple/s8003-j71t-periph.dtsi b/arch/arm64/boot/dts/apple/s8003-j71t-periph.dtsi
+index a7f6f78d6b..a2aaffa9e2 100644
+--- a/arch/arm64/boot/dts/apple/s8003-j71t-periph.dtsi
++++ b/arch/arm64/boot/dts/apple/s8003-j71t-periph.dtsi
+@@ -68,6 +68,19 @@ battery_swi_pins: battery-swi-pins {
+ };
+ 
+ &{/soc/i2c@20a110000/pmic@3c} {
++	/* Internal register offsets are not CPU MMIO resources. */
++	#size-cells = <0>;
++
++	rtc@500 {
++		reg = <0x500>;
++	};
++
++	nvmem@5000 {
++		reg = <0x5000>;
++		size = <0x28>;
++		read-only;
++	};
++
+ 	periph_pmu_gpio: gpio {
+ 		compatible = "apple,d2365-pmic-gpio";
+ 		gpio-controller;
+@@ -76,9 +89,9 @@ periph_pmu_gpio: gpio {
+ 	};
+ 
+ 	charger@180 {
+-		/* Current policy is explicitly armed for the verified Mac source. */
++		/* Automatic policy uses source authorization and private CBAT. */
+ 		compatible = "apple,j71t-d2365-charger";
+-		reg = <0x180 0x1e>, <0xa00 0x0d>;
++		reg = <0x180>, <0xa00>;
+ 		reg-names = "status", "control";
+ 		power-supplies = <&periph_tristar>;
+ 	};
+@@ -98,6 +111,12 @@ light-sensor@39 {
+ &i2c0 {
+ 	periph_tristar: power-controller@1a {
+ 		compatible = "apple,j71t-cbtl1610-power";
++		usb-controller = <&usbdev>;
++		apple,pmic = <&{/soc/i2c@20a110000/pmic@3c}>;
+ 		reg = <0x1a>;
+ 	};
+ };
++
++&usbdev {
++	apple,host-current-budget;
++};

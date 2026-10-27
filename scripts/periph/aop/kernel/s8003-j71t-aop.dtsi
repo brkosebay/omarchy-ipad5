@@ -1,0 +1,51 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J71t AOP for the active driver. Inert unless CONFIG_APPLE_A9_AOP_ACTIVE
+ * and apple_a9_aop.active=1. No power-domains: ps_aop is always-on and
+ * keeps busif/cpu/filter on; the driver only checks all five are ON.
+ * The region is the live ADT region-size (0x9b000), not the static 0xa0000.
+ * No mount-matrix until the six-pose residual is measured.
+ */
+#include <dt-bindings/interrupt-controller/apple-aic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/ {
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		/* Cold-loader target, excluded before the allocator starts. */
+		aop-firmware@210e00000 {
+			reg = <0x2 0x10e00000 0x0 0x9b000>;
+			no-map;
+		};
+
+		/* Retain across kexec, even after an incomplete AFK experiment. */
+		aop_afk: aop-afk@858000000 {
+			reg = <0x8 0x58000000 0x0 0x400000>;
+			no-map;
+		};
+	};
+
+	soc {
+		aop: aop@210800000 {
+			compatible = "apple,j71t-aop";
+			reg = <0x2 0x10800000 0x0 0x1c000>,
+			      <0x2 0x10e00000 0x0 0x9b000>,
+			      <0x2 0x10000600 0x0 0x4>;
+			reg-names = "wrapper", "region", "auto-boot";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 133 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 130 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "rx", "tx";
+			memory-region = <&aop_afk>;
+			apple,observe-domains = <&ps_aop_gpio &ps_aop &ps_aop_busif
+						 &ps_aop_cpu &ps_aop_filter>;
+			/* Firmware tags AOPt, SOC_ and SOCR (live ADT values). */
+			apple,aop-target = <8>;
+			apple,chip-id = <0x8003>;
+			apple,chip-revision = <1>;
+		};
+	};
+};

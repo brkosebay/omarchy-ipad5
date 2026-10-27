@@ -1,0 +1,376 @@
+#!/bin/bash
+# Pair a Bluetooth keyboard with the iPad from an SSH session (there's no touch
+# input yet, so the keyboard is how the desktop gets driven).
+#
+#   ipad-pair-keyboard              scan, then pair the first keyboard found
+#   ipad-pair-keyboard pair MAC     scan for MAC, then pair, trust and connect it
+#   ipad-pair-keyboard scan [SECS]  list nearby devices, keyboards marked
+#   ipad-pair-keyboard keys [SECS]  print key presses from connected keyboards
+#   ipad-pair-keyboard status       controller state and paired devices
+#   ipad-pair-keyboard forget MAC   remove a pairing, to pair it again
+#
+# Put the keyboard in pairing mode first (Keychron K2: side switch on
+# Bluetooth, hold fn+1 for about 4 s until the key light blinks fast). The
+# keyboard has no display, so pairing prints a 6-digit passkey: type it on the
+# keyboard and press Enter. The device is then trusted, so after a reboot it
+# reconnects by itself once a key wakes it.
+#
+# linux-a9 (docs/omarchy/test-plan.md). Runs as root, re-executing with sudo:
+# the pairing agent must be a process BlueZ's D-Bus policy accepts, and an SSH
+# session has no seat.
+set -uo pipefail
+
+SCAN_SECS=${SCAN_SECS:-40}
+LOG=/run/ipad-pair-keyboard.log
+mac_re='^([0-9A-F]{2}:){5}[0-9A-F]{2}$'
+
+die() {
+  echo "ipad-pair-keyboard: $*" >&2
+  echo "(bluetoothctl transcript: $LOG)" >&2
+  exit 1
+}
+
+upper() { tr '[:lower:]' '[:upper:]' <<<"$1"; }
+
+# --- controller ---------------------------------------------------------------
+
+controller_up() {
+  local i settings s
+  systemctl start bluetooth.service || die "bluetooth.service does not start (journalctl -b -u bluetooth)"
+  rfkill unblock bluetooth 2>/dev/null
+  for (( i = 0; i < 20; i++ )); do
+    bluetoothctl show 2>/dev/null | grep -q "Powered: yes" && break
+    bluetoothctl power on >/dev/null 2>&1
+    sleep 1
+  done
+  bluetoothctl show 2>/dev/null | grep -q "Powered: yes" ||
+    die "no powered Bluetooth controller (dmesg | grep -i -e bluetooth -e hci; ls /usr/lib/firmware/brcm/)"
+  # Classic keyboards need BR/EDR and BLE ones LE. bluetoothd turns both on in
+  # its default dual mode; this controller only scans with LE on, so make sure.
+  settings=$(btmgmt info 2>/dev/null | sed -n 's/^[[:space:]]*current settings: //p' | head -1)
+  for s in br/edr le; do
+    if [[ " $settings " != *" $s "* ]]; then
+      echo "Turning on $s"
+      btmgmt "${s//\//}" on >/dev/null 2>&1 || echo "  (btmgmt ${s//\//} on failed; continuing)"
+    fi
+  done
+}
+
+# One field of `bluetoothctl info` output ($1), or of device $1 (device_field).
+field() { sed -n "s/^[[:space:]]*$2: //p" <<<"$1" | head -1; }
+device_field() { field "$(bluetoothctl info "$1" 2>/dev/null)" "$2"; }
+
+# The input device the kernel made for a connected keyboard (Uniq is its MAC).
+input_device() {
+  local mac
+  mac=$(tr '[:upper:]' '[:lower:]' <<<"$1")
+  awk -v mac="$mac" '
+    /^N: Name=/ { name = substr($0, 9) }
+    /^U: Uniq=/ { uniq = tolower(substr($0, 9)) }
+    /^H: Handlers=/ { if (uniq == mac) print name " -> " substr($0, 13); uniq = "" }
+  ' /proc/bus/input/devices
+}
+
+# /dev/input/eventN of every input device a connected MAC made (a keyboard
+# can make several: keys, consumer and system control).
+event_devices() {
+  local mac
+  mac=$(tr '[:upper:]' '[:lower:]' <<<"$1")
+  awk -v mac="$mac" '
+    /^U: Uniq=/ { uniq = tolower(substr($0, 9)) }
+    /^H: Handlers=/ { if (uniq == mac && match($0, /event[0-9]+/)) print "/dev/input/" substr($0, RSTART, RLENGTH); uniq = "" }
+  ' /proc/bus/input/devices
+}
+
+# Print key presses from the given event devices for $1 seconds.
+read_keys() {
+  local secs=$1
+  shift
+  timeout "$secs" python3 -c '
+import os, re, select, struct, sys
+names = {}
+try:
+    for line in open("/usr/include/linux/input-event-codes.h"):
+        m = re.match(r"#define\s+(KEY_\w+)\s+(0x[0-9a-fA-F]+|\d+)\b", line)
+        if m:
+            names.setdefault(int(m.group(2), 0), m.group(1))
+except OSError:
+    pass
+fds = [os.open(p, os.O_RDONLY) for p in sys.argv[1:]]
+fmt = "llHHi"
+size = struct.calcsize(fmt)
+while fds:
+    for fd in select.select(fds, [], [])[0]:
+        try:
+            data = os.read(fd, size * 64)
+        except OSError:
+            fds.remove(fd)
+            print("(an input device went away: keyboard disconnected?)", flush=True)
+            continue
+        for i in range(0, len(data) - size + 1, size):
+            _, _, kind, code, value = struct.unpack_from(fmt, data, i)
+            if kind == 1 and value in (0, 1):
+                print(names.get(code, "key %d" % code), "down" if value else "up", flush=True)
+' "$@"
+  local rc=$?
+  (( rc == 0 || rc == 124 ))
+}
+
+keys() {
+  local secs=${1:-15} mac
+  local -a devs=()
+  while read -r _ mac _; do
+    [[ $mac =~ $mac_re ]] || continue
+    mapfile -t -O "${#devs[@]}" devs < <(event_devices "$mac")
+  done < <(bluetoothctl devices Connected 2>/dev/null)
+  (( ${#devs[@]} )) || die "no connected Bluetooth keyboard (press a key to wake it; ipad-pair-keyboard status)"
+  echo "Reading ${devs[*]} for ${secs}s: type on the keyboard (F1 should show KEY_F1 with fnmode=2)"
+  read_keys "$secs" "${devs[@]}"
+}
+
+status() {
+  local mac
+  bluetoothctl show 2>/dev/null | grep -E "Controller|Powered|Discoverable|Pairable|PowerState" || echo "no controller"
+  btmgmt info 2>/dev/null | grep -E "addr|current settings" | sed 's/^[[:space:]]*/  /'
+  echo "Paired devices:"
+  while read -r _ mac _; do
+    [[ $mac =~ $mac_re ]] || continue
+    printf '  %s %-24s trusted=%s connected=%s %s\n' "$mac" "$(device_field "$mac" Name)" \
+      "$(device_field "$mac" Trusted)" "$(device_field "$mac" Connected)" "$(input_device "$mac")"
+  done < <(bluetoothctl devices Paired 2>/dev/null)
+}
+
+# --- one bluetoothctl session, driven line by line -----------------------------
+
+# --agent registers the KeyboardDisplay agent as soon as bluetoothctl reaches
+# bluetoothd (an `agent` command sent earlier races its own startup agent).
+# Bash unsets the BTCTL_* variables once the coprocess exits, so keep copies.
+session_start() {
+  : >"$LOG"
+  coproc BTCTL { exec stdbuf -oL -eL bluetoothctl --agent KeyboardDisplay 2>&1; }
+  BT_PID=$BTCTL_PID
+  BT_IN=${BTCTL[1]}
+  BT_OUT=${BTCTL[0]}
+  trap session_stop EXIT
+}
+
+session_stop() {
+  [[ -n ${BT_PID:-} ]] || return 0
+  printf 'scan off\nquit\n' >&"$BT_IN" 2>/dev/null
+  sleep 1
+  kill "$BT_PID" 2>/dev/null
+  BT_PID=""
+}
+
+send() {
+  echo "> $*" >>"$LOG"
+  printf '%s\n' "$*" >&"$BT_IN" || die "bluetoothctl went away"
+}
+
+# Colour codes, readline markers and carriage returns out.
+clean() { sed -E $'s/\x1b\\[[0-9;?]*[A-Za-z]//g; s/[\x01\x02\r]//g' <<<"$1"; }
+
+shown_code=""
+found_macs=()
+
+# Agent requests can come at any time while pairing.
+handle_line() {
+  local line=$1 pin
+  echo "$line" >>"$LOG"
+  if [[ $line =~ \[NEW\]\ Device\ (([0-9A-F]{2}:){5}[0-9A-F]{2}) ]]; then
+    found_macs+=("${BASH_REMATCH[1]}")
+  elif [[ $line =~ Passkey:\ *([0-9]{6}) ]]; then
+    if [[ ${BASH_REMATCH[1]} != "$shown_code" ]]; then
+      shown_code=${BASH_REMATCH[1]}
+      echo
+      echo "=================================================="
+      echo "  On the keyboard, type:   ${shown_code:0:3} ${shown_code:3:3}"
+      echo "  then press Enter."
+      echo "=================================================="
+      echo
+    fi
+  elif [[ $line == *"Enter PIN code"* ]]; then
+    # Legacy (pre-SSP) pairing: the host picks the PIN the keyboard types.
+    pin=$(printf '%04d' $((RANDOM % 10000)))
+    shown_code=$pin
+    echo
+    echo "=================================================="
+    echo "  On the keyboard, type:   $pin"
+    echo "  then press Enter."
+    echo "=================================================="
+    echo
+    send "$pin"
+  elif [[ $line == *"Confirm passkey"* || $line == *"Authorize service"* || $line == *"Accept pairing"* ]]; then
+    send yes
+  fi
+}
+
+# Read the session's output until a line matches the regex $1, or $2 seconds
+# pass (status 1). A prompt that ends without a newline arrives on a timeout.
+expect_line() {
+  local want=$1 end=$((SECONDS + $2)) line
+  while (( SECONDS < end )); do
+    line=""
+    IFS= read -r -t 1 line <&"$BT_OUT"
+    if (( $? != 0 )) && [[ -z $line ]]; then
+      kill -0 "$BT_PID" 2>/dev/null || die "bluetoothctl exited"
+      continue
+    fi
+    line=$(clean "$line")
+    [[ -n $line ]] || continue
+    handle_line "$line"
+    if [[ -n $want && $line =~ $want ]]; then
+      MATCHED=$line
+      return 0
+    fi
+  done
+  return 1
+}
+
+drain() { expect_line "" "$1"; }
+
+session_agent() {
+  expect_line "Agent registered|already registered" 15 || die "could not register a pairing agent"
+  send "default-agent"
+  expect_line "Default agent request successful" 10 || die "could not make the agent the default one"
+  send "pairable on"
+  send "scan on"
+  expect_line "Discovery started|Discovering: yes" 15 || die "discovery does not start"
+}
+
+# $1 is `bluetoothctl info` output: class "keyboard" (major peripheral, minor
+# 0x40, alone or with a pointer) or BlueZ's keyboard icon.
+is_keyboard() {
+  [[ $(field "$1" Icon) == "input-keyboard" || $(field "$1" Class) =~ ^0x[0-9a-f]*5[4c]0$ ]]
+}
+
+# Wait for MAC (or, with no MAC, any unpaired keyboard) to show up in the scan.
+# Busy places have dozens of BLE devices: each is looked at a few times only.
+find_device() {
+  local want=$1 end=$((SECONDS + SCAN_SECS)) mac info
+  local -A tries=()
+  echo "Scanning for up to ${SCAN_SECS}s; the keyboard must be in pairing mode..."
+  while (( SECONDS < end )); do
+    drain 2
+    if [[ -n $want ]]; then
+      if bluetoothctl info "$want" >/dev/null 2>&1; then
+        TARGET=$want
+        return 0
+      fi
+      continue
+    fi
+    while read -r _ mac _; do
+      [[ $mac =~ $mac_re ]] || continue
+      (( ${tries[$mac]:-0} < 3 )) || continue
+      tries[$mac]=$(( ${tries[$mac]:-0} + 1 ))
+      info=$(bluetoothctl info "$mac" 2>/dev/null)
+      # A paired keyboard that turns up in this scan (it has an RSSI) is in
+      # pairing mode again: it lost its bond, so pair it afresh.
+      if [[ $(field "$info" Paired) == "yes" ]]; then
+        [[ -n $(field "$info" RSSI) && $(field "$info" Connected) == "no" ]] || continue
+      fi
+      if is_keyboard "$info"; then
+        TARGET=$mac
+        return 0
+      fi
+    done < <(bluetoothctl devices 2>/dev/null)
+  done
+  return 1
+}
+
+pair() {
+  local want=${1:-} name
+  [[ -z $want ]] || want=$(upper "$want")
+  [[ -z $want || $want =~ $mac_re ]] || die "not a Bluetooth address: $1"
+  # Pairing again means a fresh bond: a stale one is what kept the K2 from
+  # staying connected on the device until it was forgotten and re-paired.
+  if [[ -n $want && $(device_field "$want" Paired) == "yes" ]]; then
+    echo "$want is already paired: forgetting it to pair afresh (the keyboard must be in pairing mode)."
+    bluetoothctl remove "$want" >/dev/null
+  fi
+
+  controller_up
+  session_start
+  session_agent
+  if ! find_device "$want"; then
+    echo "No ${want:-keyboard} found. Devices seen:"
+    bluetoothctl devices 2>/dev/null | sed 's/^/  /'
+    die "is the keyboard in pairing mode? Then: ipad-pair-keyboard pair MAC"
+  fi
+  name=$(device_field "$TARGET" Name)
+  if [[ $(device_field "$TARGET" Paired) == "yes" ]]; then
+    echo "$TARGET ${name:-} is paired but in pairing mode again (its bond was lost): pairing it afresh."
+    send "remove $TARGET"
+    expect_line "Device has been removed|not available" 10
+    expect_line "\[NEW\] Device $TARGET" 30 || die "$TARGET didn't show up again after forgetting it; is it still in pairing mode?"
+  fi
+  echo "Found $TARGET ${name:-(no name)}; pairing..."
+  send "scan off"
+  drain 1
+  send "pair $TARGET"
+  expect_line "Pairing successful|Failed to pair|not available" 120 ||
+    die "pairing timed out (passkey typed on the keyboard, followed by Enter?)"
+  [[ $MATCHED == *"Pairing successful"* ]] || die "pairing failed: $MATCHED"
+  send "trust $TARGET"
+  expect_line "trust succeeded|Trusted: yes" 10 || echo "warning: trust not confirmed"
+  send "connect $TARGET"
+  expect_line "Connection successful|Failed to connect|Connected: yes" 30
+  drain 3
+  session_stop
+  # So the keyboard can page us back if it drops now (it did, the first time).
+  ipad-bt-doctor --ensure-pagescan
+
+  echo
+  echo "$TARGET ${name:-}: paired=$(device_field "$TARGET" Paired) bonded=$(device_field "$TARGET" Bonded)" \
+    "trusted=$(device_field "$TARGET" Trusted) connected=$(device_field "$TARGET" Connected)"
+  local input
+  input=$(input_device "$TARGET")
+  if [[ -n $input ]]; then
+    echo "input device: $input"
+  else
+    echo "no input device yet: press a key on the keyboard, then: ipad-pair-keyboard status"
+  fi
+}
+
+scan() {
+  local secs=${1:-20} mac info kind
+  controller_up
+  echo "Scanning for ${secs}s..."
+  bluetoothctl --timeout "$secs" scan on >/dev/null 2>&1
+  while read -r _ mac _; do
+    [[ $mac =~ $mac_re ]] || continue
+    info=$(bluetoothctl info "$mac" 2>/dev/null)
+    kind=$(field "$info" Icon)
+    printf '  %s  %-16s %s%s\n' "$mac" "${kind:--}" "$(field "$info" Name)" \
+      "$(is_keyboard "$info" && echo "   <- keyboard")"
+  done < <(bluetoothctl devices 2>/dev/null)
+}
+
+main() {
+  case ${1:-} in
+    -h | --help | help)
+      awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"
+      return
+      ;;
+  esac
+  if (( EUID != 0 )); then
+    exec sudo -- "$0" "$@"
+  fi
+  case ${1:-} in
+    "") pair ;;
+    pair) pair "${2:-}" ;;
+    scan) scan "${2:-20}" ;;
+    keys) keys "${2:-15}" ;;
+    status) status ;;
+    forget)
+      [[ ${2:-} ]] || die "usage: ipad-pair-keyboard forget MAC"
+      bluetoothctl remove "$(upper "$2")"
+      ;;
+    *) die "unknown command: $1 (try --help)" ;;
+  esac
+}
+
+# Sourcing it (tests) defines the functions without running anything.
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi

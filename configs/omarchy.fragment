@@ -1,0 +1,138 @@
+# Kernel config fragment for Omarchy (Arch Linux ARM + systemd + Hyprland) on
+# the iPad 5 (j71t). Applied on top of configs/hoolock-16k.config with
+# scripts/kconfig/merge_config.sh -m, then `make olddefconfig`
+# (scripts/omarchy/build-kernel.sh does both). Every option is built in: the
+# base config builds no modules and the NBD-root initramfs loads none.
+#
+# Tree-agnostic on purpose: merge it on top of the pcie/periph trees the
+# same way. It touches no driver the other workstreams own.
+#
+# scripts/omarchy/check-fragment.sh lists any line here that did not survive
+# olddefconfig.
+
+# --- systemd: cgroup v2 controllers and BPF ---------------------------------
+# DeviceAllow=/IPAddressDeny= and the cgroup v2 device controller are BPF
+# programs attached to cgroups.
+CONFIG_CGROUP_BPF=y
+CONFIG_CGROUP_FREEZER=y
+CONFIG_CPUSETS=y
+CONFIG_CFS_BANDWIDTH=y
+CONFIG_CGROUP_MISC=y
+CONFIG_CHECKPOINT_RESTORE=y
+CONFIG_USERFAULTFD=y
+CONFIG_TMPFS_INODE64=y
+# systemd's sysctl.d sets net.core.default_qdisc=fq_codel.
+CONFIG_NET_SCHED=y
+CONFIG_NET_SCH_FQ_CODEL=y
+CONFIG_NET_SCH_FQ=y
+# ss(8) / sock_diag users.
+CONFIG_UNIX_DIAG=y
+CONFIG_NETLINK_DIAG=y
+CONFIG_PACKET_DIAG=y
+# systemd wants no uevent helper and no sysfs firmware fallback. The fallback
+# is also what stalled boot for 60 s on the missing ALS firmware in device
+# test 1 (docs/STATUS.md).
+# CONFIG_UEVENT_HELPER is not set
+# CONFIG_FW_LOADER_USER_HELPER is not set
+# /proc/config.gz, for Docker's check-config and for debugging on the device.
+CONFIG_IKCONFIG=y
+CONFIG_IKCONFIG_PROC=y
+
+# --- LSM: Landlock for pacman's download sandbox ----------------------------
+# pacman 7 fences its downloads with Landlock. The base config has no LSM
+# enabled at all (CONFIG_LSM names selinux, which is off).
+CONFIG_SECURITY_LANDLOCK=y
+CONFIG_LSM="landlock"
+
+# --- Memory pressure on 2 GB ------------------------------------------------
+# zram swap comes from zram-generator (omarchy-aarch64.packages); ZRAM, zstd
+# and PSI (for systemd-oomd) are already in the base config.
+CONFIG_LRU_GEN=y
+CONFIG_LRU_GEN_ENABLED=y
+
+# --- Filesystems -------------------------------------------------------------
+CONFIG_FUSE_FS=y
+CONFIG_OVERLAY_FS=y
+CONFIG_SQUASHFS=y
+CONFIG_SQUASHFS_XZ=y
+CONFIG_SQUASHFS_ZSTD=y
+# Omarchy's native root filesystem (btrfs + snapper), for the later NVMe
+# install. The NBD root is ext4.
+CONFIG_BTRFS_FS=y
+CONFIG_BTRFS_FS_POSIX_ACL=y
+# btrfs pulls in raid6; don't benchmark its algorithms on every boot.
+# CONFIG_RAID6_PQ_BENCHMARK is not set
+
+# --- Input: Bluetooth keyboards, uinput, hidraw ------------------------------
+# BlueZ's HoG (BLE keyboards) needs uhid; classic HID uses hidp (already on).
+CONFIG_UHID=y
+CONFIG_HIDRAW=y
+# Keyboards that identify as Apple's (a Keychron K2 in Mac mode, the first
+# input device on the iPad): fn and media keys. hid_apple.fnmode=2 on the
+# command line makes F1-F12 the default (docs/omarchy/test-plan.md). It
+# depends on the LED class (keyboard backlight), off in the base config.
+CONFIG_NEW_LEDS=y
+CONFIG_LEDS_CLASS=y
+CONFIG_HID_APPLE=y
+# A Bluetooth keyboard's battery level as a power_supply (upower, the bar).
+CONFIG_HID_BATTERY_STRENGTH=y
+CONFIG_BT_RFCOMM=y
+CONFIG_BT_RFCOMM_TTY=y
+CONFIG_RFKILL=y
+
+# --- Graphics: Hyprland on simpledrm + llvmpipe ------------------------------
+# simpledrm, fbdev emulation and sync_file are already on. udmabuf and the
+# system dma-buf heap let software clients hand the compositor dma-bufs.
+CONFIG_UDMABUF=y
+CONFIG_DMABUF_HEAPS=y
+CONFIG_DMABUF_HEAPS_SYSTEM=y
+
+# --- Networking: ufw (iptables-nft) and Docker -------------------------------
+# nf_tables, nft_compat, conntrack, NAT and the REJECT/LOG targets are in the
+# base config. These are the xtables extensions ufw's rule files and
+# ufw-docker's after.rules use, plus the bridge/veth/overlay Docker needs.
+CONFIG_NETFILTER_XT_MARK=y
+CONFIG_NETFILTER_XT_CONNMARK=y
+CONFIG_NETFILTER_XT_TARGET_MARK=y
+CONFIG_NETFILTER_XT_TARGET_CONNMARK=y
+CONFIG_NETFILTER_XT_TARGET_NFLOG=y
+CONFIG_NETFILTER_XT_TARGET_REDIRECT=y
+CONFIG_NETFILTER_XT_TARGET_TCPMSS=y
+CONFIG_NETFILTER_XT_MATCH_COMMENT=y
+CONFIG_NETFILTER_XT_MATCH_CONNLIMIT=y
+CONFIG_NETFILTER_XT_MATCH_CONNMARK=y
+CONFIG_NETFILTER_XT_MATCH_HASHLIMIT=y
+CONFIG_NETFILTER_XT_MATCH_HL=y
+CONFIG_NETFILTER_XT_MATCH_IPRANGE=y
+CONFIG_NETFILTER_XT_MATCH_LENGTH=y
+CONFIG_NETFILTER_XT_MATCH_LIMIT=y
+CONFIG_NETFILTER_XT_MATCH_MAC=y
+CONFIG_NETFILTER_XT_MATCH_MARK=y
+CONFIG_NETFILTER_XT_MATCH_MULTIPORT=y
+CONFIG_NETFILTER_XT_MATCH_OWNER=y
+CONFIG_NETFILTER_XT_MATCH_PKTTYPE=y
+CONFIG_NETFILTER_XT_MATCH_RECENT=y
+CONFIG_NETFILTER_XT_MATCH_STATE=y
+CONFIG_NETFILTER_XT_MATCH_STATISTIC=y
+CONFIG_NETFILTER_XT_MATCH_TCPMSS=y
+CONFIG_NETFILTER_XT_MATCH_U32=y
+CONFIG_NFT_FIB_IPV4=y
+CONFIG_NFT_FIB_IPV6=y
+CONFIG_NFT_FIB_INET=y
+# No legacy ip_tables filter/nat/mangle tables (IP_NF_FILTER and friends need
+# NETFILTER_XTABLES_LEGACY): Arch's iptables is iptables-nft, which puts
+# ufw's and Docker's rules in nf_tables through nft_compat.
+CONFIG_IP6_NF_MATCH_HL=y
+CONFIG_IP6_NF_MATCH_IPV6HEADER=y
+CONFIG_IP6_NF_MATCH_RT=y
+CONFIG_BRIDGE=y
+CONFIG_BRIDGE_NETFILTER=y
+CONFIG_VETH=y
+CONFIG_MACVLAN=y
+CONFIG_IPVLAN=y
+CONFIG_VXLAN=y
+CONFIG_DUMMY=y
+# Kernel log to the Mac over usb0 (initramfs start_netconsole,
+# scripts/omarchy/netconsole.py): the only log path left when NBD stalls.
+CONFIG_NETCONSOLE=y
+CONFIG_NETCONSOLE_DYNAMIC=y

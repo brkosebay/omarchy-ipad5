@@ -1,0 +1,9 @@
+0001-input-touchscreen-add-bounded-J71t-N1-protocol-drive.patch
+0002-soc-apple-add-bounded-A9-touch-SPI-clock-and-analog-.patch
+0003-pinctrl-apple-add-S8000-mux-semantics-for-touch-disp.patch
+0004-arm64-dts-apple-wire-J71t-N1-touchscreen.patch
+0005-input-apple_n1-harden-descriptor-and-runtime-readine.patch
+0006-spi-apple-preserve-N1-inter-word-and-chip-select-tim.patch
+0007-input-apple_n1-correct-N1-timing-and-diagnose-discov.patch
+0008-input-apple_n1-synchronize-teardown-and-advertise-fi.patch
+0009-arm64-dts-apple-invert-J71t-touch-Y-for-portrait-dis.patch

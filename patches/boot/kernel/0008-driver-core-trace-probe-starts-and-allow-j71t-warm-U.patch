@@ -1,0 +1,185 @@
+From 2719b5fba1096a8d9d3cf7f3071793985f87bb30 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 09:18:09 +0000
+Subject: [PATCH 8/8] driver core: trace probe starts and allow j71t warm USB
+ rescue
+
+---
+ drivers/base/base.h |  2 ++
+ drivers/base/core.c |  3 +++
+ drivers/base/dd.c   | 57 +++++++++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 60 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/base/base.h b/drivers/base/base.h
+index a5b7abc10f..35c84cebed 100644
+--- a/drivers/base/base.h
++++ b/drivers/base/base.h
+@@ -12,6 +12,8 @@
+  */
+ #include <linux/notifier.h>
+ 
++void driver_boot_trace(struct device *dev, const char *stage);
++
+ /**
+  * struct subsys_private - structure to hold the private to the driver core
+  *			   portions of the bus_type/class structure.
+diff --git a/drivers/base/core.c b/drivers/base/core.c
+index 4c0c373998..fc84d919ad 100644
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@ -1244,10 +1244,13 @@ static void device_links_flush_sync_list(struct list_head *list,
+ 	list_for_each_entry_safe(dev, tmp, list, links.defer_sync) {
+ 		list_del_init(&dev->links.defer_sync);
+ 
++		driver_boot_trace(dev, "sync lock begin");
+ 		if (dev != dont_lock_dev)
+ 			device_lock(dev);
+ 
++		driver_boot_trace(dev, "sync begin");
+ 		dev_sync_state(dev);
++		driver_boot_trace(dev, "sync end");
+ 
+ 		if (dev != dont_lock_dev)
+ 			device_unlock(dev);
+diff --git a/drivers/base/dd.c b/drivers/base/dd.c
+index f6525a7ee8..680c87d538 100644
+--- a/drivers/base/dd.c
++++ b/drivers/base/dd.c
+@@ -22,6 +22,8 @@
+ #include <linux/dma-map-ops.h>
+ #include <linux/init.h>
+ #include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_fdt.h>
+ #include <linux/kthread.h>
+ #include <linux/wait.h>
+ #include <linux/async.h>
+@@ -58,6 +60,40 @@ static LIST_HEAD(deferred_probe_active_list);
+ static atomic_t deferred_trigger_count = ATOMIC_INIT(0);
+ static bool initcalls_done;
+ 
++/* A finite boot-only breadcrumb budget, independent of initcall_debug. */
++static unsigned int boot_trace;
++static bool apple_deferred_async;
++
++static int __init boot_trace_setup(char *arg)
++{
++	unsigned int count;
++	int ret = kstrtouint(arg, 0, &count);
++
++	if (!ret)
++		WRITE_ONCE(boot_trace, min(count, 4096U));
++	return ret;
++}
++early_param("driver_boot_trace", boot_trace_setup);
++
++void driver_boot_trace(struct device *dev, const char *stage)
++{
++	unsigned int left = READ_ONCE(boot_trace);
++
++	while (left) {
++		if (try_cmpxchg(&boot_trace, &left, left - 1)) {
++			dev_info(dev, "boot-trace %s driver=%s\n", stage,
++				 dev_driver_string(dev));
++			break;
++		}
++	}
++}
++
++static int __init apple_deferred_async_setup(char *arg)
++{
++	return kstrtobool(arg, &apple_deferred_async);
++}
++early_param("apple_boot.deferred_async", apple_deferred_async_setup);
++
+ /* Save the async probe drivers' name from kernel cmdline */
+ #define ASYNC_DRV_NAMES_MAX_LEN	256
+ static char async_probe_drv_names[ASYNC_DRV_NAMES_MAX_LEN];
+@@ -118,10 +154,12 @@ static void deferred_probe_work_func(struct work_struct *work)
+ 		 * the list is a good order for suspend but deferred
+ 		 * probe makes that very unsafe.
+ 		 */
++		driver_boot_trace(dev, "deferred begin");
+ 		device_pm_move_to_tail(dev);
+ 
+ 		dev_dbg(dev, "Retrying from deferred list\n");
+ 		bus_probe_device(dev);
++		driver_boot_trace(dev, "deferred end");
+ 		mutex_lock(&deferred_probe_mutex);
+ 
+ 		put_device(dev);
+@@ -339,13 +377,21 @@ void deferred_probe_extend_timeout(void)
+  */
+ static int deferred_probe_initcall(void)
+ {
++	bool warm_async = apple_deferred_async &&
++		IS_ENABLED(CONFIG_NVME_APPLE_ANS_EARLY_USB) &&
++		of_machine_is_compatible("apple,j71t") &&
++		of_property_read_bool(of_chosen, "linux,booted-from-kexec");
++
+ 	debugfs_create_file("devices_deferred", 0444, NULL, NULL,
+ 			    &deferred_devs_fops);
+ 
+ 	driver_deferred_probe_enable = true;
+ 	driver_deferred_probe_trigger();
+ 	/* Sort as many dependencies as possible before exiting initcalls */
+-	flush_work(&deferred_probe_work);
++	if (!warm_async)
++		flush_work(&deferred_probe_work);
++	else
++		pr_warn("j71t warm boot: deferred probe flush skipped for initramfs USB rescue\n");
+ 	initcalls_done = true;
+ 
+ 	if (!IS_ENABLED(CONFIG_MODULES))
+@@ -356,7 +402,8 @@ static int deferred_probe_initcall(void)
+ 	 * that is optional
+ 	 */
+ 	driver_deferred_probe_trigger();
+-	flush_work(&deferred_probe_work);
++	if (!warm_async)
++		flush_work(&deferred_probe_work);
+ 
+ 	if (driver_deferred_probe_timeout > 0) {
+ 		schedule_delayed_work(&deferred_probe_timeout_work,
+@@ -622,10 +669,12 @@ static int call_driver_probe(struct device *dev, const struct device_driver *drv
+ {
+ 	int ret = 0;
+ 
++	driver_boot_trace(dev, "callback begin");
+ 	if (dev->bus->probe)
+ 		ret = dev->bus->probe(dev);
+ 	else if (drv->probe)
+ 		ret = drv->probe(dev);
++	driver_boot_trace(dev, "callback end");
+ 
+ 	switch (ret) {
+ 	case 0:
+@@ -857,6 +906,7 @@ static int __driver_probe_device(const struct device_driver *drv, struct device
+ 	dev_dbg(dev, "bus: '%s': %s: matched device with driver %s\n",
+ 		drv->bus->name, __func__, drv->name);
+ 
++	driver_boot_trace(dev, "suppliers/runtime begin");
+ 	pm_runtime_get_suppliers(dev);
+ 	if (dev->parent)
+ 		pm_runtime_get_sync(dev->parent);
+@@ -872,6 +922,7 @@ static int __driver_probe_device(const struct device_driver *drv, struct device
+ 		pm_runtime_put(dev->parent);
+ 
+ 	pm_runtime_put_suppliers(dev);
++	driver_boot_trace(dev, "runtime end");
+ 	return ret;
+ }
+ 
+@@ -895,7 +946,9 @@ static int driver_probe_device(const struct device_driver *drv, struct device *d
+ 	int ret;
+ 
+ 	atomic_inc(&probe_count);
++	driver_boot_trace(dev, "probe begin");
+ 	ret = __driver_probe_device(drv, dev);
++	driver_boot_trace(dev, "probe end");
+ 	if (ret == -EPROBE_DEFER || ret == EPROBE_DEFER) {
+ 		driver_deferred_probe_add(dev);
+ 
+-- 
+2.56.0
+

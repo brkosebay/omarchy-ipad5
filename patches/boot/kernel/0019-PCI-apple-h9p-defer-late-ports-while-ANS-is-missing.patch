@@ -1,0 +1,67 @@
+From 6d449cccb367476701872e683021be769c1f5dca Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sun, 25 Oct 2026 00:15:19 +0000
+Subject: [PATCH] PCI: apple-h9p: defer late j71t ports while ANS is missing
+
+The tri46 same-entry warm-boot rescue trace shows Wi-Fi 14e4:43dc
+enumerating at 0000:01:00.0 after ANS port 0 failed link training.
+The DT maps bus 1 to ANS DART0 at 601008000, so its all-ones
+attach/reinit and iommu_setup_default_domain warning are a secondary
+wrong-DART attachment, not proof of a shared PMGR power failure.
+
+Programming rescue-bus secondary=2 does not prevent this: the common
+ECAM host helper sets PCI_REASSIGN_ALL_BUS before scanning.
+
+Keep late ports unpublished on j71t trial ANS boots until port 0 is
+enabled. After a successful explicit ANS rescue and rescan has reserved
+bus 1, reschedule late-port work so Wi-Fi can enumerate on bus 2.
+Leave the normal ANS-present, Round 7 and other-board paths unchanged.
+
+This guards DART routing. It does not repair the earlier port-0 link
+failure and does not add a shared-domain reset or automatic retry.
+
+Validated: actual late-work/rescue functions with ASan/UBSan fixtures
+(red on tri46), 23 existing ANS handoff tests, ARM64 object compilation,
+and strict checkpatch. No device access or hardware validation.
+---
+ drivers/pci/controller/pcie-apple-h9p.c | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/drivers/pci/controller/pcie-apple-h9p.c b/drivers/pci/controller/pcie-apple-h9p.c
+index f3e3f5724e..3a60a3ac3c 100644
+--- a/drivers/pci/controller/pcie-apple-h9p.c
++++ b/drivers/pci/controller/pcie-apple-h9p.c
+@@ -2796,6 +2796,20 @@ static void apple_h9p_late_ports_work(struct work_struct *work)
+ 	unsigned int port;
+ 	int ret;
+ 
++	/* The DT maps bus 1 to ANS/DART0, bus 2 to Wi-Fi/DART1. The
++	 * generic host scan reassigns buses, overriding rescue_bus(). With
++	 * port 0 absent it gives Wi-Fi bus 1 and attaches it to the stopped
++	 * ANS DART. Leave late ports unpublished until ANS owns bus 1.
++	 */
++	if (of_machine_is_compatible("apple,j71t") &&
++	    pcie->ans_mode != APPLE_ANS_ROUND7 &&
++	    !(READ_ONCE(pcie->enabled_ports) & BIT(0))) {
++		dev_warn(pcie->dev,
++			 "ANS port 0 missing; deferring late ports %#lx to preserve DART routing\n",
++			 pending);
++		return;
++	}
++
+ 	for_each_set_bit(port, &pending, H9P_NUM_PORTS) {
+ 		ret = apple_h9p_late_port(pcie, port);
+ 		if (ret == -EPROBE_DEFER) {
+@@ -3085,6 +3099,9 @@ static ssize_t ans_recover_store(struct device *dev,
+ out:
+ 	pcie->ans_rescue_result = ret;
+ 	pci_unlock_rescan_remove();
++	/* Successful ANS publication reserves bus 1 before Wi-Fi can scan. */
++	if (!ret && pcie->late_ports)
++		schedule_delayed_work(&pcie->late_work, 0);
+ 	return ret ? ret : count;
+ }
+ 
+-- 
+2.56.0
+

@@ -1,0 +1,71 @@
+From 6ae884719a0df21a6c12bd467f4871e188fdd492 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 14:16:38 +0000
+Subject: [PATCH 33/43] wifi: brcmfmac: feature: Drop P2P on the Apple iOS
+ BCM4355 C0 firmware
+
+Apple's iOS 16 firmware for the BCM4355 C0 "FearA" module (9.44.205.0.3.50.46,
+FWID 01-9787ef4d) answers the "p2p" iovar, so brcmfmac advertises
+P2P-device support. But it fails "p2p_da_override" with -52, so every
+P2P device creation fails:
+
+  brcmf_p2p_set_firmware: failed to update device address ret -52
+  brcmf_p2p_create_p2pdev: set p2p_disc error
+  brcmf_cfg80211_add_iface: add iface p2p-dev-wld0 type 10 failed: err=-52
+
+(NetworkManager tries this on every start.) Apple uses AWDL, not Wi-Fi
+P2P. Add a per-FWID table of features to clear, the counterpart of
+brcmf_feat_fwfeat_map, with P2P for this firmware.
+---
+ .../broadcom/brcm80211/brcmfmac/feature.c     | 28 +++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/feature.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/feature.c
+index 488364ef8f..63cc186947 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/feature.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/feature.c
+@@ -104,6 +104,33 @@ static const struct brcmf_feat_fwfeat brcmf_feat_fwfeat_map[] = {
+ 	{ "01-d2cbb8fd", BIT(BRCMF_FEAT_MONITOR_FMT_HW_RX_HDR) },
+ };
+ 
++/* Features a given firmware build advertises but can't actually do */
++static const struct brcmf_feat_fwfeat brcmf_feat_fwfeat_disable_map[] = {
++	/*
++	 * Apple iOS 16 BCM4355 C0 "FearA" firmware (9.44.205.0.3.50.46):
++	 * answers the "p2p" iovar but fails "p2p_da_override" with -52, so
++	 * every P2P device creation fails. Apple uses AWDL, not Wi-Fi P2P.
++	 */
++	{ "01-9787ef4d", BIT(BRCMF_FEAT_P2P) },
++};
++
++static void brcmf_feat_firmware_disables(struct brcmf_pub *drv)
++{
++	const struct brcmf_feat_fwfeat *e;
++	int i, j;
++
++	for (i = 0; i < ARRAY_SIZE(brcmf_feat_fwfeat_disable_map); i++) {
++		e = &brcmf_feat_fwfeat_disable_map[i];
++		if (strcmp(e->fwid, drv->fwver))
++			continue;
++		for (j = 0; j < BRCMF_FEAT_LAST; j++)
++			if (e->feat_flags & drv->feat_flags & BIT(j))
++				brcmf_info("firmware %s: disabling feature %s\n",
++					   e->fwid, brcmf_feat_names[j]);
++		drv->feat_flags &= ~e->feat_flags;
++	}
++}
++
+ static void brcmf_feat_firmware_overrides(struct brcmf_pub *drv)
+ {
+ 	const struct brcmf_feat_fwfeat *e;
+@@ -343,6 +370,7 @@ void brcmf_feat_attach(struct brcmf_pub *drvr)
+ 
+ 	brcmf_feat_wlc_version_overrides(drvr);
+ 	brcmf_feat_firmware_overrides(drvr);
++	brcmf_feat_firmware_disables(drvr);
+ 
+ 	brcmf_fwvid_feat_attach(ifp);
+ 
+-- 
+2.56.0
+

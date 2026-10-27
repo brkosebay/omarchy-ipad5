@@ -1,0 +1,224 @@
+#!/bin/bash
+# Turn the iPad's desktop: the screen and the touchscreen together.
+#
+#   ipad-rotate landscape          home button on the right [default]
+#   ipad-rotate portrait           home button at the bottom (the panel's own way)
+#   ipad-rotate landscape-flipped  home button on the left
+#   ipad-rotate portrait-flipped   home button at the top
+#   ipad-rotate next               landscape -> portrait -> landscape-flipped
+#                                  -> landscape (SUPER + ALT + R)
+#   ipad-rotate                    print the current orientation
+#   ipad-rotate lock [on|off|toggle]   rotation lock (default: print "locked" or
+#                                  "unlocked"); the bar's lock button and
+#                                  SUPER + ALT + SHIFT + R toggle it
+#
+# With an accelerometer, ipad-autorotate (a user unit) calls this to follow the
+# way the iPad is held; the lock stops it. Turning the screen by hand here
+# always works, locked or not, and stays until the iPad is physically turned.
+#
+# The choice is kept as orientation=... in ~/.local/state/linux-a9/display,
+# which ~/.config/hypr/ipad.lua reads, so it holds across logins and boots;
+# it is applied through hyprctl eval (no full config reload). Visible settling
+# can outlast the IPC reply; see docs/omarchy/rotation-blank.md.
+# The Omarchy bar stays on top in every orientation
+# (bar_portrait= / bar_landscape= override). touch_transform=0..7 in the same file
+# overrides the touchscreen's rotation (it follows the screen otherwise).
+# rotation_lock=on|off in the same file is the lock.
+# IPAD_ROTATE_APPLY=transform opts into a partial monitor-rule update for A/B
+# testing; legacy (default) reasserts preferred/auto/scale=2. The transform
+# experiment reports eval failures without silently falling back to reload.
+#
+# linux-a9 (docs/omarchy/hyprland.md). Works from the desktop and over SSH.
+set -euo pipefail
+
+state=${XDG_STATE_HOME:-$HOME/.local/state}/linux-a9/display
+order=(landscape portrait landscape-flipped)
+
+# No state file yet (a fresh image) means the default. Under set -e a failing
+# sed in the substitution would end the script silently, so don't run it then.
+current() {
+  local value=""
+  if [[ -r $state ]]; then
+    value=$(sed -n 's/^[[:space:]]*orientation[[:space:]]*=[[:space:]]*//p' "$state" | tail -1)
+  fi
+  case $value in
+    landscape | portrait | landscape-flipped | portrait-flipped) echo "$value" ;;
+    *) echo landscape ;;
+  esac
+}
+
+# Replace or add one key=value line, atomically.
+set_state() {
+  local tmp
+  mkdir -p "${state%/*}"
+  tmp=$(mktemp "$state.XXXXXX")
+  grep -v "^[[:space:]]*$1[[:space:]]*=" "$state" 2>/dev/null >"$tmp" || true
+  echo "$1=$2" >>"$tmp"
+  mv -f "$tmp" "$state"
+}
+
+# Hyprland transform for each orientation; must match ~/.config/hypr/ipad.lua.
+transform_of() {
+  case $1 in
+    portrait) echo 0 ;;
+    landscape-flipped) echo 1 ;;
+    portrait-flipped) echo 2 ;;
+    *) echo 3 ;;
+  esac
+}
+
+state_value() {
+  [[ -r $state ]] || return 0
+  sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$state" | tail -1
+}
+
+# From the desktop Hyprland's instance is in the environment; over SSH, use
+# the newest running one.
+apply_hyprland() {
+  if [[ -z ${HYPRLAND_INSTANCE_SIGNATURE:-} ]]; then
+    export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+    local sig="" instance
+    # No hypr directory (Hyprland never ran this boot) isn't an error.
+    for instance in "$XDG_RUNTIME_DIR"/hypr/*; do
+      [[ -S $instance/.socket.sock ]] || continue
+      if [[ -z $sig || $instance -nt $XDG_RUNTIME_DIR/hypr/$sig ]]; then
+        sig=${instance##*/}
+      fi
+    done
+    if [[ -z $sig || ! -S $XDG_RUNTIME_DIR/hypr/$sig/.socket.sock ]]; then
+      echo "Hyprland isn't running; the next login applies it"
+      return 0
+    fi
+    export HYPRLAND_INSTANCE_SIGNATURE=$sig
+  fi
+  # hl.monitor merges omitted fields from the rule with the SAME output
+  # selector. Keep output="" to update ipad.lua's existing catch-all rule.
+  # Hyprland 0.56.2 already applies transform diffs softly; this experiment
+  # also avoids overwriting hard fields changed by another config source.
+  local t touch monitor reply
+  t=$(transform_of "$1")
+  touch=$(state_value touch_transform)
+  [[ $touch =~ ^[0-7]$ ]] || touch=$t
+  if [[ ${IPAD_ROTATE_APPLY:-legacy} == transform ]]; then
+    monitor="hl.monitor({ output = \"\", transform = $t })"
+  else
+    monitor="hl.monitor({ output = \"\", mode = \"preferred\", position = \"auto\", scale = 2, transform = $t })"
+  fi
+  if ! reply=$(hyprctl eval "$monitor hl.config({ input = { touchdevice = { transform = $touch } } })" 2>&1); then
+    if [[ ${IPAD_ROTATE_APPLY:-legacy} == transform ]]; then
+      printf 'ipad-rotate: transform eval failed: %s\n' "$reply" >&2
+      return 1
+    fi
+    hyprctl reload >/dev/null
+  fi
+}
+
+# The Omarchy shell's bar: on top in every orientation (owner's choice,
+# 2026-10-27). bar_portrait / bar_landscape in the state file override it,
+# e.g. bar_landscape=left to put it on the side in landscape. The shell watches shell.json and redraws.
+place_bar() {
+  local file=${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/shell.json want
+  [[ -w $file ]] || return 0
+  case $1 in
+    portrait | portrait-flipped) want=$(state_value bar_portrait); want=${want:-top} ;;
+    *) want=$(state_value bar_landscape); want=${want:-top} ;;
+  esac
+  case $want in top | bottom | left | right) ;; *) return 0 ;; esac
+  python3 - "$file" "$want" <<'EOF' || true
+import json, os, sys, tempfile
+path, want = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    config = json.load(f)
+bar = config.setdefault("bar", {})
+if bar.get("position") == want:
+    sys.exit(0)
+bar["position"] = want
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".shell.json.")
+with os.fdopen(fd, "w") as f:
+    json.dump(config, f, indent=2)
+    f.write("\n")
+os.chmod(tmp, os.stat(path).st_mode & 0o777)
+os.replace(tmp, path)
+EOF
+}
+
+# Rotation lock: only ipad-autorotate looks at it.
+lock_state() {
+  local value=""
+  if [[ -r $state ]]; then
+    value=$(sed -n 's/^[[:space:]]*rotation_lock[[:space:]]*=[[:space:]]*//p' "$state" | tail -1)
+  fi
+  [[ $value == on ]] && echo locked || echo unlocked
+}
+
+lock() {
+  local now want
+  now=$(lock_state)
+  case ${1:-} in
+    "") echo "$now"; return 0 ;;
+    on) want=locked ;;
+    off) want=unlocked ;;
+    toggle) [[ $now == locked ]] && want=unlocked || want=locked ;;
+    *) echo "usage: ipad-rotate lock [on|off|toggle]" >&2; return 2 ;;
+  esac
+  set_state rotation_lock "$([[ $want == locked ]] && echo on || echo off)"
+  # Over SSH there is no bus address in the environment.
+  export DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bus}
+  notify-send -t 1500 -i object-rotate-right "Rotation $want" 2>/dev/null || true
+  echo "$want"
+}
+
+# squeekboard lays itself out from the output's size when it appears; one
+# that was already up on the old orientation is hidden and shown again so it
+# does too. A keyboard that wasn't up is left alone.
+relayout_osk() {
+  command -v ipad-osk >/dev/null || return 0
+  [[ $(ipad-osk status 2>/dev/null) == *shown* ]] || return 0
+  sleep 0.5
+  ipad-osk hide >/dev/null 2>&1 || true
+  sleep 0.3
+  ipad-osk show >/dev/null 2>&1 || true
+}
+
+case ${1:-} in
+  "")
+    current
+    exit 0
+    ;;
+  lock)
+    shift
+    lock "$@"
+    exit $?
+    ;;
+  next)
+    now=$(current)
+    want=${order[0]}
+    for i in "${!order[@]}"; do
+      if [[ ${order[$i]} == "$now" ]]; then
+        want=${order[$(((i + 1) % ${#order[@]}))]}
+      fi
+    done
+    ;;
+  landscape | portrait | landscape-flipped | portrait-flipped)
+    want=$1
+    ;;
+  -h | --help | help)
+    awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"
+    exit 0
+    ;;
+  *)
+    echo "usage: ipad-rotate [landscape|portrait|landscape-flipped|portrait-flipped|next|lock [on|off|toggle]]" >&2
+    exit 2
+    ;;
+esac
+
+before=$(current)
+case ${IPAD_ROTATE_APPLY:-legacy} in
+  legacy | transform) ;;
+  *) echo 'IPAD_ROTATE_APPLY must be legacy or transform' >&2; exit 2 ;;
+esac
+set_state orientation "$want"
+apply_hyprland "$want"
+place_bar "$want"
+[[ $before != "$want" ]] && relayout_osk
+echo "$want"

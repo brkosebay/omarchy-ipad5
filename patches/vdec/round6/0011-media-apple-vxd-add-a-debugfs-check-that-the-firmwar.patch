@@ -1,0 +1,257 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 11:10:39 +0000
+Subject: [PATCH 11/20] media: apple: vxd: add a debugfs check that the firmware
+ drives TO_MTX_RD
+
+On the device every message so far, the 0x80 init message and four
+pings, was "consumed after 0 us".  That is what a fast firmware reader
+gives, but also what a read index that is not written by the firmware
+at all would give.  consume_check pushes one benign 0x83 in three
+stages:
+
+  1. the words go into the ring, the write index (0x2030) is not
+     published: rd must stay put for 20 ms, and the ring window must
+     read back what was written;
+  2. the write index is published without the doorbell: whether rd
+     moves says if the reader polls 0x2030 or waits for 0x88;
+  3. the doorbell is rung: rd must reach the new write index (100 ms).
+
+It logs 0x0, 0x200c and 0x2010 before and after, drains TO_HOST by
+hand, and returns 0, -EIO (rd moved with nothing published) or
+-ETIMEDOUT to the shell.  It runs under power_lock like the ping and
+refuses while a job is active or TO_MTX is not idle.
+
+The device also read 0x0 = 0x1029821 and 0x200c = 0 after the init
+message.  0x1029821 is an odd address inside the firmware image
+(0x01000000 + 0x29821, MINIM code), so the study's "0x0 = consumed word
+count, 0x200c = firmware PC" may be swapped.  Until that is settled the
+dumps print both registers by offset instead of by role.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ drivers/media/platform/apple/vxd/apple-vxd-mbox.c | 181 +++++++++++++++++++++-
+ 1 file changed, 177 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-mbox.c b/drivers/media/platform/apple/vxd/apple-vxd-mbox.c
+index 6d5adfe18d76827fe08e7a7e6281e483b2cb2cad..d3b1c2ed0e0b060c602122580599984d27a282c0 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-mbox.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-mbox.c
+@@ -451,7 +451,7 @@ static void vxd_msg_completion(struct apple_vxd_dev *vxd, const u32 *msg,
+ 	}
+ 	if (status & VXD_COMPLETION_REATTEMPT)
+ 		dev_warn_ratelimited(vxd->dev,
+-				     "completion fence %#x asks for REATTEMPT_SINGLEPIPE (fw pc %#x)\n",
++				     "completion fence %#x asks for REATTEMPT_SINGLEPIPE (0x200c %#x)\n",
+ 				     id, vxd_read(vxd, VXD_REG_FW_PC));
+ 
+ 	for (i = 0; i < APPLE_VXD_NUM_FENCES; i++) {
+@@ -588,7 +588,7 @@ irqreturn_t apple_vxd_irq(int irq, void *data)
+ static void vxd_mbox_log_state(struct apple_vxd_dev *vxd, const char *what)
+ {
+ 	dev_info(vxd->dev,
+-		 "%s: TO_MTX rd %u wr %u, TO_HOST rd %u wr %u, fw pc %#x, consumed word %#x, comms state %#x, irq status %#x\n",
++		 "%s: TO_MTX rd %u wr %u, TO_HOST rd %u wr %u, 0x200c %#x, 0x0 %#x, comms state %#x, irq status %#x\n",
+ 		 what, vxd_read(vxd, VXD_REG_TO_MTX_RD_INDEX),
+ 		 vxd_read(vxd, VXD_REG_TO_MTX_WR_INDEX),
+ 		 vxd_read(vxd, VXD_REG_TO_HOST_RD_INDEX),
+@@ -830,6 +830,177 @@ static const struct file_operations apple_vxd_ping_fops = {
+ 	.llseek = default_llseek,
+ };
+ 
++struct vxd_comms_snap {
++	u32 rd, wr, r0, r200c, r2010;
++};
++
++static void vxd_comms_snap(struct apple_vxd_dev *vxd, struct vxd_comms_snap *s,
++			   const char *when)
++{
++	s->rd = vxd_read(vxd, VXD_REG_TO_MTX_RD_INDEX);
++	s->wr = vxd_read(vxd, VXD_REG_TO_MTX_WR_INDEX);
++	s->r0 = vxd_read(vxd, VXD_REG_MTX_MSG_CONSUMED);
++	s->r200c = vxd_read(vxd, VXD_REG_FW_PC);
++	s->r2010 = vxd_read(vxd, VXD_REG_COMMS_MSG_COUNT);
++	dev_info(vxd->dev,
++		 "consume_check: %s: TO_MTX rd %u wr %u, 0x0 %#x, 0x200c %#x, 0x2010 %#x\n",
++		 when, s->rd, s->wr, s->r0, s->r200c, s->r2010);
++}
++
++static u32 vxd_to_mtx_rd(struct apple_vxd_dev *vxd)
++{
++	return vxd_read(vxd, VXD_REG_TO_MTX_RD_INDEX);
++}
++
++/*
++ * Is TO_MTX_RD (0x2028) really written by the firmware?  Every message so
++ * far was "consumed after 0 us", which a reader that moves rd before the
++ * host even looks would also produce.  One benign 0x83 in three stages:
++ *
++ *   1. ring words written, write index NOT published: rd must not move
++ *      (20 ms), and the ring window must read back what was written;
++ *   2. write index published, no doorbell: does the reader poll 0x2030
++ *      (rd moves) or wait for the doorbell (rd stays)?  Either is a finding;
++ *   3. doorbell: rd must reach the new write index (100 ms).
++ *
++ * Returns 0 when stage 1 held and stage 3 was reached, -EIO when rd moved
++ * with nothing published, -ETIMEDOUT when the message was never taken.
++ * Same serialization as the ping (power_lock); refuses while a decode job
++ * is in flight.
++ */
++static int apple_vxd_consume_check(struct apple_vxd_dev *vxd)
++{
++	struct apple_vxd_fence *fence = NULL;
++	struct vxd_comms_snap s0, s1;
++	u32 msg[2], back[2], cap, wr, wr1, rd;
++	unsigned long flags;
++	bool moved_early = false, moved_nodb = false;
++	unsigned int i, drained;
++	ktime_t t0;
++	int ret, err;
++
++	mutex_lock(&vxd->power_lock);
++	if (!vxd->mbox_ready) {
++		dev_err(vxd->dev, "consume_check: the firmware mailbox is not up (boot first)\n");
++		ret = -ENODEV;
++		goto out_unlock;
++	}
++	if (READ_ONCE(vxd->job_active)) {
++		ret = -EBUSY;
++		goto out_unlock;
++	}
++	ret = pm_runtime_resume_and_get(vxd->dev);
++	if (ret)
++		goto out_unlock;
++
++	fence = apple_vxd_fence_arm(vxd, 0, VXD_MSG_NOP_FIRST);
++	if (!fence) {
++		ret = -EBUSY;
++		goto out_put;
++	}
++	msg[0] = apple_vxd_msg_hdr(fence->id, VXD_MSG_NOP_FIRST, 2);
++	msg[1] = VXD_PING_COOKIE ^ fence->id;
++
++	vxd_comms_snap(vxd, &s0, "before");
++	cap = vxd->to_mtx.cap;
++	if (s0.rd >= cap || s0.wr >= cap || s0.rd != s0.wr) {
++		dev_err(vxd->dev, "consume_check: TO_MTX not idle (rd %u wr %u, capacity %u)\n",
++			s0.rd, s0.wr, cap);
++		ret = -EBUSY;
++		goto out_fence;
++	}
++
++	/* Stage 1: words only. */
++	spin_lock_irqsave(&vxd->mbox_lock, flags);
++	wr = s0.wr;
++	for (i = 0; i < ARRAY_SIZE(msg); i++) {
++		vxd_write(vxd, vxd_ring_reg(&vxd->to_mtx, wr), msg[i]);
++		wr = vxd_ring_next(wr, cap);
++	}
++	wr1 = wr;
++	wr = s0.wr;
++	for (i = 0; i < ARRAY_SIZE(msg); i++) {
++		back[i] = vxd_read(vxd, vxd_ring_reg(&vxd->to_mtx, wr));
++		wr = vxd_ring_next(wr, cap);
++	}
++	spin_unlock_irqrestore(&vxd->mbox_lock, flags);
++	vxd_step(vxd->dev,
++		 "consume_check: stage 1: %#010x %#010x written at TO_MTX [%u..%u), read back %#010x %#010x, write index NOT published; wait 20 ms",
++		 msg[0], msg[1], s0.wr, wr1, back[0], back[1]);
++	msleep(20);
++	rd = vxd_to_mtx_rd(vxd);
++	moved_early = rd != s0.rd;
++	dev_info(vxd->dev, "consume_check: stage 1: rd %u after 20 ms (%s), wr register %u, ring readback %s\n",
++		 rd, moved_early ? "MOVED with nothing published: FAIL" : "unchanged: ok",
++		 vxd_read(vxd, VXD_REG_TO_MTX_WR_INDEX),
++		 back[0] == msg[0] && back[1] == msg[1] ? "matches" : "DIFFERS");
++
++	/* Stage 2: publish the write index, no doorbell. */
++	spin_lock_irqsave(&vxd->mbox_lock, flags);
++	vxd_write(vxd, VXD_REG_TO_MTX_WR_INDEX, wr1);
++	vxd_read(vxd, VXD_REG_TO_MTX_RD_INDEX);
++	vxd_read(vxd, VXD_REG_TO_MTX_WR_INDEX);
++	vxd_read(vxd, VXD_REG_TO_HOST_RD_INDEX);
++	vxd_read(vxd, VXD_REG_TO_HOST_WR_INDEX);
++	vxd->stats.sent++;
++	spin_unlock_irqrestore(&vxd->mbox_lock, flags);
++	t0 = ktime_get();
++	err = read_poll_timeout(vxd_to_mtx_rd, rd, rd == wr1, 20, 50000, false, vxd);
++	moved_nodb = !err;
++	dev_info(vxd->dev, "consume_check: stage 2: write index %u published, no doorbell: rd %u, %s after %lld us\n",
++		 wr1, rd, moved_nodb ? "taken (the reader polls 0x2030)" :
++		 "not taken (the reader waits for the doorbell)",
++		 ktime_us_delta(ktime_get(), t0));
++
++	/* Stage 3: doorbell. */
++	spin_lock_irqsave(&vxd->mbox_lock, flags);
++	vxd_write(vxd, VXD_REG_MTX_DOORBELL, 1);
++	vxd_read(vxd, VXD_REG_COMMS_STATE);
++	spin_unlock_irqrestore(&vxd->mbox_lock, flags);
++	t0 = ktime_get();
++	err = read_poll_timeout(vxd_to_mtx_rd, rd, rd == wr1, 20, 100000, false, vxd);
++	dev_info(vxd->dev, "consume_check: stage 3: doorbell rung: rd %u, %s after %lld us\n",
++		 rd, err ? "NOT taken" : "taken", ktime_us_delta(ktime_get(), t0));
++
++	drained = apple_vxd_mbox_drain(vxd);
++	vxd_comms_snap(vxd, &s1, "after");
++	if (moved_early)
++		ret = -EIO;
++	else if (err)
++		ret = -ETIMEDOUT;
++	dev_info(vxd->dev,
++		 "consume_check: %s: rd firmware-driven %s, reader %s, %u TO_HOST messages drained, 0x0 %s, 0x200c %s, 0x2010 %s\n",
++		 ret ? "FAIL" : "PASS", moved_early ? "NO" : "yes",
++		 moved_nodb ? "polls the write index" : "is doorbell-driven", drained,
++		 s1.r0 == s0.r0 ? "unchanged" : "changed",
++		 s1.r200c == s0.r200c ? "unchanged" : "changed",
++		 s1.r2010 == s0.r2010 ? "unchanged" : "changed");
++
++out_fence:
++	apple_vxd_fence_release(vxd, fence);
++out_put:
++	pm_runtime_put_autosuspend(vxd->dev);
++out_unlock:
++	mutex_unlock(&vxd->power_lock);
++	return ret;
++}
++
++static ssize_t apple_vxd_consume_check_write(struct file *file,
++					     const char __user *ubuf,
++					     size_t count, loff_t *ppos)
++{
++	int ret = apple_vxd_consume_check(file->private_data);
++
++	return ret ? ret : count;
++}
++
++static const struct file_operations apple_vxd_consume_check_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = apple_vxd_consume_check_write,
++	.llseek = default_llseek,
++};
++
+ static void vxd_dump_ring(struct seq_file *m, struct apple_vxd_dev *vxd,
+ 			  const char *name, const struct apple_vxd_ring *ring)
+ {
+@@ -881,9 +1052,9 @@ static int apple_vxd_mbox_dump_show(struct seq_file *m, void *v)
+ 	raw_host = vxd_read(vxd, VXD_REG_TO_HOST_RING);
+ 
+ 	seq_printf(m, "comms state      %#x\n", vxd_read(vxd, VXD_REG_COMMS_STATE));
+-	seq_printf(m, "consumed (0x0)   %#x\n", vxd_read(vxd, VXD_REG_MTX_MSG_CONSUMED));
++	seq_printf(m, "reg 0x0          %#x\n", vxd_read(vxd, VXD_REG_MTX_MSG_CONSUMED));
+ 	seq_printf(m, "comms 0x2008     %#x\n", vxd_read(vxd, VXD_REG_COMMS_2008));
+-	seq_printf(m, "fw pc (200c)     %#x\n", vxd_read(vxd, VXD_REG_FW_PC));
++	seq_printf(m, "reg 0x200c       %#x\n", vxd_read(vxd, VXD_REG_FW_PC));
+ 	seq_printf(m, "msg count (2010) %#x\n", vxd_read(vxd, VXD_REG_COMMS_MSG_COUNT));
+ 	seq_printf(m, "fw ready (2014)  %#x%s\n", vxd_read(vxd, VXD_REG_FW_READY_MAGIC),
+ 		   vxd->fw_loaded ? " (firmware alive)" : "");
+@@ -999,6 +1170,8 @@ int apple_vxd_mbox_init(struct apple_vxd_dev *vxd)
+ 	debugfs_create_file("regs", 0444, dir, vxd, &apple_vxd_regs_dump_fops);
+ 	debugfs_create_file("boot", 0200, dir, vxd, &apple_vxd_boot_trigger_fops);
+ 	debugfs_create_file("ping", 0200, dir, vxd, &apple_vxd_ping_fops);
++	debugfs_create_file("consume_check", 0200, dir, vxd,
++			    &apple_vxd_consume_check_fops);
+ 	apple_vxd_cmdbufs_debugfs(vxd);
+ 	return 0;
+ }

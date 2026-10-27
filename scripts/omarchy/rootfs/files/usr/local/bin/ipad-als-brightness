@@ -1,0 +1,902 @@
+#!/usr/bin/env python3
+"""Ambient-light auto-brightness for Omarchy on the iPad (linux-a9).
+
+Follows the ambient light sensor (the CT819, an IIO light sensor with
+in_illuminance_input in lux) and moves the backlight with brightnessctl. It
+runs as the user unit ipad-als-brightness.service, which only starts where
+such a sensor exists, and it does nothing until switched on (it is off by
+default: the sensor's calibration has not been checked against a light meter).
+
+  ipad-als-brightness on|off|toggle   switch it (the bar button, the menu)
+  ipad-als-brightness status          what the running daemon last saw
+  ipad-als-brightness enabled         exit status 0 when it is on
+  ipad-als-brightness dim|undim       idle dim for hypridle: dims, and tells the
+                                      daemon to leave the backlight alone
+  ipad-als-brightness --list          sensors and backlights found, one reading
+  ipad-als-brightness --probe [S]     dry run for S seconds (default 20), logging
+                                      lux, the smoothed level and what it would set
+  ipad-als-brightness [daemon]        the daemon (what the unit runs)
+
+Sources (--source, default auto):
+  proxy   iio-sensor-proxy's AmbientLightLevel, read through monitor-sensor
+  iio     the kernel's IIO light sensor straight from sysfs, polled
+  auto    proxy when it reports an ambient light sensor, else iio, else wait
+Testing without hardware: --mock PATH (lux, one per line, from a FIFO or file),
+--mock-iio DIR (a fake sysfs tree), IPAD_ALS_MONITOR_CMD (replaces monitor-sensor),
+IPAD_ALS_BRIGHTNESSCTL (replaces brightnessctl), IPAD_ALS_BACKLIGHT_ROOT.
+
+How it decides (the numbers are in ~/.config/linux-a9/als-brightness.conf):
+  - the lux readings go through a median of the last five and a smoothing in
+    log(1 + lux) with a time constant of a few seconds, so a hand passing over
+    the sensor doesn't flicker the screen
+  - the smoothed level maps to a brightness through a curve (log lux, linear
+    between the points) clamped to min_pct..max_pct, never to off
+  - it only moves when the level changed by more than `hysteresis` (20 %) and
+    the brightness would move by at least `min_pct_step`, and at most once per
+    `min_interval`; the move is a short ramp, not a jump
+  - a brightness change it didn't make (a brightness key, the menu) pauses it
+    for `override_secs`; after that it resumes from the new brightness
+  - it holds still while the screen is dimmed for idle (ipad-als-brightness
+    dim) or turned off for the cover (ipad-lid)
+
+Switch state lives in ~/.local/state/linux-a9/display as auto_brightness=on|off
+(absent: the `enabled` key of the conf file, default off).
+
+~/.config/linux-a9/als-brightness.conf (key = value, # comments; SIGHUP or a
+restart applies):
+  enabled = off                  default when nothing was switched yet
+  backlight =                    /sys/class/backlight name (default: the first)
+  curve = 0:10, 5:18, 20:30, 80:50, 250:70, 700:90, 1500:100   lux:percent
+  min_pct = 5   max_pct = 100    clamp (never below the panel's lowest step)
+  lux_scale = 1.0                multiply the readings (calibrate to a meter)
+  smooth_secs = 3.0              smoothing time constant
+  hysteresis = 0.20              relative level change needed to move
+  min_pct_step = 2               smallest brightness move worth making
+  min_interval = 2.0             seconds between two moves
+  ramp_pct_per_s = 40            speed of a move
+  override_secs = 30             pause after a manual change
+  poll_hz = 1.0                  iio source: reads per second (keep it >= 0.5:
+                                 the sensor powers down after 2 s without a read)
+"""
+
+import argparse
+import glob
+import json
+import math
+import os
+import pty
+import re
+import select
+import shlex
+import shutil
+import signal
+import stat
+import statistics
+import subprocess
+import sys
+import time
+
+IIO_ROOT = "/sys/bus/iio/devices"
+BACKLIGHT_ROOT = "/sys/class/backlight"
+TICK = 0.1
+RAMP_STEP = 0.15  # seconds between two backlight writes while ramping
+HOLD_SETTLE = 1.0  # seconds to wait after a hold ends (brightnessctl -r runs)
+DIM_STALE = 2 * 3600  # an idle-dim flag older than this is a leftover
+DEFAULT_CURVE = "0:10, 5:18, 20:30, 80:50, 250:70, 700:90, 1500:100"
+DEFAULTS = {
+    "enabled": False,
+    "backlight": "",
+    "curve": DEFAULT_CURVE,
+    "min_pct": 5.0,
+    "max_pct": 100.0,
+    "lux_scale": 1.0,
+    "smooth_secs": 3.0,
+    "hysteresis": 0.20,
+    "min_pct_step": 2.0,
+    "min_interval": 2.0,
+    "ramp_pct_per_s": 40.0,
+    "override_secs": 30.0,
+    "poll_hz": 1.0,
+}
+
+
+def log(*args):
+    print("ipad-als-brightness:", *args, file=sys.stderr, flush=True)
+
+
+# --- configuration and state ---------------------------------------------------
+def config_home():
+    return os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+
+
+def state_path():
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.join(base, "linux-a9", "display")
+
+
+def runtime_dir():
+    return os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "linux-a9")
+
+
+def status_path():
+    return os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "ipad-als-brightness.json")
+
+
+def parse_curve(text):
+    points = []
+    for part in text.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        lux, pct = part.split(":")
+        points.append((float(lux), float(pct)))
+    points.sort()
+    if len(points) < 2 or len({p[0] for p in points}) != len(points):
+        raise ValueError("needs at least two points with different lux")
+    return points
+
+
+def load_conf():
+    conf = dict(DEFAULTS)
+    try:
+        with open(os.path.join(config_home(), "linux-a9", "als-brightness.conf")) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        line = line.split("#", 1)[0].strip()
+        # several "key = value" pairs may share a line only in the docs; the
+        # file takes one per line
+        if "=" not in line:
+            continue
+        key, value = (part.strip() for part in line.split("=", 1))
+        if key not in DEFAULTS:
+            log(f"als-brightness.conf: unknown key {key}")
+        elif key == "enabled":
+            conf[key] = value.lower() in ("on", "yes", "true", "1")
+        elif key in ("backlight", "curve"):
+            conf[key] = value
+        else:
+            try:
+                conf[key] = float(value)
+            except ValueError:
+                log(f"als-brightness.conf: {key} = {value}: not a number")
+    try:
+        conf["curve_points"] = parse_curve(conf["curve"])
+    except ValueError as e:
+        log(f"als-brightness.conf: curve = {conf['curve']}: {e}; using the default")
+        conf["curve_points"] = parse_curve(DEFAULT_CURVE)
+    conf["min_pct"] = max(0.0, min(conf["min_pct"], 100.0))
+    conf["max_pct"] = max(conf["min_pct"], min(conf["max_pct"], 100.0))
+    return conf
+
+
+def read_state():
+    values = {}
+    try:
+        with open(state_path()) as f:
+            for line in f:
+                m = re.match(r"\s*([\w]+)\s*=\s*(\S+)", line)
+                if m:
+                    values[m.group(1)] = m.group(2)
+    except OSError:
+        pass
+    return values
+
+
+def set_state(key, value):
+    """Rewrite the state file with one key changed, the others kept (ipad-rotate
+    and ipad-tablet keep their own keys in it)."""
+    path = state_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        with open(path) as f:
+            lines = [ln for ln in f.read().splitlines() if not re.match(rf"\s*{re.escape(key)}\s*=", ln)]
+    except OSError:
+        lines = []
+    lines.append(f"{key}={value}")
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(tmp, path)
+
+
+FORCE_ENABLED = False  # --probe runs whatever the switch says
+
+
+def is_enabled(conf):
+    if FORCE_ENABLED:
+        return True
+    value = read_state().get("auto_brightness")
+    if value in ("on", "off"):
+        return value == "on"
+    return conf["enabled"]
+
+
+# --- the policy (no I/O, so the tests can drive it) -------------------------------
+def curve_pct(points, lux):
+    """Brightness percent for a lux level: linear in log(1 + lux) between the
+    points, flat beyond the ends."""
+    if lux <= points[0][0]:
+        return points[0][1]
+    if lux >= points[-1][0]:
+        return points[-1][1]
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        if x0 <= lux <= x1:
+            a, b, v = math.log1p(x0), math.log1p(x1), math.log1p(lux)
+            return y0 + (y1 - y0) * (v - a) / (b - a)
+    return points[-1][1]
+
+
+class Smoother:
+    """Median of the last few readings, then a first-order filter in log(1 + lux)."""
+
+    def __init__(self, tau, window=5):
+        self.tau, self.window = max(tau, 0.0), window
+        self.readings = []
+        self.level = None  # log(1 + lux)
+        self.time = None
+
+    def feed(self, lux, now):
+        self.readings = (self.readings + [max(lux, 0.0)])[-self.window:]
+        target = math.log1p(statistics.median(self.readings))
+        if self.level is None or self.tau == 0:
+            self.level = target
+        else:
+            alpha = 1.0 - math.exp(-max(now - self.time, 0.0) / self.tau)
+            self.level += alpha * (target - self.level)
+        self.time = now
+
+    @property
+    def lux(self):
+        return None if self.level is None else math.expm1(self.level)
+
+
+class Policy:
+    """When to move and to what."""
+
+    def __init__(self, conf):
+        self.conf = conf
+        self.reset()
+
+    def reset(self):
+        self.ref_level = None  # log(1 + lux) at the last move
+        self.last_move = -1e9
+
+    def goal(self, lux):
+        pct = curve_pct(self.conf["curve_points"], lux)
+        return max(self.conf["min_pct"], min(pct, self.conf["max_pct"]))
+
+    def decide(self, smoothed, now, current_pct):
+        """The percent to ramp to, or None to stay."""
+        goal = self.goal(smoothed.lux)
+        if self.ref_level is None:
+            # First move after starting, a pause or a manual change: go now.
+            if abs(goal - current_pct) < 1.0:
+                self.ref_level = smoothed.level
+                return None
+        else:
+            if abs(smoothed.level - self.ref_level) < math.log1p(self.conf["hysteresis"]):
+                return None
+            if abs(goal - current_pct) < self.conf["min_pct_step"]:
+                return None
+            if now - self.last_move < self.conf["min_interval"]:
+                return None
+        self.ref_level = smoothed.level
+        self.last_move = now
+        return goal
+
+
+# --- the backlight ------------------------------------------------------------------
+def read_number(path, default=None):
+    try:
+        with open(path) as f:
+            return float(f.read().strip())
+    except (OSError, ValueError):
+        return default
+
+
+def backlight_root():
+    return os.environ.get("IPAD_ALS_BACKLIGHT_ROOT") or BACKLIGHT_ROOT
+
+
+def brightnessctl_cmd():
+    return shlex.split(os.environ.get("IPAD_ALS_BRIGHTNESSCTL", "brightnessctl"))
+
+
+def find_backlight(name=""):
+    root = backlight_root()
+    if name:
+        return name if os.path.exists(os.path.join(root, name, "brightness")) else None
+    for path in sorted(glob.glob(os.path.join(root, "*"))):
+        if os.path.exists(os.path.join(path, "brightness")) and os.path.exists(os.path.join(path, "max_brightness")):
+            return os.path.basename(path)
+    return None
+
+
+class Backlight:
+    def __init__(self, name):
+        self.name = name
+        self.dir = os.path.join(backlight_root(), name)
+        self.max = int(read_number(os.path.join(self.dir, "max_brightness"), 0))
+        self.failed = False
+
+    def read(self):
+        value = read_number(os.path.join(self.dir, "brightness"))
+        return None if value is None else int(value)
+
+    def pct(self, raw):
+        return 100.0 * raw / self.max if self.max else 0.0
+
+    def raw_for(self, pct):
+        return max(1, min(self.max, int(round(pct * self.max / 100.0))))
+
+    def write(self, raw):
+        try:
+            result = subprocess.run(brightnessctl_cmd() + ["-q", "-d", self.name, "set", str(raw)],
+                                    capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            result = None
+            err = str(e)
+        else:
+            err = result.stderr.strip()
+        ok = result is not None and result.returncode == 0
+        if not ok and not self.failed:
+            log(f"brightnessctl set {raw} failed: {err}")
+        self.failed = not ok
+        return ok
+
+
+# --- sensor sources: poll(timeout) -> [lux, ...] -----------------------------------------
+def find_iio_light(root):
+    """The first IIO device with in_illuminance_input (or raw and scale)."""
+    for dev in sorted(glob.glob(os.path.join(root, "iio:device*"))):
+        if os.path.exists(os.path.join(dev, "in_illuminance_input")) or \
+                os.path.exists(os.path.join(dev, "in_illuminance_raw")):
+            return dev
+    return None
+
+
+def read_iio_lux(dev):
+    value = read_number(os.path.join(dev, "in_illuminance_input"))
+    if value is not None:
+        return value
+    raw = read_number(os.path.join(dev, "in_illuminance_raw"))
+    if raw is None:
+        return None
+    scale = read_number(os.path.join(dev, "in_illuminance_scale"), 1.0)
+    offset = read_number(os.path.join(dev, "in_illuminance_offset"), 0.0)
+    return (raw + offset) * scale
+
+
+class IioSource:
+    kind = "iio"
+
+    def __init__(self, root, hz):
+        self.root = root
+        self.interval = 1.0 / max(hz, 0.5)
+        self.due = 0.0
+        self.warned = False
+
+    def poll(self, timeout):
+        wait = max(0.0, min(timeout, self.due - time.monotonic()))
+        time.sleep(wait)
+        if time.monotonic() < self.due:
+            return []
+        self.due = time.monotonic() + self.interval
+        dev = find_iio_light(self.root)
+        lux = read_iio_lux(dev) if dev else None
+        if lux is None:
+            if not self.warned:
+                log("no readable IIO light sensor under", self.root)
+                self.warned = True
+            return []
+        self.warned = False
+        return [lux]
+
+    def close(self):
+        pass
+
+
+class LineSource:
+    """Lux readings, one number per line, from a FIFO or a file (--mock)."""
+
+    kind = "mock"
+
+    def __init__(self, path):
+        self.path = path
+        self.buf = b""
+        self.fd = None
+        self.offset = 0
+        self.pending = []
+        if not os.path.exists(path):
+            os.mkfifo(path, 0o600)
+        self.fifo = stat.S_ISFIFO(os.stat(path).st_mode)
+        if self.fifo:
+            self.fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        else:
+            with open(path) as f:
+                self.pending = [v for v in map(self.parse, f.read().splitlines()) if v is not None][-1:]
+            self.offset = os.path.getsize(path)
+
+    @staticmethod
+    def parse(line):
+        line = line.split("#", 1)[0].strip()
+        try:
+            return float(line)
+        except ValueError:
+            return None
+
+    def poll(self, timeout):
+        out = list(self.pending)
+        self.pending = []
+        if self.fifo:
+            ready, _, _ = select.select([self.fd], [], [], timeout)
+            if ready:
+                self.buf += os.read(self.fd, 4096)
+                *lines, self.buf = self.buf.split(b"\n")
+                out += [self.parse(ln.decode(errors="replace")) for ln in lines]
+        else:
+            time.sleep(min(timeout, 0.2))
+            try:
+                size = os.path.getsize(self.path)
+            except OSError:
+                size = self.offset
+            if size < self.offset:
+                self.offset = 0
+            if size > self.offset:
+                with open(self.path, "rb") as f:
+                    f.seek(self.offset)
+                    data = f.read()
+                self.offset += len(data)
+                out += [self.parse(ln.decode(errors="replace")) for ln in data.splitlines()]
+        return [v for v in out if v is not None]
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+
+
+class ProxySource:
+    """iio-sensor-proxy through monitor-sensor, on a pty so its output isn't
+    block-buffered. It prints the level when it changes, so the daemon holds
+    the last value. Restarts monitor-sensor if it exits."""
+
+    kind = "proxy"
+    CHANGED = re.compile(r"Light changed:\s*([-+0-9.eE]+)\s*\((\w+)\)")
+    HAS = re.compile(r"Has ambient light sensor.*?value:\s*([-+0-9.eE]+),\s*unit:\s*(\w+)", re.I)
+
+    def __init__(self):
+        self.proc = None
+        self.master = None
+        self.buf = b""
+        self.retry_at = 0.0
+
+    @staticmethod
+    def command():
+        override = os.environ.get("IPAD_ALS_MONITOR_CMD")
+        if override:
+            return shlex.split(override)
+        cmd = ["monitor-sensor"]
+        try:
+            help_text = subprocess.run(cmd + ["--help"], capture_output=True, text=True, timeout=5)
+            if "--light" in help_text.stdout + help_text.stderr:
+                cmd.append("--light")
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return cmd
+
+    def start(self):
+        cmd = self.command()
+        master, slave = pty.openpty()
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=slave, stderr=slave, close_fds=True)
+        os.close(slave)
+        self.master = master
+        self.buf = b""
+        log("started", " ".join(cmd))
+
+    def stop(self):
+        if self.proc:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        if self.master is not None:
+            os.close(self.master)
+        self.proc = self.master = None
+
+    def poll(self, timeout):
+        if self.proc is None:
+            if time.monotonic() < self.retry_at:
+                time.sleep(timeout)
+                return []
+            try:
+                self.start()
+            except OSError as e:
+                log("cannot start monitor-sensor:", e)
+                self.retry_at = time.monotonic() + 5
+                return []
+        ready, _, _ = select.select([self.master], [], [], timeout)
+        if not ready:
+            if self.proc.poll() is not None:
+                self.exited()
+            return []
+        try:
+            data = os.read(self.master, 4096)
+        except OSError:  # EIO: the child closed the pty
+            data = b""
+        if not data:
+            self.exited()
+            return []
+        self.buf += data
+        *lines, self.buf = self.buf.split(b"\n")
+        out = []
+        for raw in lines:
+            text = raw.decode(errors="replace").strip()
+            m = self.CHANGED.search(text) or self.HAS.search(text)
+            if m:
+                if m.group(2).lower() != "lux":
+                    log(f"iio-sensor-proxy reports {m.group(2)}, not lux: ignoring")
+                    continue
+                out.append(float(m.group(1)))
+            elif text:
+                log("monitor-sensor:", text)
+        return out
+
+    def exited(self):
+        log("monitor-sensor exited; retrying in 3 s")
+        self.stop()
+        self.retry_at = time.monotonic() + 3
+
+    def close(self):
+        self.stop()
+
+
+def proxy_has_light():
+    try:
+        out = subprocess.run(
+            ["busctl", "--system", "get-property", "net.hadess.SensorProxy", "/net/hadess/SensorProxy",
+             "net.hadess.SensorProxy", "HasAmbientLight"],
+            capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return out == "b true"
+
+
+def have_monitor_sensor():
+    return bool(os.environ.get("IPAD_ALS_MONITOR_CMD")) or shutil.which("monitor-sensor") is not None
+
+
+def make_source(args, conf):
+    if args.mock:
+        return LineSource(args.mock)
+    root = args.mock_iio or IIO_ROOT
+    if args.mock_iio:
+        return IioSource(root, conf["poll_hz"])
+    if args.source == "proxy":
+        return ProxySource()
+    if args.source == "iio":
+        return IioSource(root, conf["poll_hz"])
+    announced = False
+    while True:
+        if have_monitor_sensor() and proxy_has_light():
+            return ProxySource()
+        if find_iio_light(root):
+            return IioSource(root, conf["poll_hz"])
+        if args.probe is not None:
+            log("no ambient light sensor: iio-sensor-proxy has none and there is no IIO device")
+            sys.exit(1)
+        if not announced:
+            log("no ambient light sensor yet (iio-sensor-proxy has none, no IIO device); waiting")
+            announced = True
+        time.sleep(10)
+
+
+def list_sensors(args, conf):
+    print("iio-sensor-proxy HasAmbientLight:", proxy_has_light() if shutil.which("busctl") else "no busctl")
+    print("monitor-sensor:", "found" if have_monitor_sensor() else "missing")
+    dev = find_iio_light(args.mock_iio or IIO_ROOT)
+    print("IIO light sensor:", dev or "none")
+    if dev:
+        print("  lux:", read_iio_lux(dev))
+    name = find_backlight(conf["backlight"])
+    print("backlight:", name or "none")
+    if name:
+        bl = Backlight(name)
+        raw = bl.read()
+        print(f"  brightness {raw} of {bl.max}" + ("" if raw is None else f" ({bl.pct(raw):.0f} %)"))
+    print("brightnessctl:", "found" if shutil.which(brightnessctl_cmd()[0]) else "missing")
+    print("auto-brightness:", "on" if is_enabled(conf) else "off")
+
+
+# --- holds: other tools that own the backlight for a while -----------------------------
+def holds():
+    """Names of the holds in force: `dimmed` (idle dim, written by `dim`),
+    `blanked` (screen off without sleep, written by ipad-screen) and `lid` (the
+    cover is closed, written by ipad-lid with its pid)."""
+    found = []
+    base = runtime_dir()
+    try:
+        age = time.time() - os.stat(os.path.join(base, "dimmed")).st_mtime
+        if age < DIM_STALE:
+            found.append("dimmed")
+    except OSError:
+        pass
+    # No age limit: a screen can stay off all night. ipad-screen removes it,
+    # and $XDG_RUNTIME_DIR does not outlive the session.
+    if os.path.exists(os.path.join(base, "blanked")):
+        found.append("blanked")
+    try:
+        with open(os.path.join(base, "lid-closed")) as f:
+            pid = int((f.read().split() or ["0"])[0])
+        if pid > 0:
+            os.kill(pid, 0)
+            found.append("lid")
+    except (OSError, ValueError):
+        pass
+    return found
+
+
+# --- the daemon -------------------------------------------------------------------------
+class Daemon:
+    def __init__(self, conf, source, backlight, dry, debug):
+        self.conf, self.source, self.backlight, self.dry, self.debug = conf, source, backlight, dry, debug
+        self.smoother = Smoother(conf["smooth_secs"])
+        self.policy = Policy(conf)
+        self.latest = None  # the last lux reading
+        self.next_sample = 0.0
+        self.last_written = None  # raw value we last set; a different reading is someone else's
+        self.goal_raw = None
+        self.next_step = 0.0
+        self.override_until = 0.0
+        self.hold = []
+        self.settle_until = 0.0
+        self.active = False
+        self.moves = 0
+        self.stop = False
+        self.shown = None
+
+    # -- helpers
+    def tolerance(self):
+        return max(2, int(round(self.backlight.max * 0.01)))
+
+    def pause(self, why):
+        """Forget what we were doing, so that what comes next starts from the
+        backlight as it is."""
+        self.last_written = None
+        self.goal_raw = None
+        self.policy.reset()
+        if self.active:
+            log("paused:", why)
+        self.active = False
+
+    def tick(self, now):
+        conf = self.conf
+        if not is_enabled(conf):
+            self.pause("off")
+            self.write_status(now, enabled=False)
+            return
+        hold = holds()
+        if hold != self.hold:
+            if hold:
+                log("holding for", ", ".join(hold))
+            elif self.hold:
+                self.settle_until = now + HOLD_SETTLE
+            self.hold = hold
+        if hold or now < self.settle_until:
+            self.pause("hold")
+            self.write_status(now, enabled=True)
+            return
+        raw = self.backlight.read()
+        if raw is None:
+            return
+        # A change we didn't make: a brightness key, the menu.
+        if self.last_written is not None and abs(raw - self.last_written) > self.tolerance():
+            self.override_until = now + conf["override_secs"]
+            log(f"brightness changed by hand ({self.backlight.pct(self.last_written):.0f} -> "
+                f"{self.backlight.pct(raw):.0f} %): paused for {conf['override_secs']:.0f} s")
+            self.pause("manual change")
+        if now < self.override_until:
+            self.write_status(now, enabled=True, override=self.override_until - now)
+            return
+        if not self.active:
+            self.active = True
+            log("auto-brightness on")
+        # sample
+        if self.latest is not None and now >= self.next_sample:
+            self.next_sample = now + 1.0 / max(conf["poll_hz"], 0.5)
+            self.smoother.feed(self.latest * conf["lux_scale"], now)
+            goal = self.policy.decide(self.smoother, now, self.backlight.pct(raw))
+            if self.debug:
+                log("lux %.1f smoothed %.1f -> %s" %
+                    (self.latest * conf["lux_scale"], self.smoother.lux,
+                     "%.0f %%" % goal if goal is not None else "stay"))
+            if goal is not None:
+                self.goal_raw = self.backlight.raw_for(goal)
+                log("lux %.0f: brightness %.0f %% -> %.0f %%" %
+                    (self.smoother.lux, self.backlight.pct(raw), goal))
+        # ramp
+        if self.goal_raw is not None and now >= self.next_step:
+            self.step(raw, now)
+        self.write_status(now, enabled=True)
+
+    def step(self, raw, now):
+        if raw == self.goal_raw:
+            self.goal_raw = None
+            self.last_written = raw
+            return
+        step = max(1, int(round(self.conf["ramp_pct_per_s"] / 100.0 * self.backlight.max * RAMP_STEP)))
+        new = min(raw + step, self.goal_raw) if self.goal_raw > raw else max(raw - step, self.goal_raw)
+        self.next_step = now + RAMP_STEP
+        if self.dry:
+            log(f"would set brightness {new} of {self.backlight.max} (dry run)")
+            self.goal_raw = None
+            return
+        if self.backlight.write(new):
+            self.last_written = new
+            self.moves += 1
+            if new == self.goal_raw:
+                self.goal_raw = None
+        else:
+            self.goal_raw = None  # try again at the next decision
+
+    def write_status(self, now, enabled, override=0.0):
+        if self.shown is not None and now - self.shown < 1.0:
+            return
+        self.shown = now
+        raw = self.backlight.read()
+        data = {
+            "pid": os.getpid(),
+            "source": self.source.kind,
+            "enabled": enabled,
+            "backlight": self.backlight.name,
+            "brightness_pct": None if raw is None else round(self.backlight.pct(raw), 1),
+            "lux": self.latest,
+            "smoothed_lux": None if self.smoother.lux is None else round(self.smoother.lux, 1),
+            "hold": self.hold,
+            "override_secs_left": round(override, 1),
+            "moves": self.moves,
+            "time": time.time(),
+        }
+        tmp = status_path() + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, status_path())
+        except OSError:
+            pass
+
+    def run(self, seconds=None):
+        end = time.monotonic() + seconds if seconds else None
+        log(f"source {self.source.kind}, backlight {self.backlight.name} (max {self.backlight.max})"
+            + (", dry run" if self.dry else "") + ("" if is_enabled(self.conf) else "; off until switched on"))
+        while not self.stop and (end is None or time.monotonic() < end):
+            for lux in self.source.poll(TICK):
+                self.latest = lux
+            self.tick(time.monotonic())
+        self.source.close()
+        try:
+            os.unlink(status_path())
+        except OSError:
+            pass
+
+
+# --- commands -------------------------------------------------------------------------------
+def running_pid():
+    try:
+        with open(status_path()) as f:
+            pid = json.load(f)["pid"]
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def cmd_switch(action, conf):
+    now = is_enabled(conf)
+    want = (not now) if action == "toggle" else action == "on"
+    set_state("auto_brightness", "on" if want else "off")
+    print("auto-brightness", "on" if want else "off")
+    if want and not running_pid():
+        print("note: the daemon isn't running (no ambient light sensor, or not logged in yet)", file=sys.stderr)
+    return 0
+
+
+def cmd_status(conf):
+    pid = running_pid()
+    print("auto-brightness:", "on" if is_enabled(conf) else "off", "| daemon:", f"running (pid {pid})" if pid else "not running")
+    if pid:
+        try:
+            with open(status_path()) as f:
+                print(f.read())
+        except OSError:
+            pass
+    return 0 if pid else 1
+
+
+def cmd_dim(action):
+    os.makedirs(runtime_dir(), exist_ok=True)
+    flag = os.path.join(runtime_dir(), "dimmed")
+    if action == "dim":
+        # Hold first, so the daemon doesn't take the dim for a hand on a key.
+        with open(flag, "w") as f:
+            f.write(f"{os.getpid()}\n")
+        os.utime(flag)
+        cmd = brightnessctl_cmd() + ["-s", "set", "10%"]
+    else:
+        cmd = brightnessctl_cmd() + ["-r"]
+    try:
+        rc = subprocess.run(cmd, capture_output=True).returncode
+    except OSError as e:
+        print(f"ipad-als-brightness: {cmd[0]}: {e}", file=sys.stderr)
+        rc = 1
+    if action == "undim":
+        try:
+            os.unlink(flag)
+        except OSError:
+            pass
+    return rc
+
+
+def main():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("command", nargs="?", default="daemon",
+                        choices=("daemon", "on", "off", "toggle", "status", "enabled", "dim", "undim"))
+    parser.add_argument("--source", choices=("auto", "proxy", "iio"), default=None)
+    parser.add_argument("--mock")
+    parser.add_argument("--mock-iio")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--probe", nargs="?", const=20, type=float)
+    parser.add_argument("--list", action="store_true")
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("-h", "--help", action="store_true")
+    args = parser.parse_args()
+    if args.help:
+        print(__doc__.strip("\n"))
+        return 0
+    conf = load_conf()
+    if args.source is None:
+        args.source = os.environ.get("IPAD_ALS_SOURCE", "auto")
+    if args.list:
+        list_sensors(args, conf)
+        return 0
+    if args.command in ("on", "off", "toggle"):
+        return cmd_switch(args.command, conf)
+    if args.command == "status":
+        return cmd_status(conf)
+    if args.command == "enabled":
+        return 0 if is_enabled(conf) else 1
+    if args.command in ("dim", "undim"):
+        return cmd_dim(args.command)
+
+    if args.probe is not None:
+        global FORCE_ENABLED
+        args.dry_run = args.debug = True
+        FORCE_ENABLED = True
+    name = find_backlight(conf["backlight"])
+    if not name:
+        log("no backlight under", backlight_root())
+        if args.probe is not None:
+            return 1
+        while not name:  # the unit's condition is the sensor; the panel may come later
+            time.sleep(10)
+            name = find_backlight(conf["backlight"])
+    source = make_source(args, conf)
+    daemon = Daemon(conf, source, Backlight(name), args.dry_run, args.debug)
+    def stop(*_):
+        daemon.stop = True
+
+    def reload(*_):
+        daemon.conf.update(load_conf())
+        daemon.smoother.tau = daemon.conf["smooth_secs"]
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGHUP, reload)
+    daemon.run(args.probe)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

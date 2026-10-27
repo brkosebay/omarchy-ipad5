@@ -1,0 +1,9 @@
+844a097dcde99e517d2f2ffc22d606d40feda9cc013efe5e98003a482e0bcd05  ./0001-dt-bindings-media-add-Apple-S8000-VXD-video-decoder.patch
+62cea112a3638d7160823690a2a3adbbbb6eab2dd86c308d1269abad9e1d06c5  ./0002-arm64-dts-apple-s8000-s8003-add-the-VXD-video-decode.patch
+8f01fde7b3136f9f1a9e0023a4812ea0f4beaf47e25ae3b0861b2dccc2f0bf5f  ./0003-media-apple-add-VXD-PowerVR-MSVDX-probe-and-bring-up.patch
+cb4354e9292d14ac3916ee56a96eeff9285b82b5dc2045c68cbcefef6f78db08  ./0004-media-apple-vxd-add-the-V4L2-stateless-H.264-m2m-dev.patch
+6de3bb69be460c0e2f9f327d248c088889c20e4dbc30a949d55bad4d2183c56e  ./0005-media-apple-vxd-wire-the-V4L2-device-into-probe-make.patch
+3f582e10f37f375424592bfdeb32b543aee9218655d7f183c891b12485794329  ./0006-media-apple-vxd-fix-the-open-NULL-dereference-and-ha.patch
+824ac3e424e096812baf3216c4037d3b851023e7a3e8e1121375d2842ab7841d  ./0007-media-apple-vxd-fix-the-GART-for-16-KiB-pages-and-DR.patch
+67e06b9287898360e6d7bd50ae1641f839af9f7b58e6dcb3d325605eac5bd34a  ./0008-media-apple-vxd-bring-up-the-host-MTX-mailbox-R3a.patch
+f4e8990e0400acb205ae138864b70ab2ab1effcdf3d2be22a066a29bbc6c1288  ./0009-media-apple-vxd-add-the-command-buffer-layer-R3b.patch

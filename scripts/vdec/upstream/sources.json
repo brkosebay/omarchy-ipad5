@@ -1,0 +1,27 @@
+[
+  {
+    "file": "h264_vlc.h",
+    "commit": "9453ad8ebdd42a5e5a384c21cd5f6bc2c86aa6d8",
+    "path": "decoder/h264_vlc.h",
+    "download_url": "https://raw.githubusercontent.com/TexasInstruments/img-vxe-vxd/9453ad8ebdd42a5e5a384c21cd5f6bc2c86aa6d8/decoder/h264_vlc.h",
+    "sha256": "9b349a315038817651a8f6c0be87bb82321f9b046901957a3d65e73f6f1eeb66",
+    "license": "GPL-2.0"
+  },
+  {
+    "file": "h264_idx.h",
+    "commit": "9453ad8ebdd42a5e5a384c21cd5f6bc2c86aa6d8",
+    "path": "decoder/h264_idx.h",
+    "download_url": "https://raw.githubusercontent.com/TexasInstruments/img-vxe-vxd/9453ad8ebdd42a5e5a384c21cd5f6bc2c86aa6d8/decoder/h264_idx.h",
+    "sha256": "fdec275fa3fe8d579d8531adbc300f5bf7a78db755b0725ae6a8bbb504fe4b99",
+    "license": "GPL-2.0"
+  },
+  {
+    "file": "pnw_H264.c",
+    "commit": "fabbb665d0e0aa1c4286acd423cc1e572d10d684",
+    "path": "src/pnw_H264.c",
+    "download_url": "https://android.googlesource.com/platform/hardware/intel/img/psb_video/+/fabbb665d0e0aa1c4286acd423cc1e572d10d684/src/pnw_H264.c?format=TEXT",
+    "base64": true,
+    "sha256": "096be85abdd08365e6a701a67fcbdf224bd181f3377e1d1e1bb84a274baf3285",
+    "license": "MIT (full upstream permission notice, no SPDX line)"
+  }
+]

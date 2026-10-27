@@ -1,0 +1,262 @@
+From d67fe465f2c531ee6a7f9a6464cf0456067e38b5 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 14:16:30 +0000
+Subject: [PATCH] nvme-pci: Add a boot-time write window to the read-only mode
+
+CONFIG_NVME_PCI_READ_ONLY makes every NVMe PCI controller read-only, so
+an Apple iDevice's disk can be read without risking the iOS install on
+it. To run Linux from a partition next to iOS, the kernel has to write
+that one partition and nothing else.
+
+Add CONFIG_NVME_PCI_WRITE_WINDOW (default n) and the boot parameter
+nvme.write_window=NSID:FIRST-LAST. With it, the read-only allowlist
+also accepts NVMe Write commands to namespace NSID whose whole LBA range
+lies within FIRST..LAST (inclusive). Everything else stays refused before
+submission and in the SQ-copy backstop: writes outside the window or to
+other namespaces, Write Zeroes, Dataset Management, Format, Sanitize,
+firmware, namespace management, security and vendor commands.
+
+With a window, NVME_CTRL_FORCE_RO is not set; every namespace except the
+window's is still marked read-only. Trim and Write Zeroes are no longer
+advertised (NVME_QUIRK_DISABLE_WRITE_ZEROES; ONCS DSM, DMRL and DMRSL
+cleared after identify, and the namespace scan's re-read of Identify CNS
+06h skipped), so the block layer falls back to plain writes instead of
+getting EIO from the allowlist. The controller's ONCS, VWC and DMRSL are
+logged, as are refused writes with their LBA range.
+
+A parameter that doesn't parse is rejected and leaves the controller
+fully read-only. Without the parameter nothing changes.
+---
+ drivers/nvme/host/Kconfig |  20 ++++++
+ drivers/nvme/host/pci.c   | 135 +++++++++++++++++++++++++++++++++++---
+ 2 files changed, 147 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/nvme/host/Kconfig b/drivers/nvme/host/Kconfig
+index 85be74a909..6a3bcdd31d 100644
+--- a/drivers/nvme/host/Kconfig
++++ b/drivers/nvme/host/Kconfig
+@@ -29,6 +29,26 @@ config NVME_PCI_READ_ONLY
+ 	  This exists for bring-up on Apple A9/A10 iDevices, whose internal
+ 	  NVMe disk holds the iOS installation. Say N on any other system.
+ 
++config NVME_PCI_WRITE_WINDOW
++	bool "Allow one boot-time write window on read-only NVMe PCI devices"
++	depends on NVME_PCI_READ_ONLY
++	help
++	  Accept nvme.write_window=NSID:FIRST-LAST on the kernel command
++	  line. NVMe Write commands to namespace NSID whose whole LBA range
++	  lies within FIRST..LAST (inclusive, in that namespace's logical
++	  blocks) are then allowed, and that namespace is no longer marked
++	  read-only. Everything else CONFIG_NVME_PCI_READ_ONLY refuses stays
++	  refused: writes outside the window or to any other namespace,
++	  Write Zeroes, Dataset Management (trim), Format, Sanitize, firmware
++	  and namespace management, and vendor commands. Trim and Write
++	  Zeroes aren't advertised to the block layer while a window is set.
++
++	  Without the parameter, or if it doesn't parse, the controller is
++	  exactly as read-only as with CONFIG_NVME_PCI_READ_ONLY alone.
++
++	  This lets an Apple iDevice keep iOS on its disk and run Linux from
++	  one partition next to it. Say N unless you need that.
++
+ config NVME_MULTIPATH
+ 	bool "NVMe multipath support"
+ 	depends on NVME_CORE
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index dc45a347a8..f5aa389e45 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -279,6 +279,101 @@ static bool noacpi;
+ module_param(noacpi, bool, 0444);
+ MODULE_PARM_DESC(noacpi, "disable acpi bios quirks");
+ 
++/*
++ * CONFIG_NVME_PCI_WRITE_WINDOW: the one range the read-only allowlist lets
++ * NVMe Write reach, namespace nsid, LBAs first..last inclusive. Only
++ * nvme.write_window= on the command line sets it.
++ */
++static struct {
++	bool set;
++	u32 nsid;
++	u64 first;
++	u64 last;
++} write_window;
++
++#ifdef CONFIG_NVME_PCI_WRITE_WINDOW
++static char write_window_param[64];
++
++static int write_window_set(const char *val, const struct kernel_param *kp)
++{
++	char buf[64], *lba, *last;
++	u64 first_lba, last_lba;
++	u32 nsid;
++
++	if (strscpy(buf, val, sizeof(buf)) < 0)
++		return -EINVAL;
++	lba = strchr(buf, ':');
++	last = lba ? strchr(lba + 1, '-') : NULL;
++	if (!last)
++		return -EINVAL;
++	*lba++ = '\0';
++	*last++ = '\0';
++	if (kstrtou32(buf, 0, &nsid) || kstrtou64(lba, 0, &first_lba) ||
++	    kstrtou64(strim(last), 0, &last_lba) || !nsid ||
++	    nsid == NVME_NSID_ALL || first_lba > last_lba)
++		return -EINVAL;
++
++	write_window.nsid = nsid;
++	write_window.first = first_lba;
++	write_window.last = last_lba;
++	write_window.set = true;
++	return param_set_copystring(val, kp);
++}
++
++static const struct kernel_param_ops write_window_ops = {
++	.set = write_window_set,
++	.get = param_get_string,
++};
++
++static struct kparam_string write_window_string = {
++	.maxlen = sizeof(write_window_param),
++	.string = write_window_param,
++};
++
++module_param_cb(write_window, &write_window_ops, &write_window_string, 0444);
++MODULE_PARM_DESC(write_window,
++	"NSID:FIRST-LAST: on a read-only (CONFIG_NVME_PCI_READ_ONLY) controller, allow NVMe Write to these LBAs (inclusive) of namespace NSID and nothing else. Boot-time only.");
++#endif
++
++static bool nvme_pci_write_window_active(void)
++{
++	return IS_ENABLED(CONFIG_NVME_PCI_WRITE_WINDOW) && write_window.set;
++}
++
++/* A Write whose whole LBA range lies in the window */
++static bool nvme_pci_in_write_window(const struct nvme_command *cmd)
++{
++	u64 slba = le64_to_cpu(cmd->rw.slba);
++	u64 nlb = (u64)le16_to_cpu(cmd->rw.length) + 1;
++
++	return nvme_pci_write_window_active() &&
++	       le32_to_cpu(cmd->rw.nsid) == write_window.nsid &&
++	       slba >= write_window.first && slba <= write_window.last &&
++	       nlb <= write_window.last - slba + 1;
++}
++
++/*
++ * The allowlist refuses trim and Write Zeroes even inside the window, so
++ * don't advertise them: the block layer would turn the refusal into EIO
++ * where callers expect EOPNOTSUPP and a fallback to plain writes.
++ * NVME_QUIRK_DISABLE_WRITE_ZEROES (set at probe) covers Write Zeroes;
++ * namespaces read oncs and dmrsl when they are scanned, after this. The
++ * scan re-reads dmrsl from Identify (CNS 06h) unless that is skipped; its
++ * other fields only size trim and Write Zeroes too.
++ */
++static void nvme_pci_write_window_limits(struct nvme_dev *dev)
++{
++	if (!nvme_pci_write_window_active())
++		return;
++	dev_info(dev->ctrl.device,
++		 "write window: controller ONCS %#x VWC %#x DMRSL %u; trim and write zeroes not advertised\n",
++		 dev->ctrl.oncs, dev->ctrl.vwc, dev->ctrl.dmrsl);
++	dev->ctrl.oncs &= ~NVME_CTRL_ONCS_DSM;
++	dev->ctrl.dmrl = 0;
++	dev->ctrl.dmrsl = 0;
++	set_bit(NVME_CTRL_SKIP_ID_CNS_CS, &dev->ctrl.flags);
++}
++
+ static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown);
+ static void nvme_delete_io_queues(struct nvme_dev *dev);
+ static void nvme_update_attrs(struct nvme_dev *dev);
+@@ -599,7 +694,8 @@ static inline void nvme_write_sq_db(struct nvme_queue *nvmeq, bool write_sq)
+  * features nvme-core configures at init. Everything else (write, write
+  * zeroes, DSM/trim, format, sanitize, firmware download/commit, namespace
+  * management, security send, directives, vendor-specific opcodes, saved
+- * features) is refused before it reaches the submission queue.
++ * features) is refused before it reaches the submission queue. The one
++ * exception is CONFIG_NVME_PCI_WRITE_WINDOW: a Write inside nvme.write_window.
+  */
+ static bool nvme_pci_ro_cmd_allowed(const struct nvme_queue *nvmeq,
+ 				    const struct nvme_command *cmd)
+@@ -614,6 +710,8 @@ static bool nvme_pci_ro_cmd_allowed(const struct nvme_queue *nvmeq,
+ 		case nvme_cmd_flush:
+ 		case nvme_cmd_read:
+ 			return true;
++		case nvme_cmd_write:
++			return nvme_pci_in_write_window(cmd);
+ 		default:
+ 			return false;
+ 		}
+@@ -1390,12 +1488,20 @@ static blk_status_t nvme_prep_rq(struct request *req)
+ 
+ 	if (unlikely(!nvme_pci_cmd_allowed(req->mq_hctx->driver_data,
+ 					   &iod->cmd))) {
+-		dev_err_ratelimited(nvme_req(req)->ctrl->device,
+-				    "read-only: refused opcode %#x nsid %u on %s queue\n",
+-				    iod->cmd.common.opcode,
+-				    le32_to_cpu(iod->cmd.common.nsid),
+-				    nvme_req(req)->ctrl->admin_q == req->q ?
+-				    "admin" : "I/O");
++		if (iod->cmd.common.opcode == nvme_cmd_write &&
++		    nvme_pci_write_window_active())
++			dev_err_ratelimited(nvme_req(req)->ctrl->device,
++					    "read-only: refused write nsid %u LBA %llu+%u outside the write window\n",
++					    le32_to_cpu(iod->cmd.rw.nsid),
++					    le64_to_cpu(iod->cmd.rw.slba),
++					    le16_to_cpu(iod->cmd.rw.length) + 1);
++		else
++			dev_err_ratelimited(nvme_req(req)->ctrl->device,
++					    "read-only: refused opcode %#x nsid %u on %s queue\n",
++					    iod->cmd.common.opcode,
++					    le32_to_cpu(iod->cmd.common.nsid),
++					    nvme_req(req)->ctrl->admin_q == req->q ?
++					    "admin" : "I/O");
+ 		ret = BLK_STS_IOERR;
+ 		goto out_free_cmd;
+ 	}
+@@ -3447,6 +3553,7 @@ static void nvme_reset_work(struct work_struct *work)
+ 	result = nvme_init_ctrl_finish(&dev->ctrl, was_suspend);
+ 	if (result)
+ 		goto out;
++	nvme_pci_write_window_limits(dev);
+ 
+ 	if (nvme_ctrl_meta_sgl_supported(&dev->ctrl))
+ 		dev->ctrl.max_integrity_segments = NVME_MAX_META_SEGS;
+@@ -3540,6 +3647,9 @@ static bool nvme_pci_ns_is_readonly(struct nvme_ctrl *ctrl, u32 nsid)
+ {
+ 	struct nvme_dev *dev = to_nvme_dev(ctrl);
+ 
++	/* NVME_CTRL_FORCE_RO is off with a write window: only its NSID is rw */
++	if (nvme_pci_write_window_active() && nsid != write_window.nsid)
++		return true;
+ 	return dev->dma_ops && dev->dma_ops->ns_readonly &&
+ 	       dev->dma_ops->ns_readonly(dev, nsid);
+ }
+@@ -3766,7 +3876,15 @@ static struct nvme_dev *nvme_pci_alloc_dev(struct pci_dev *pdev,
+ 	if (ret)
+ 		goto out_put_device;
+ 
+-	if (IS_ENABLED(CONFIG_NVME_PCI_READ_ONLY)) {
++	if (IS_ENABLED(CONFIG_NVME_PCI_READ_ONLY) &&
++	    nvme_pci_write_window_active()) {
++		/* Namespaces other than the window's: nvme_pci_ns_is_readonly() */
++		dev->ctrl.quirks |= NVME_QUIRK_DISABLE_WRITE_ZEROES;
++		dev_warn(&pdev->dev,
++			 "read-only except NVMe Write to NSID %u LBAs %llu-%llu (nvme.write_window): no trim, no write zeroes, no destructive admin commands\n",
++			 write_window.nsid, write_window.first,
++			 write_window.last);
++	} else if (IS_ENABLED(CONFIG_NVME_PCI_READ_ONLY)) {
+ 		set_bit(NVME_CTRL_FORCE_RO, &dev->ctrl.flags);
+ 		dev_info(&pdev->dev,
+ 			 "read-only: media writes and destructive admin commands are refused (CONFIG_NVME_PCI_READ_ONLY)\n");
+@@ -3870,6 +3988,7 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	result = nvme_init_ctrl_finish(&dev->ctrl, false);
+ 	if (result)
+ 		goto out_disable;
++	nvme_pci_write_window_limits(dev);
+ 
+ 	if (nvme_ctrl_meta_sgl_supported(&dev->ctrl))
+ 		dev->ctrl.max_integrity_segments = NVME_MAX_META_SEGS;
+-- 
+2.56.0
+

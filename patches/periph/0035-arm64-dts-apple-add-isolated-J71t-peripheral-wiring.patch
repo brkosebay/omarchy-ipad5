@@ -1,0 +1,125 @@
+From c1636075f9c4b701b9347849daa4a807809aed3d Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 09:54:06 +0000
+Subject: [PATCH 35/55] arm64: dts: apple: add isolated J71t peripheral wiring
+
+Wire UART3 BCM4355, UART5 HDQ, D2365 GPIO13, read-only charger and I2C2 CT819 using the J71t ADT. Only J71t includes this file; leave other A9 variants unchanged. MMIO/IRQ/GPIO values are verified from ADT; driver register layouts and transport timing remain inferred until device testing.
+---
+ .../boot/dts/apple/s8003-j71t-periph.dtsi     | 95 +++++++++++++++++++
+ arch/arm64/boot/dts/apple/s8003-j71t.dts      |  1 +
+ 2 files changed, 96 insertions(+)
+ create mode 100644 arch/arm64/boot/dts/apple/s8003-j71t-periph.dtsi
+
+diff --git a/arch/arm64/boot/dts/apple/s8003-j71t-periph.dtsi b/arch/arm64/boot/dts/apple/s8003-j71t-periph.dtsi
+new file mode 100644
+index 0000000000..5ab7fbc4a3
+--- /dev/null
++++ b/arch/arm64/boot/dts/apple/s8003-j71t-periph.dtsi
+@@ -0,0 +1,95 @@
++// SPDX-License-Identifier: GPL-2.0+ OR MIT
++/* Round 1 J71t peripherals. Hardware values: Apple's J71t ADT. */
++
++/ {
++	aliases {
++		serial3 = &serial3;
++		serial5 = &serial5;
++		bluetooth0 = &bluetooth;
++	};
++};
++
++&{/soc} {
++	serial3: serial@20a0cc000 {
++		compatible = "apple,s8000-uart", "apple,s5l-uart";
++		reg = <0x2 0x0a0cc000 0 0x4000>;
++		reg-io-width = <4>;
++		interrupts = <AIC_IRQ 195 IRQ_TYPE_LEVEL_HIGH>;
++		clocks = <&clkref>, <&clkref>;
++		clock-names = "uart", "clk_uart_baud0";
++		power-domains = <&ps_uart3>;
++		pinctrl-0 = <&bluetooth_uart3_pins>;
++		pinctrl-names = "default";
++		uart-has-rtscts;
++		status = "okay";
++
++		bluetooth: bluetooth {
++			compatible = "apple,j71t-bcm4355-bt";
++			/* 115200 ROM rate inferred from A10; runtime rate is in ADT. */
++			current-speed = <115200>;
++			max-speed = <3000000>;
++			shutdown-gpios = <&periph_pmu_gpio 13 GPIO_ACTIVE_HIGH>;
++			device-wakeup-gpios = <&pinctrl_ap 142 GPIO_ACTIVE_HIGH>;
++		};
++	};
++
++	serial5: serial@20a0d4000 {
++		compatible = "apple,s5l-uart";
++		reg = <0x2 0x0a0d4000 0 0x4000>;
++		reg-io-width = <4>;
++		interrupts = <AIC_IRQ 197 IRQ_TYPE_LEVEL_HIGH>;
++		clocks = <&clkref>, <&clkref>;
++		clock-names = "uart", "clk_uart_baud0";
++		power-domains = <&ps_uart5>;
++		pinctrl-0 = <&battery_swi_pins>;
++		pinctrl-names = "default";
++		status = "okay";
++
++		onewire {
++			compatible = "ti,hdq-uart";
++
++			battery: fuel-gauge {
++				/* ADT bq27540; uses the experimental J172 map, not an ID claim. */
++				compatible = "apple,j71t-bq27540";
++			};
++		};
++	};
++};
++
++&pinctrl_ap {
++	bluetooth_uart3_pins: bluetooth-uart3-pins {
++		pinmux = <APPLE_PINMUX(88, 1)>, <APPLE_PINMUX(89, 1)>,
++			 <APPLE_PINMUX(90, 1)>, <APPLE_PINMUX(91, 1)>;
++	};
++
++	battery_swi_pins: battery-swi-pins {
++		pinmux = <APPLE_PINMUX(2, 1)>;
++	};
++};
++
++&{/soc/i2c@20a110000/pmic@3c} {
++	periph_pmu_gpio: gpio {
++		compatible = "apple,d2365-pmic-gpio";
++		gpio-controller;
++		#gpio-cells = <2>;
++		gpio-reserved-ranges = <0 13>, <14 10>;
++	};
++
++	charger@180 {
++		/* Status only: J172 input-current policy must never run on J71t. */
++		compatible = "apple,j71t-d2365-charger";
++		reg = <0x180 0x1e>, <0xa00 0x0d>;
++		reg-names = "status", "control";
++	};
++};
++
++&i2c2 {
++	status = "okay";
++
++	light-sensor@39 {
++		compatible = "apple,ct819", "amstaos,tsl2581";
++		reg = <0x39>;
++		interrupts-extended = <&pinctrl_ap 71 IRQ_TYPE_LEVEL_LOW>;
++		firmware-name = "apple/j71t-LSCI.bin";
++	};
++};
+diff --git a/arch/arm64/boot/dts/apple/s8003-j71t.dts b/arch/arm64/boot/dts/apple/s8003-j71t.dts
+index 0d906ae80b..047b21b713 100644
+--- a/arch/arm64/boot/dts/apple/s8003-j71t.dts
++++ b/arch/arm64/boot/dts/apple/s8003-j71t.dts
+@@ -8,6 +8,7 @@
+ 
+ #include "s8003.dtsi"
+ #include "s800x-ipad5.dtsi"
++#include "s8003-j71t-periph.dtsi"
+ 
+ / {
+ 	compatible = "apple,j71t", "apple,s8003", "apple,arm-platform";

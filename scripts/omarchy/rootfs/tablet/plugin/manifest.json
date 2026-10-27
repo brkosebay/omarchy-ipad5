@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "linuxa9.tablet",
+  "name": "iPad Tablet Buttons",
+  "version": "1.0.0",
+  "author": "linux-a9",
+  "description": "Touch buttons for the iPad: apps, keyboard, layout, float, full screen, rotate, rotation lock, auto-brightness, close",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "TabletButtons.qml"
+  },
+  "barWidget": {
+    "displayName": "iPad Tablet Buttons",
+    "description": "Touch buttons for the iPad",
+    "category": "System",
+    "defaultSection": "left",
+    "allowMultiple": false
+  }
+}

@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 18:17:29 +0000
+Subject: [PATCH] nvme: apple-ans: validate health queues and reserve recovery
+ for timeouts
+
+Clone the validated Identify/admin queue limits instead of setting an
+8 KiB maximum below PAGE_SIZE on A9. Keep local gate errors and command
+rejections inconclusive so they cannot cycle a healthy link. Only a
+confirmed gate timeout authorizes recovery.
+
+Require the S5L8960X DART valid bit. A changing last-transaction address
+with err 0x500 is not a fault.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ drivers/nvme/host/pci-apple-ans.c | 13 ++++----
+ drivers/nvme/host/pci.c           | 52 ++++++++++++++++++++++---------
+ 2 files changed, 45 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/nvme/host/pci-apple-ans.c b/drivers/nvme/host/pci-apple-ans.c
+index cb586378f2..9ab643b59d 100644
+--- a/drivers/nvme/host/pci-apple-ans.c
++++ b/drivers/nvme/host/pci-apple-ans.c
+@@ -712,12 +712,13 @@ static bool nvme_pci_apple_ans_new_fault(struct nvme_dev *dev,
+ 	return !st->link_up;
+ }
+ 
+-static bool nvme_pci_apple_ans_new_dart_fault(struct apple_ans_nvme *ans,
+-					      const struct apple_ans_host_state *st)
++static bool nvme_pci_apple_ans_new_dart_fault(const struct apple_ans_host_state *st)
+ {
+-	/* apple-dart's handler clears the flag, the address register stays */
+-	return (st->dart_err & BIT(31)) ||
+-	       st->dart_addr != ans->cc_base.dart_addr;
++	/* Without valid, ERROR/ADDR are a live transaction record. In
++	 * particular 0x500 only records write direction, even if ADDR changed.
++	 * An IRQ-acked fault cannot be reconstructed from the address alone.
++	 */
++	return st->dart_err & BIT(31);
+ }
+ 
+ /*
+@@ -805,7 +806,7 @@ static int nvme_pci_apple_ans_read_csts(struct nvme_dev *dev, u32 *csts)
+ 			return -EIO;
+ 		}
+ 		if (!ans->dart_fault_logged &&
+-		    nvme_pci_apple_ans_new_dart_fault(ans, &st)) {
++		    nvme_pci_apple_ans_new_dart_fault(&st)) {
+ 			ans->dart_fault_logged = true;
+ 			dev_warn(dev->dev,
+ 				 "Apple ANS: DART fault since CC.EN (err %#x addr %#x), still polling\n",
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index f9d5d74d81..2135a43640 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -2015,9 +2015,10 @@ static void nvme_apple_ans_dump(struct nvme_dev *dev, const char *reason)
+  * The timeout callback blocks DMA and cancels requests before the buffers can
+  * be freed. This runs in reset_work before nvme_start_ctrl publishes disks.
+  */
+-static int nvme_apple_ans_health_cmd(struct request_queue *q,
++static int nvme_apple_ans_health_cmd(struct nvme_dev *dev,
++				     struct request_queue *q,
+ 				     struct nvme_command *cmd, void *buffer,
+-				     unsigned int size)
++				     unsigned int size, bool *unhealthy)
+ {
+ 	struct request *req;
+ 	int ret;
+@@ -2028,15 +2029,21 @@ static int nvme_apple_ans_health_cmd(struct request_queue *q,
+ 	nvme_init_request(req, cmd);
+ 	req->timeout = 5 * HZ;
+ 	ret = blk_rq_map_kern(req, buffer, size, GFP_KERNEL);
+-	if (!ret)
++	if (!ret) {
+ 		ret = nvme_execute_rq(req, false);
++		/* Only the timeout path proves that the controller stopped
++		 * responding. Allocation/mapping errors and rejected commands
++		 * leave this diagnostic inconclusive, never justify a link cycle.
++		 */
++		*unhealthy = test_bit(ANS_HEALTH_FAILED, &dev->apple_ans_flags);
++	}
+ 	blk_mq_free_request(req);
+ 	return ret;
+ }
+ 
+-static int nvme_apple_ans_health(struct nvme_dev *dev)
++static int nvme_apple_ans_health(struct nvme_dev *dev, bool *unhealthy)
+ {
+-	struct queue_limits lim = { .max_hw_sectors = 16, .max_segments = 1 };
++	struct queue_limits lim;
+ 	struct nvme_command cmd = { };
+ 	struct request_queue *q;
+ 	struct nvme_id_ns *id;
+@@ -2046,8 +2053,11 @@ static int nvme_apple_ans_health(struct nvme_dev *dev)
+ 	u8 format;
+ 	int ret;
+ 
+-	if (dev->online_queues < 2 || !dev->ctrl.tagset)
+-		return -ENODEV;
++	*unhealthy = false;
++	if (dev->online_queues < 2 || !dev->ctrl.tagset || !dev->ctrl.admin_q) {
++		ret = -ENODEV;
++		goto report;
++	}
+ 	id = kzalloc_obj(*id);
+ 	buffer = kzalloc(8192, GFP_KERNEL);
+ 	if (!id || !buffer) {
+@@ -2058,7 +2068,8 @@ static int nvme_apple_ans_health(struct nvme_dev *dev)
+ 	cmd.identify.opcode = nvme_admin_identify;
+ 	cmd.identify.nsid = cpu_to_le32(1);
+ 	cmd.identify.cns = NVME_ID_CNS_NS;
+-	ret = nvme_apple_ans_health_cmd(dev->ctrl.admin_q, &cmd, id, sizeof(*id));
++	ret = nvme_apple_ans_health_cmd(dev, dev->ctrl.admin_q, &cmd, id,
++					sizeof(*id), unhealthy);
+ 	if (ret)
+ 		goto done;
+ 	format = nvme_lbaf_index(id->flbas);
+@@ -2068,6 +2079,12 @@ static int nvme_apple_ans_health(struct nvme_dev *dev)
+ 		goto done;
+ 	}
+ 	lbs = 1U << id->lbaf[format].ds;
++	/* Identify has already installed validated controller limits on the
++	 * admin queue. Keep its conservative PRP boundary/alignment rules for
++	 * these passthrough reads, including at least PAGE_SECTORS (32 on A9).
++	 * The diagnostic's 8 KiB transfer size is not a legal queue maximum.
++	 */
++	lim = dev->ctrl.admin_q->limits;
+ 	lim.logical_block_size = lbs;
+ 	lim.physical_block_size = lbs;
+ 	q = blk_mq_alloc_queue(&dev->tagset, &lim, NULL);
+@@ -2080,7 +2097,8 @@ static int nvme_apple_ans_health(struct nvme_dev *dev)
+ 	 */
+ 	data_lba = nvme_pci_write_window_active() && write_window.nsid == 1 ?
+ 		write_window.first : 8;
+-	if (data_lba >= le64_to_cpu(id->nsze) ||
++	if (8192 / lbs > le64_to_cpu(id->nsze) ||
++	    data_lba >= le64_to_cpu(id->nsze) ||
+ 	    4096 / lbs > le64_to_cpu(id->nsze) - data_lba) {
+ 		ret = -ERANGE;
+ 		goto destroy;
+@@ -2090,11 +2108,11 @@ static int nvme_apple_ans_health(struct nvme_dev *dev)
+ 	cmd.rw.nsid = cpu_to_le32(1);
+ 	/* Both MBR and GPT header even with a native 4K logical block. */
+ 	cmd.rw.length = cpu_to_le16(8192 / lbs - 1);
+-	ret = nvme_apple_ans_health_cmd(q, &cmd, buffer, 8192);
++	ret = nvme_apple_ans_health_cmd(dev, q, &cmd, buffer, 8192, unhealthy);
+ 	if (!ret) {
+ 		cmd.rw.slba = cpu_to_le64(data_lba);
+ 		cmd.rw.length = cpu_to_le16(4096 / lbs - 1);
+-		ret = nvme_apple_ans_health_cmd(q, &cmd, buffer, 4096);
++		ret = nvme_apple_ans_health_cmd(dev, q, &cmd, buffer, 4096, unhealthy);
+ 	}
+ destroy:
+ 	blk_mq_destroy_queue(q);
+@@ -2104,7 +2122,9 @@ static int nvme_apple_ans_health(struct nvme_dev *dev)
+ free:
+ 	kfree(buffer);
+ 	kfree(id);
+-	dev_info(dev->dev, "Apple ANS: health gate partition/data NSID 1 result %d\n", ret);
++report:
++	dev_info(dev->dev, "Apple ANS: health gate partition/data NSID 1 result %d (%s)\n",
++		 ret, !ret ? "passed" : *unhealthy ? "controller timeout" : "gate inconclusive");
+ 	return ret;
+ }
+ 
+@@ -3786,6 +3806,7 @@ static void nvme_reset_work(struct work_struct *work)
+ 	struct nvme_dev *dev =
+ 		container_of(work, struct nvme_dev, ctrl.reset_work);
+ 	bool was_suspend = !!(dev->ctrl.ctrl_config & NVME_CC_SHN_NORMAL);
++	bool unhealthy;
+ 	int result;
+ 
+ 	if (nvme_ctrl_state(&dev->ctrl) != NVME_CTRL_RESETTING) {
+@@ -3889,9 +3910,12 @@ static void nvme_reset_work(struct work_struct *work)
+ 
+ 	if (dev->dma_ops == &nvme_pci_apple_ans_ops &&
+ 	    apple_ans_boot_mode(dev->dev) != APPLE_ANS_ROUND7) {
+-		result = nvme_apple_ans_health(dev);
+-		if (result)
++		result = nvme_apple_ans_health(dev, &unhealthy);
++		if (result && unhealthy)
+ 			goto out;
++		if (result)
++			dev_warn(dev->dev, "Apple ANS: health gate inconclusive (%d); continuing namespace discovery without recovery\n",
++				 result);
+ 	}
+ 
+ 	/*

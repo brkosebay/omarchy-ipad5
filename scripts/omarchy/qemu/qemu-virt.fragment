@@ -1,0 +1,27 @@
+# TEST ONLY, never for the iPad: what QEMU's virt machine needs on top of the
+# iPad kernel config (build/kernel-omarchy/config, 16K pages), so the Omarchy
+# rootfs can be booted offline under HVF (scripts/omarchy/qemu-smoke.sh).
+CONFIG_PCI_HOST_GENERIC=y
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_MENU=y
+CONFIG_VIRTIO_PCI=y
+CONFIG_VIRTIO_MMIO=y
+CONFIG_VIRTIO_BLK=y
+CONFIG_VIRTIO_NET=y
+CONFIG_VIRTIO_CONSOLE=y
+CONFIG_VIRTIO_INPUT=y
+CONFIG_HW_RANDOM_VIRTIO=y
+CONFIG_SERIAL_AMBA_PL011=y
+CONFIG_SERIAL_AMBA_PL011_CONSOLE=y
+CONFIG_RTC_DRV_PL031=y
+# bochs-display: KMS only, no render node, like simpledrm on the iPad.
+CONFIG_DRM_BOCHS=y
+# A virtual UDC, so the initramfs's configfs gadget (NCM + ACM) binds and
+# usb0/ttyGS0 exist as on the iPad.
+CONFIG_USB_DUMMY_HCD=y
+# A dummy ALSA card, so PipeWire/WirePlumber and Omarchy's volume controls
+# have a card to find (the iPad's is simple-card "iPad5 Speakers").
+CONFIG_SOUND=y
+CONFIG_SND=y
+CONFIG_SND_DRIVERS=y
+CONFIG_SND_DUMMY=y

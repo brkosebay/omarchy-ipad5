@@ -1,0 +1,17 @@
+0001-dt-bindings-sound-add-Cirrus-Logic-CS42L81.patch
+0002-ASoC-codecs-add-Cirrus-Logic-CS42L81-Apple-driver.patch
+0003-dt-bindings-sound-add-Apple-S8000-MCA.patch
+0004-ASoC-apple-add-S8000-A9-MCA-driver.patch
+0005-arm64-dts-apple-j71t-add-speaker-audio-nodes.patch
+0006-dt-bindings-dma-Apple-SIO.patch
+0007-soc-apple-add-SIO-core.patch
+0008-dmaengine-apple-add-SIO-DMA-driver.patch
+0009-dt-bindings-dma-apple-sio-add-S8000.patch
+0010-soc-apple-sio-support-S8000-per-endpoint-tags-and-no.patch
+0011-dmaengine-apple-sio-multiple-endpoints-cyclic-transf.patch
+0012-ASoC-apple-s8000-mca-feed-MCA0-through-SmartIO-DMA.patch
+0013-arm64-dts-apple-j71t-add-SmartIO-and-wire-MCA0-TX-DM.patch
+0014-ASoC-cs42l81-set-CLK_CTL-bit-7-when-the-codec-provid.patch
+0015-ASoC-apple-s8000-mca-add-MCLK-and-route-bring-up-ove.patch
+0016-ASoC-apple-s8000-mca-fix-IRQ-storm-on-idle-power-up-.patch
+0017-ASoC-apple-s8000-mca-mark-the-SmartIO-PCM-as-BATCH-l.patch

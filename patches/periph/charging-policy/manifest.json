@@ -1,0 +1,14 @@
+{
+  "branch": "a9/periph",
+  "base": "46864bf1264874b31f9eff73dda5f1b529ca013a",
+  "head": "bcc4784eee43684d2a48905a9cb6f7a30a627319",
+  "incremental_after": "patches/periph/usb-resume/series",
+  "patches": {
+    "0001-dt-bindings-power-supply-apple-describe-J71t-input-c.patch": "eb826e6af9afba118a84f1a425c5750d22dbb3c0079464642859c218fb0bba0a",
+    "0002-power-supply-apple-keep-J71t-charging-steady-across-.patch": "bd646fd2a936374447cb258324dd33e1537a5cc450bdd6c34c64f5bd2697c17d",
+    "0003-arm64-dts-apple-arm-the-J71t-owner-s-calibrated-USB-.patch": "cb57d3f1224fbaadd8e9c4d3c33903413a9e8e41c69631f9c7465214b653ade6"
+  },
+  "device_access": false,
+  "hardware_tested": false,
+  "workspace_commits": false
+}

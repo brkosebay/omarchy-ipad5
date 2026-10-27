@@ -1,0 +1,67 @@
+From 3d972d5f9539d1a554f4054f717917cdc9e3019c Mon Sep 17 00:00:00 2001
+From: Paul Praschl <maintainer@example.invalid>
+Date: Tue, 14 Jul 2026 13:05:54 +0200
+Subject: [PATCH 05/43] MAINTAINERS: Add T8010 PCIe and ANS support
+
+Add the new T8010 PCIe and Apple ANS files to the Apple platform
+section and list Paul Praschl as their maintainer.
+
+Signed-off-by: Paul Praschl <maintainer@example.invalid>
+(cherry picked from commit 0ad8e964046d49432bfa893aa1177ebd49627a6e)
+---
+ MAINTAINERS | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 7cb94e3bd9..ade85b5705 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -2652,6 +2652,7 @@ F:	Documentation/devicetree/bindings/nvmem/apple,efuses.yaml
+ F:	Documentation/devicetree/bindings/nvmem/apple,pmic-nvmem.yaml
+ F:	Documentation/devicetree/bindings/nvmem/apple,spmi-nvmem.yaml
+ F:	Documentation/devicetree/bindings/pci/apple,pcie.yaml
++F:	Documentation/devicetree/bindings/pci/apple,t8010-pcie.yaml
+ F:	Documentation/devicetree/bindings/phy/apple,atcphy.yaml
+ F:	Documentation/devicetree/bindings/pinctrl/apple,pinctrl.yaml
+ F:	Documentation/devicetree/bindings/power/apple*
+@@ -2684,9 +2685,12 @@ F:	drivers/irqchip/irq-apple-aic.c
+ F:	drivers/mfd/macsmc.c
+ F:      drivers/mfd/simple-mfd-spmi.c
+ F:	drivers/nvme/host/apple.c
++F:	drivers/nvme/host/pci-apple-ans.c
++F:	drivers/nvme/host/pci-internal.h
+ F:	drivers/nvmem/apple-efuses.c
+ F:	drivers/nvmem/apple-spmi-nvmem.c
+ F:      drivers/nvmem/simple-mfd-nvmem.c
++F:	drivers/pci/controller/pcie-apple-h9p.c
+ F:	drivers/phy/apple/
+ F:	drivers/pinctrl/pinctrl-apple-gpio.c
+ F:	drivers/power/reset/macsmc-reboot.c
+@@ -2702,11 +2706,24 @@ F:	drivers/video/backlight/apple_dwi_bl.c
+ F:	drivers/video/backlight/apple_pmic_bl.c
+ F:	drivers/watchdog/apple_wdt.c
+ F:	include/dt-bindings/interrupt-controller/apple-aic.h
++F:	include/linux/apple-ans.h
+ F:	include/dt-bindings/pinctrl/apple.h
+ F:	include/linux/mfd/macsmc.h
+ F:	include/linux/soc/apple/*
+ F:	include/uapi/drm/asahi_drm.h
+ 
++APPLE T8010 PCIE AND ANS SUPPORT
++M:	Paul Praschl <maintainer@example.invalid>
++L:	maintainer@example.invalid
++L:	maintainer@example.invalid
++L:	maintainer@example.invalid
++S:	Maintained
++F:	Documentation/devicetree/bindings/pci/apple,t8010-pcie.yaml
++F:	drivers/nvme/host/pci-apple-ans.c
++F:	drivers/nvme/host/pci-internal.h
++F:	drivers/pci/controller/pcie-apple-h9p.c
++F:	include/linux/apple-ans.h
++
+ ARM/ARTPEC MACHINE SUPPORT
+ M:	Jesper Nilsson <maintainer@example.invalid>
+ M:	Lars Persson <maintainer@example.invalid>
+-- 
+2.56.0
+

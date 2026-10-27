@@ -1,0 +1,1369 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 22:08:31 +0000
+Subject: [PATCH 06/20] media: apple: vxd: fix the open() NULL dereference and harden
+ the V4L2 paths
+
+Round 2 (warm kexec, apple_vxd.boot_firmware unset) registered
+/dev/video0, then udev's v4l_id oopsed in its first open(): NULL
+dereference at VA 0, read (ESR 0x96000004, level-0 translation fault).
+
+Root cause: struct apple_vxd_variant carried coded_fmts/num_coded_fmts
+since the V4L2 patch, but s8000_vxd_variant never filled them, and no
+other code did either.  open() -> apple_vxd_reset_coded_fmt() took
+&variant->coded_fmts[0] == NULL and read ->fourcc (offset 0) from it.
+Round 1 never registered the node, so the bug only showed once round 2
+wired V4L2 into probe.  The other candidate, a NULL vdev->dev_parent in
+v4l_querycap(), is not a bug: video_register_device() defaults it to
+v4l2_dev->dev, and media_set_bus_info() handles NULL anyway.
+
+The coded-format table now lives in the device, filled by
+apple_vxd_h264_register() during probe.  apple_vxd_v4l2_init() and
+open() refuse to run without it (-ENODEV).  Every path reachable from
+open, release, QUERYCAP, ENUM_FMT, G_FMT, TRY_FMT and S_FMT on the video
+and media nodes was audited with the firmware not booted.  None of them
+touches state that only the firmware boot or the debugfs trigger
+creates.  The only hw_ready consumer is the H.264 job path, which fails
+the job with -EAGAIN.
+
+Also fixed along those paths:
+- G_FMT on the output queue returned num_planes 0 and sizeimage 0 by
+  default.  It now gets the same normalization as TRY_FMT: one plane,
+  1 MiB.
+- v4l2_ready was set right after video_register_device(), so a later
+  registration failure left remove() a second teardown.  It is set
+  last now, and the error labels no longer clean up a media device that
+  was never initialized.
+- A V4L2 registration failure used to fail the probe after debugfs
+  existed, freeing vxd (devm) under live debugfs files.  The probe now
+  logs the failure and continues without the node.
+- bus_info is no longer hardcoded.  The core fills
+  "platform:<dev_name>" for both QUERYCAP and the media device, so the
+  two match.
+- The debugfs mbox/regs dumps read MMIO without a runtime PM reference.
+  The block autosuspends 100 ms after probe, so a pre-boot `cat` read an
+  unpowered block.  Both dumps now resume the device around the read.
+- apple_vxd_boot_firmware() released the firmware a second time on
+  every failure after the copy, for example a ready-poll timeout, which
+  is the likely T3 outcome.
+- W=1: drop the unused 'saved' in vxd_discover_core() (the register read
+  is kept) and the static/extern mismatch on apple_vxd_log_pwrstate().
+- TRY_EXT_CTRLS on the current control values failed with -EINVAL.  The
+  SPS validator allow-listed profile_idc 66/77/100, so the default SPS
+  (profile_idc 0) was rejected.  It now rejects only the profiles the
+  decoder lacks: extended, SVC, and MVC/stereo/depth.  High 10, 4:2:2
+  and 4:4:4 stay rejected by the chroma and bit-depth checks.  Found by
+  v4l2-compliance.
+
+New bring-up aids:
+- apple_vxd.v4l2=0 skips the V4L2 registration entirely.  Probe, GART,
+  debugfs and the boot trigger still work.
+- Every V4L2 entry point announces itself with a flushed dev_emerg STEP
+  line.  That covers open/release (with the caller's comm/pid), every
+  ioctl before the core runs (named, e.g. "ioctl VIDIOC_QUERYCAP"), the
+  driver handler, mmap, start/stop_streaming, device_run, and the media
+  request validate/queue hooks.  The high-rate lines can be silenced at
+  runtime with /sys/module/apple_vxd/parameters/step_ioctls.
+- A register-time self-test runs before any node is exposed.  It
+  covers the driver half of open() (format defaults, the m2m context
+  and vb2 queues, and the control handler including
+  v4l2_ctrl_handler_setup -> s_ctrl), every format, enum and
+  framesize handler body, the querycap fill and the driver half of
+  release(), all on a private context.  A failure names the check and
+  skips the V4L2 registration instead of oopsing under udev.  The
+  handler bodies now take the context, and the file-based ioctl ops
+  are thin wrappers around them.  The v4l2_fh bookkeeping is core code
+  and is not run.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ drivers/media/platform/apple/vxd/apple-vxd-core.c |  84 ++-
+ drivers/media/platform/apple/vxd/apple-vxd-fw.c   |  12 +-
+ drivers/media/platform/apple/vxd/apple-vxd-h264.c |  37 +-
+ drivers/media/platform/apple/vxd/apple-vxd-mbox.c |  22 +-
+ drivers/media/platform/apple/vxd/apple-vxd-v4l2.c | 637 ++++++++++++++++++----
+ drivers/media/platform/apple/vxd/apple-vxd.h      |  18 +-
+ 6 files changed, 677 insertions(+), 133 deletions(-)
+
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-core.c b/drivers/media/platform/apple/vxd/apple-vxd-core.c
+index 026a301d70aca31b1715d0bc607fa72ac4b8a64f..2780baeb9b0c7827faa3284801a9eaa72d0ba881 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-core.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-core.c
+@@ -52,16 +52,62 @@ static bool apple_vxd_debug;
+ module_param_named(debug, apple_vxd_debug, bool, 0444);
+ MODULE_PARM_DESC(debug, "log register details beyond probe summary");
+ 
++/*
++ * Round 2's oops was in the first open() of the freshly exposed video
++ * node (udev's v4l_id).  apple_vxd.v4l2=0 skips the V4L2 registration
++ * entirely so the probe/GART/boot rungs can be worked on without any
++ * /dev/video* or /dev/media* node existing.  Read once, at probe.
++ */
++static bool apple_vxd_v4l2_param = true;
++module_param_named(v4l2, apple_vxd_v4l2_param, bool, 0444);
++MODULE_PARM_DESC(v4l2, "register the V4L2 m2m/media devices (0 = probe only)");
++
++/*
++ * Per-ioctl/per-job STEP lines (vxd_step_io).  On by default for the
++ * bring-up rounds so a crash in any V4L2 handler names it; a decode run or
++ * v4l2-compliance produces hundreds of them, so they can be switched off
++ * at runtime through /sys/module/apple_vxd/parameters/step_ioctls.
++ */
++static bool apple_vxd_step_ioctls = true;
++module_param_named(step_ioctls, apple_vxd_step_ioctls, bool, 0644);
++MODULE_PARM_DESC(step_ioctls,
++		 "announce every V4L2 ioctl/job with a flushed STEP line (default on)");
++
++static void vxd_vstep(const struct device *dev, const char *fmt, va_list args)
++{
++	struct va_format vaf = { .fmt = fmt, .va = &args };
++
++	dev_emerg(dev, "STEP %pV\n", &vaf);
++	pr_flush(100, false);
++}
++
+ /*
+  * Crash reporting for the bring-up rounds: announce the next step BEFORE
+  * doing it and flush the console, so the last line on the screen or in
+  * netconsole (or the pstore panic record) names the step that faulted.
+  * Round 1's rebind panic left nothing behind; this removes the ambiguity.
++ * Process context only (pr_flush may sleep).
+  */
+-void vxd_step(const struct device *dev, const char *what)
++void vxd_step(const struct device *dev, const char *fmt, ...)
+ {
+-	dev_emerg(dev, "STEP %s\n", what);
+-	pr_flush(100, false);
++	va_list args;
++
++	va_start(args, fmt);
++	vxd_vstep(dev, fmt, args);
++	va_end(args);
++}
++
++/* Same, for the high-rate V4L2 entry points (gated by step_ioctls). */
++void vxd_step_io(const struct device *dev, const char *fmt, ...)
++{
++	va_list args;
++
++	if (!READ_ONCE(apple_vxd_step_ioctls))
++		return;
++
++	va_start(args, fmt);
++	vxd_vstep(dev, fmt, args);
++	va_end(args);
+ }
+ 
+ /*
+@@ -103,7 +149,7 @@ void apple_vxd_watchdog(struct work_struct *work)
+  * history fields of the genpd backing this device so a boot that touches
+  * a half-powered block is identifiable from the log.
+  */
+-static void apple_vxd_log_pwrstate(struct apple_vxd_dev *vxd, const char *when)
++void apple_vxd_log_pwrstate(struct apple_vxd_dev *vxd, const char *when)
+ {
+ 	struct device_node *domain, *parent;
+ 	struct regmap *pmgr;
+@@ -367,15 +413,33 @@ static int apple_vxd_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		goto err_disable_runtime_pm;
+ 
+-	/* Debugfs (dumps + the boot trigger) first so a later step can be
+-	 * re-run or inspected no matter how far probe got.
++	/*
++	 * Codec registration fills vxd->coded_fmts before any V4L2 node can
++	 * exist; apple_vxd_v4l2_init() refuses to register without it.
+ 	 */
+-	apple_vxd_mbox_init(vxd);
+-
+-	ret = apple_vxd_v4l2_init(vxd);
++	ret = apple_vxd_h264_register(vxd);
+ 	if (ret)
+ 		goto err_gart_fini;
+ 
++	/*
++	 * Debugfs (dumps + the boot trigger) first so a later step can be
++	 * re-run or inspected no matter how far probe got.  Nothing after
++	 * this point fails the probe: an error return here would free vxd
++	 * (devm) under the live debugfs files.
++	 */
++	apple_vxd_mbox_init(vxd);
++
++	if (apple_vxd_v4l2_param) {
++		ret = apple_vxd_v4l2_init(vxd);
++		if (ret)
++			dev_err(&pdev->dev,
++				"V4L2 registration failed (%d); continuing without /dev/video (debugfs boot trigger still usable)\n",
++				ret);
++	} else {
++		dev_info(&pdev->dev,
++			 "v4l2: registration skipped (apple_vxd.v4l2=0)\n");
++	}
++
+ 	if (apple_vxd_boot_firmware_param) {
+ 		ret = apple_vxd_boot_firmware(vxd);
+ 		if (ret)
+@@ -429,7 +493,7 @@ static struct platform_driver apple_vxd_driver = {
+ 	.probe = apple_vxd_probe,
+ 	.remove = apple_vxd_remove,
+ 	.driver = {
+-		.name = "apple-vxd",
++		.name = APPLE_VXD_DRV_NAME,
+ 		.pm = &apple_vxd_pm_ops,
+ 		.of_match_table = apple_vxd_of_match,
+ 	},
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-fw.c b/drivers/media/platform/apple/vxd/apple-vxd-fw.c
+index 32603f836287a52a77d2c9df64bbd4f32857603b..63ff4502f5c091d4aa32c7c574295901a4dddc8e 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-fw.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-fw.c
+@@ -185,12 +185,16 @@ static int vxd_known_state_v2(struct apple_vxd_dev *vxd)
+  */
+ static void vxd_discover_core(struct apple_vxd_dev *vxd)
+ {
+-	u32 saved, pipe, status = 0, maxa = 0;
++	u32 pipe, status = 0, maxa = 0;
+ 
+ 	vxd->cfg_flags = ((vxd->num_entropy_pipes != 0) << 21);
+ 
+-	/* save 0x440, set the firmware clock value [E] */
+-	saved = vxd_read(vxd, VXD_REG_CR_PVDEC_MAN_CLK_ENABLE);
++	/*
++	 * save 0x440, set the firmware clock value [E].  The saved value is
++	 * not restored in this prologue (round 2 already left it unused), so
++	 * only the read is kept, in the kext's order.
++	 */
++	vxd_read(vxd, VXD_REG_CR_PVDEC_MAN_CLK_ENABLE);
+ 	vxd_set_clocks(vxd, VXD_CLK_ENABLE_FW);
+ 
+ 	for (pipe = 1; pipe <= vxd->num_pixel_pipes; pipe++) {
+@@ -394,6 +398,8 @@ int apple_vxd_boot_firmware(struct apple_vxd_dev *vxd)
+ 
+ 	memcpy(vxd->fw_vaddr, fw->data, fw->size);
+ 	release_firmware(fw);
++	/* Every later failure unwinds through out_release: no double free. */
++	fw = NULL;
+ 
+ 	/* PrepareCore [E], in the kext's order. */
+ 	ret = vxd_known_state_v1(vxd, "PrepareCore");
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-h264.c b/drivers/media/platform/apple/vxd/apple-vxd-h264.c
+index eacde4be6ef0af78a4cce1cf0cf401ab62afb581..5fbfa366a9de198677e2dcc3d7ce4c2b0e40c618 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-h264.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-h264.c
+@@ -20,15 +20,28 @@ static int apple_vxd_h264_validate_sps(struct apple_vxd_ctx *ctx,
+ {
+ 	const struct apple_vxd_dev *vxd = ctx->vxd;
+ 
++	/*
++	 * Reject the profiles whose tools the 8-bit 4:2:0 decoder lacks;
++	 * High 10/4:2:2/4:4:4 are caught by the chroma/bit-depth checks below.
++	 * No allow-list: the control's default (profile_idc 0, before
++	 * userspace sets an SPS) must pass, or TRY_EXT_CTRLS on the current
++	 * values fails (v4l2-compliance, round 3 QEMU smoke).
++	 */
+ 	switch (sps->profile_idc) {
+-	case 66: /* constrained baseline / baseline */
+-	case 77: /* main */
+-	case 100: /* high */
+-		break;
+-	default:
++	case 88: /* extended: data partitioning */
++	case 83: /* scalable baseline */
++	case 86: /* scalable high */
++	case 118: /* multiview high */
++	case 128: /* stereo high */
++	case 134: /* MFC high */
++	case 135: /* MFC depth high */
++	case 138: /* multiview depth high */
++	case 139: /* enhanced multiview depth high */
+ 		dev_dbg(vxd->dev, "sps: unsupported profile %u\n",
+ 			sps->profile_idc);
+ 		return -EINVAL;
++	default:
++		break;
+ 	}
+ 
+ 	if (sps->chroma_format_idc > 1) {
+@@ -199,6 +212,18 @@ static const struct apple_vxd_coded_fmt_desc apple_vxd_h264_fmt = {
+ 	.decoded_fmts = apple_vxd_h264_decoded_fmts,
+ };
+ 
+-const struct apple_vxd_coded_fmt_desc apple_vxd_coded_fmts[] = {
++static const struct apple_vxd_coded_fmt_desc apple_vxd_coded_fmts[] = {
+ 	apple_vxd_h264_fmt,
+ };
++
++/*
++ * Fills the device's coded-format table.  Called during probe, before any
++ * V4L2 node exists: apple_vxd_v4l2_init() and open() both refuse to run
++ * without it (round 2 had no such fill and oopsed in the first open()).
++ */
++int apple_vxd_h264_register(struct apple_vxd_dev *vxd)
++{
++	vxd->coded_fmts = apple_vxd_coded_fmts;
++	vxd->num_coded_fmts = ARRAY_SIZE(apple_vxd_coded_fmts);
++	return 0;
++}
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-mbox.c b/drivers/media/platform/apple/vxd/apple-vxd-mbox.c
+index 3cbe7f890ebac4690a0032ddf5797541f9e95656..dd10083fa1de2f747c4d38b5ece1745b4052a7ca 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-mbox.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-mbox.c
+@@ -22,6 +22,7 @@
+ #include <linux/fs.h>
+ #include <linux/debugfs.h>
+ #include <linux/module.h>
++#include <linux/pm_runtime.h>
+ #include <linux/seq_file.h>
+ 
+ #include "apple-vxd.h"
+@@ -87,9 +88,19 @@ static const struct file_operations apple_vxd_boot_trigger_fops = {
+ 	.llseek = default_llseek,
+ };
+ 
++/*
++ * The dumps read MMIO, and the block autosuspends 100 ms after probe (the
++ * ps_vdec genpd then cuts it): take a runtime PM reference around every
++ * dump so a `cat` never reads an unpowered block.
++ */
+ static int apple_vxd_mbox_dump_show(struct seq_file *m, void *v)
+ {
+ 	struct apple_vxd_dev *vxd = m->private;
++	int ret;
++
++	ret = pm_runtime_resume_and_get(vxd->dev);
++	if (ret)
++		return ret;
+ 
+ 	seq_printf(m, "comms state      %#x\n", vxd_read(vxd, VXD_REG_COMMS_STATE));
+ 	seq_printf(m, "comms 0x2008     %#x\n", vxd_read(vxd, VXD_REG_COMMS_2008));
+@@ -106,6 +117,8 @@ static int apple_vxd_mbox_dump_show(struct seq_file *m, void *v)
+ 		   vxd_read(vxd, VXD_REG_TO_MTX_WR_INDEX),
+ 		   apple_vxd_to_mtx_free(vxd));
+ 	seq_printf(m, "comms flags      %#x\n", vxd_read(vxd, VXD_REG_COMMS_FLAGS));
++
++	pm_runtime_put_autosuspend(vxd->dev);
+ 	return 0;
+ }
+ 
+@@ -148,9 +161,16 @@ static int apple_vxd_regs_dump_show(struct seq_file *m, void *v)
+ 	};
+ 	struct apple_vxd_dev *vxd = m->private;
+ 	unsigned int i;
++	int ret;
++
++	ret = pm_runtime_resume_and_get(vxd->dev);
++	if (ret)
++		return ret;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(regs); i++)
+ 		seq_printf(m, "%-24s %#x\n", regs[i].name, vxd_read(vxd, regs[i].off));
++
++	pm_runtime_put_autosuspend(vxd->dev);
+ 	return 0;
+ }
+ 
+@@ -164,7 +184,7 @@ int apple_vxd_mbox_init(struct apple_vxd_dev *vxd)
+ 	if (!IS_ENABLED(CONFIG_DEBUG_FS))
+ 		return 0;
+ 
+-	dir = debugfs_create_dir("apple-vxd", NULL);
++	dir = debugfs_create_dir(APPLE_VXD_DRV_NAME, NULL);
+ 	if (IS_ERR(dir))
+ 		return 0;	/* debugfs is optional for bring-up */
+ 
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-v4l2.c b/drivers/media/platform/apple/vxd/apple-vxd-v4l2.c
+index 2e8a09ca86c38fd25d3725dfb31ceafe2f546651..21c362eba265a8b3441b1eaab1ee1f35df6ab21e 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-v4l2.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-v4l2.c
+@@ -8,15 +8,31 @@
+  * The hardware submission layer behind the H.264 backend refuses jobs
+  * until R2 wires the firmware mailbox; that failure path is part of the
+  * bring-up contract (test plan T6).
++ *
++ * Round 3: every handler body takes the context, not the file, so the
++ * register-time self-test runs the same code as open(), the format ioctls
++ * and release() on a private context before the node is exposed.  Every
++ * V4L2 entry point announces itself with a flushed STEP line; nothing here
++ * touches state that only the firmware boot creates (the only consumer of
++ * hw_ready is the H.264 job path, which fails the job instead).
+  */
++#include <linux/pm_runtime.h>
++#include <linux/sched.h>
++
+ #include <media/v4l2-event.h>
+ #include <media/v4l2-ioctl.h>
+ #include <media/videobuf2-dma-contig.h>
+ 
+-#include <linux/pm_runtime.h>
+-
+ #include "apple-vxd.h"
+ 
++/* Smallest bitstream buffer handed to userspace. */
++#define APPLE_VXD_MIN_BITSTREAM_SIZE	SZ_1M
++
++static struct apple_vxd_ctx *file_to_vxd_ctx(struct file *file)
++{
++	return container_of(file_to_v4l2_fh(file), struct apple_vxd_ctx, fh);
++}
++
+ static void apple_vxd_reset_fmt(struct apple_vxd_ctx *ctx,
+ 				struct v4l2_format *f, u32 fourcc)
+ {
+@@ -71,11 +87,12 @@ static bool apple_vxd_is_valid_fmt(struct apple_vxd_ctx *ctx, u32 fourcc,
+ static const struct apple_vxd_coded_fmt_desc *
+ apple_vxd_find_coded_fmt_desc(struct apple_vxd_ctx *ctx, u32 fourcc)
+ {
++	struct apple_vxd_dev *vxd = ctx->vxd;
+ 	unsigned int i;
+ 
+-	for (i = 0; i < ctx->vxd->variant->num_coded_fmts; i++)
+-		if (ctx->vxd->variant->coded_fmts[i].fourcc == fourcc)
+-			return &ctx->vxd->variant->coded_fmts[i];
++	for (i = 0; i < vxd->num_coded_fmts; i++)
++		if (vxd->coded_fmts[i].fourcc == fourcc)
++			return &vxd->coded_fmts[i];
+ 	return NULL;
+ }
+ 
+@@ -83,11 +100,15 @@ static void apple_vxd_reset_coded_fmt(struct apple_vxd_ctx *ctx)
+ {
+ 	struct v4l2_format *f = &ctx->coded_fmt;
+ 
+-	ctx->coded_fmt_desc = &ctx->vxd->variant->coded_fmts[0];
++	/* apple_vxd_ctx_init() checked vxd->coded_fmts before calling us. */
++	ctx->coded_fmt_desc = &ctx->vxd->coded_fmts[0];
+ 	apple_vxd_reset_fmt(ctx, f, ctx->coded_fmt_desc->fourcc);
+ 	f->type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+ 	f->fmt.pix_mp.width = ctx->coded_fmt_desc->frmsize.min_width;
+ 	f->fmt.pix_mp.height = ctx->coded_fmt_desc->frmsize.min_height;
++	/* Same normalization as TRY_FMT: one plane, a usable bitstream size. */
++	f->fmt.pix_mp.num_planes = 1;
++	f->fmt.pix_mp.plane_fmt[0].sizeimage = APPLE_VXD_MIN_BITSTREAM_SIZE;
+ 
+ 	if (ctx->coded_fmt_desc->ops->adjust_fmt)
+ 		ctx->coded_fmt_desc->ops->adjust_fmt(ctx, f);
+@@ -126,6 +147,10 @@ static int apple_vxd_try_ctrl(struct v4l2_ctrl *ctrl)
+ 	return 0;
+ }
+ 
++/*
++ * Also runs from v4l2_ctrl_handler_setup() inside apple_vxd_ctx_init(), so
++ * the m2m context (and its queues) must exist before the controls do.
++ */
+ static int apple_vxd_s_ctrl(struct v4l2_ctrl *ctrl)
+ {
+ 	struct apple_vxd_ctx *ctx =
+@@ -172,17 +197,17 @@ static int apple_vxd_add_ctrls(struct apple_vxd_ctx *ctx,
+ 
+ static int apple_vxd_init_ctrls(struct apple_vxd_ctx *ctx)
+ {
++	struct apple_vxd_dev *vxd = ctx->vxd;
+ 	unsigned int i, nctrls = 0;
+ 	int ret;
+ 
+-	for (i = 0; i < ctx->vxd->variant->num_coded_fmts; i++)
+-		nctrls += ctx->vxd->variant->coded_fmts[i].ctrls->num_ctrls;
++	for (i = 0; i < vxd->num_coded_fmts; i++)
++		nctrls += vxd->coded_fmts[i].ctrls->num_ctrls;
+ 
+ 	v4l2_ctrl_handler_init(&ctx->ctrl_hdl, nctrls);
+ 
+-	for (i = 0; i < ctx->vxd->variant->num_coded_fmts; i++) {
+-		ret = apple_vxd_add_ctrls(ctx,
+-					  ctx->vxd->variant->coded_fmts[i].ctrls);
++	for (i = 0; i < vxd->num_coded_fmts; i++) {
++		ret = apple_vxd_add_ctrls(ctx, vxd->coded_fmts[i].ctrls);
+ 		if (ret)
+ 			goto err_free_handler;
+ 	}
+@@ -199,11 +224,11 @@ static int apple_vxd_init_ctrls(struct apple_vxd_ctx *ctx)
+ 	return ret;
+ }
+ 
+-static int apple_vxd_enum_framesizes(struct file *file, void *priv,
+-				     struct v4l2_frmsizeenum *fsize)
++/* --- handler bodies (context based; shared with the self-test) --------- */
++
++static int apple_vxd_do_enum_framesizes(struct apple_vxd_ctx *ctx,
++					struct v4l2_frmsizeenum *fsize)
+ {
+-	struct apple_vxd_ctx *ctx = container_of(file_to_v4l2_fh(file),
+-						 struct apple_vxd_ctx, fh);
+ 	const struct apple_vxd_coded_fmt_desc *desc;
+ 
+ 	if (fsize->index != 0)
+@@ -224,25 +249,22 @@ static int apple_vxd_enum_framesizes(struct file *file, void *priv,
+ 	return 0;
+ }
+ 
+-static int apple_vxd_querycap(struct file *file, void *priv,
+-			      struct v4l2_capability *cap)
++/*
++ * The V4L2 core fills device_caps, capabilities and bus_info (from the
++ * node's parent device, "platform:207f00000.vxd", matching the media
++ * device's default) before calling the driver.
++ */
++static void apple_vxd_fill_querycap(struct apple_vxd_dev *vxd,
++				    struct v4l2_capability *cap)
+ {
+-	struct apple_vxd_dev *vxd = video_drvdata(file);
+-	struct video_device *vdev = video_devdata(file);
+-
+-	strscpy(cap->driver, vxd->dev->driver->name, sizeof(cap->driver));
+-	strscpy(cap->card, vdev->name, sizeof(cap->card));
+-	snprintf(cap->bus_info, sizeof(cap->bus_info), "platform:%s",
+-		 vxd->dev->driver->name);
+-	return 0;
++	strscpy(cap->driver, APPLE_VXD_DRV_NAME, sizeof(cap->driver));
++	strscpy(cap->card, APPLE_VXD_DRV_NAME, sizeof(cap->card));
+ }
+ 
+-static int apple_vxd_try_capture_fmt(struct file *file, void *priv,
+-				     struct v4l2_format *f)
++static int apple_vxd_do_try_capture_fmt(struct apple_vxd_ctx *ctx,
++					struct v4l2_format *f)
+ {
+ 	struct v4l2_pix_format_mplane *pix_mp = &f->fmt.pix_mp;
+-	struct apple_vxd_ctx *ctx = container_of(file_to_v4l2_fh(file),
+-						 struct apple_vxd_ctx, fh);
+ 	const struct apple_vxd_coded_fmt_desc *coded_desc = ctx->coded_fmt_desc;
+ 
+ 	if (!apple_vxd_is_valid_fmt(ctx, pix_mp->pixelformat, ctx->image_fmt))
+@@ -261,17 +283,15 @@ static int apple_vxd_try_capture_fmt(struct file *file, void *priv,
+ 	return 0;
+ }
+ 
+-static int apple_vxd_try_output_fmt(struct file *file, void *priv,
+-				    struct v4l2_format *f)
++static int apple_vxd_do_try_output_fmt(struct apple_vxd_ctx *ctx,
++				       struct v4l2_format *f)
+ {
+ 	struct v4l2_pix_format_mplane *pix_mp = &f->fmt.pix_mp;
+-	struct apple_vxd_ctx *ctx = container_of(file_to_v4l2_fh(file),
+-						 struct apple_vxd_ctx, fh);
+ 	const struct apple_vxd_coded_fmt_desc *desc;
+ 
+ 	desc = apple_vxd_find_coded_fmt_desc(ctx, pix_mp->pixelformat);
+ 	if (!desc) {
+-		desc = &ctx->vxd->variant->coded_fmts[0];
++		desc = &ctx->vxd->coded_fmts[0];
+ 		pix_mp->pixelformat = desc->fourcc;
+ 	}
+ 
+@@ -291,15 +311,13 @@ static int apple_vxd_try_output_fmt(struct file *file, void *priv,
+ 	}
+ 
+ 	pix_mp->plane_fmt[0].sizeimage =
+-		max(pix_mp->plane_fmt[0].sizeimage, SZ_1M);
++		max(pix_mp->plane_fmt[0].sizeimage, APPLE_VXD_MIN_BITSTREAM_SIZE);
+ 	return 0;
+ }
+ 
+-static int apple_vxd_s_capture_fmt(struct file *file, void *priv,
+-				   struct v4l2_format *f)
++static int apple_vxd_do_s_capture_fmt(struct apple_vxd_ctx *ctx,
++				      struct v4l2_format *f)
+ {
+-	struct apple_vxd_ctx *ctx = container_of(file_to_v4l2_fh(file),
+-						 struct apple_vxd_ctx, fh);
+ 	struct vb2_queue *vq;
+ 	int ret;
+ 
+@@ -309,7 +327,7 @@ static int apple_vxd_s_capture_fmt(struct file *file, void *priv,
+ 	if (vb2_is_busy(vq))
+ 		return -EBUSY;
+ 
+-	ret = apple_vxd_try_capture_fmt(file, priv, f);
++	ret = apple_vxd_do_try_capture_fmt(ctx, f);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -317,11 +335,9 @@ static int apple_vxd_s_capture_fmt(struct file *file, void *priv,
+ 	return 0;
+ }
+ 
+-static int apple_vxd_s_output_fmt(struct file *file, void *priv,
+-				  struct v4l2_format *f)
++static int apple_vxd_do_s_output_fmt(struct apple_vxd_ctx *ctx,
++				     struct v4l2_format *f)
+ {
+-	struct apple_vxd_ctx *ctx = container_of(file_to_v4l2_fh(file),
+-						 struct apple_vxd_ctx, fh);
+ 	struct v4l2_m2m_ctx *m2m_ctx = ctx->fh.m2m_ctx;
+ 	const struct apple_vxd_coded_fmt_desc *desc;
+ 	struct v4l2_format *cap_fmt;
+@@ -343,7 +359,7 @@ static int apple_vxd_s_output_fmt(struct file *file, void *priv,
+ 	if (vb2_is_busy(peer_vq))
+ 		return -EBUSY;
+ 
+-	ret = apple_vxd_try_output_fmt(file, priv, f);
++	ret = apple_vxd_do_try_output_fmt(ctx, f);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -370,52 +386,112 @@ static int apple_vxd_s_output_fmt(struct file *file, void *priv,
+ 	return 0;
+ }
+ 
+-static int apple_vxd_g_output_fmt(struct file *file, void *priv,
++static int apple_vxd_do_enum_output_fmt(struct apple_vxd_ctx *ctx,
++					struct v4l2_fmtdesc *f)
++{
++	if (f->index >= ctx->vxd->num_coded_fmts)
++		return -EINVAL;
++	f->pixelformat = ctx->vxd->coded_fmts[f->index].fourcc;
++	return 0;
++}
++
++static int apple_vxd_do_enum_capture_fmt(struct apple_vxd_ctx *ctx,
++					 struct v4l2_fmtdesc *f)
++{
++	u32 fourcc;
++
++	fourcc = apple_vxd_enum_decoded_fmt(ctx, f->index, ctx->image_fmt);
++	if (!fourcc)
++		return -EINVAL;
++	f->pixelformat = fourcc;
++	return 0;
++}
++
++/* --- ioctl entry points ------------------------------------------------ */
++
++/*
++ * Driver-side STEP lines: the ioctl-entry line (apple_vxd_ioctl) names the
++ * command before the V4L2 core runs; these name the driver handler, so a
++ * crash between the two is in core code.
++ */
++static void apple_vxd_step_handler(struct file *file, const char *what)
++{
++	struct apple_vxd_dev *vxd = video_drvdata(file);
++
++	vxd_step_io(vxd->dev, "handler: %s", what);
++}
++
++static int apple_vxd_enum_framesizes(struct file *file, void *priv,
++				     struct v4l2_frmsizeenum *fsize)
++{
++	apple_vxd_step_handler(file, "enum_framesizes");
++	return apple_vxd_do_enum_framesizes(file_to_vxd_ctx(file), fsize);
++}
++
++static int apple_vxd_querycap(struct file *file, void *priv,
++			      struct v4l2_capability *cap)
++{
++	apple_vxd_step_handler(file, "querycap");
++	apple_vxd_fill_querycap(video_drvdata(file), cap);
++	return 0;
++}
++
++static int apple_vxd_try_capture_fmt(struct file *file, void *priv,
++				     struct v4l2_format *f)
++{
++	apple_vxd_step_handler(file, "try_fmt capture");
++	return apple_vxd_do_try_capture_fmt(file_to_vxd_ctx(file), f);
++}
++
++static int apple_vxd_try_output_fmt(struct file *file, void *priv,
++				    struct v4l2_format *f)
++{
++	apple_vxd_step_handler(file, "try_fmt output");
++	return apple_vxd_do_try_output_fmt(file_to_vxd_ctx(file), f);
++}
++
++static int apple_vxd_s_capture_fmt(struct file *file, void *priv,
++				   struct v4l2_format *f)
++{
++	apple_vxd_step_handler(file, "s_fmt capture");
++	return apple_vxd_do_s_capture_fmt(file_to_vxd_ctx(file), f);
++}
++
++static int apple_vxd_s_output_fmt(struct file *file, void *priv,
+ 				  struct v4l2_format *f)
+ {
+-	struct apple_vxd_ctx *ctx = container_of(file_to_v4l2_fh(file),
+-						 struct apple_vxd_ctx, fh);
++	apple_vxd_step_handler(file, "s_fmt output");
++	return apple_vxd_do_s_output_fmt(file_to_vxd_ctx(file), f);
++}
+ 
+-	*f = ctx->coded_fmt;
++static int apple_vxd_g_output_fmt(struct file *file, void *priv,
++				  struct v4l2_format *f)
++{
++	apple_vxd_step_handler(file, "g_fmt output");
++	*f = file_to_vxd_ctx(file)->coded_fmt;
+ 	return 0;
+ }
+ 
+ static int apple_vxd_g_capture_fmt(struct file *file, void *priv,
+ 				   struct v4l2_format *f)
+ {
+-	struct apple_vxd_ctx *ctx = container_of(file_to_v4l2_fh(file),
+-						 struct apple_vxd_ctx, fh);
+-
+-	*f = ctx->decoded_fmt;
++	apple_vxd_step_handler(file, "g_fmt capture");
++	*f = file_to_vxd_ctx(file)->decoded_fmt;
+ 	return 0;
+ }
+ 
+ static int apple_vxd_enum_output_fmt(struct file *file, void *priv,
+ 				     struct v4l2_fmtdesc *f)
+ {
+-	struct apple_vxd_ctx *ctx = container_of(file_to_v4l2_fh(file),
+-						 struct apple_vxd_ctx, fh);
+-	const struct apple_vxd_coded_fmt_desc *desc;
+-
+-	if (f->index >= ctx->vxd->variant->num_coded_fmts)
+-		return -EINVAL;
+-	desc = &ctx->vxd->variant->coded_fmts[f->index];
+-	f->pixelformat = desc->fourcc;
+-	return 0;
++	apple_vxd_step_handler(file, "enum_fmt output");
++	return apple_vxd_do_enum_output_fmt(file_to_vxd_ctx(file), f);
+ }
+ 
+ static int apple_vxd_enum_capture_fmt(struct file *file, void *priv,
+ 				      struct v4l2_fmtdesc *f)
+ {
+-	struct apple_vxd_ctx *ctx = container_of(file_to_v4l2_fh(file),
+-						 struct apple_vxd_ctx, fh);
+-	u32 fourcc;
+-
+-	fourcc = apple_vxd_enum_decoded_fmt(ctx, f->index, ctx->image_fmt);
+-	if (!fourcc)
+-		return -EINVAL;
+-	f->pixelformat = fourcc;
+-	return 0;
++	apple_vxd_step_handler(file, "enum_fmt capture");
++	return apple_vxd_do_enum_capture_fmt(file_to_vxd_ctx(file), f);
+ }
+ 
+ static const struct v4l2_ioctl_ops apple_vxd_ioctl_ops = {
+@@ -449,6 +525,78 @@ static const struct v4l2_ioctl_ops apple_vxd_ioctl_ops = {
+ 	.vidioc_try_decoder_cmd = v4l2_m2m_ioctl_stateless_try_decoder_cmd,
+ };
+ 
++static const struct {
++	unsigned int cmd;
++	const char *name;
++} apple_vxd_ioctl_names[] = {
++	{ VIDIOC_QUERYCAP, "VIDIOC_QUERYCAP" },
++	{ VIDIOC_ENUM_FMT, "VIDIOC_ENUM_FMT" },
++	{ VIDIOC_G_FMT, "VIDIOC_G_FMT" },
++	{ VIDIOC_S_FMT, "VIDIOC_S_FMT" },
++	{ VIDIOC_TRY_FMT, "VIDIOC_TRY_FMT" },
++	{ VIDIOC_ENUM_FRAMESIZES, "VIDIOC_ENUM_FRAMESIZES" },
++	{ VIDIOC_ENUM_FRAMEINTERVALS, "VIDIOC_ENUM_FRAMEINTERVALS" },
++	{ VIDIOC_REQBUFS, "VIDIOC_REQBUFS" },
++	{ VIDIOC_QUERYBUF, "VIDIOC_QUERYBUF" },
++	{ VIDIOC_QBUF, "VIDIOC_QBUF" },
++	{ VIDIOC_DQBUF, "VIDIOC_DQBUF" },
++	{ VIDIOC_PREPARE_BUF, "VIDIOC_PREPARE_BUF" },
++	{ VIDIOC_CREATE_BUFS, "VIDIOC_CREATE_BUFS" },
++	{ VIDIOC_EXPBUF, "VIDIOC_EXPBUF" },
++	{ VIDIOC_STREAMON, "VIDIOC_STREAMON" },
++	{ VIDIOC_STREAMOFF, "VIDIOC_STREAMOFF" },
++	{ VIDIOC_QUERYCTRL, "VIDIOC_QUERYCTRL" },
++	{ VIDIOC_QUERY_EXT_CTRL, "VIDIOC_QUERY_EXT_CTRL" },
++	{ VIDIOC_QUERYMENU, "VIDIOC_QUERYMENU" },
++	{ VIDIOC_G_CTRL, "VIDIOC_G_CTRL" },
++	{ VIDIOC_S_CTRL, "VIDIOC_S_CTRL" },
++	{ VIDIOC_G_EXT_CTRLS, "VIDIOC_G_EXT_CTRLS" },
++	{ VIDIOC_S_EXT_CTRLS, "VIDIOC_S_EXT_CTRLS" },
++	{ VIDIOC_TRY_EXT_CTRLS, "VIDIOC_TRY_EXT_CTRLS" },
++	{ VIDIOC_SUBSCRIBE_EVENT, "VIDIOC_SUBSCRIBE_EVENT" },
++	{ VIDIOC_UNSUBSCRIBE_EVENT, "VIDIOC_UNSUBSCRIBE_EVENT" },
++	{ VIDIOC_DQEVENT, "VIDIOC_DQEVENT" },
++	{ VIDIOC_DECODER_CMD, "VIDIOC_DECODER_CMD" },
++	{ VIDIOC_TRY_DECODER_CMD, "VIDIOC_TRY_DECODER_CMD" },
++	{ VIDIOC_G_PRIORITY, "VIDIOC_G_PRIORITY" },
++	{ VIDIOC_S_PRIORITY, "VIDIOC_S_PRIORITY" },
++	{ VIDIOC_ENUMINPUT, "VIDIOC_ENUMINPUT" },
++	{ VIDIOC_ENUMOUTPUT, "VIDIOC_ENUMOUTPUT" },
++	{ VIDIOC_G_INPUT, "VIDIOC_G_INPUT" },
++	{ VIDIOC_G_OUTPUT, "VIDIOC_G_OUTPUT" },
++	{ VIDIOC_G_PARM, "VIDIOC_G_PARM" },
++	{ VIDIOC_LOG_STATUS, "VIDIOC_LOG_STATUS" },
++};
++
++static const char *apple_vxd_ioctl_name(unsigned int cmd)
++{
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(apple_vxd_ioctl_names); i++)
++		if (apple_vxd_ioctl_names[i].cmd == cmd)
++			return apple_vxd_ioctl_names[i].name;
++	return "unknown";
++}
++
++/*
++ * Every ioctl on the video node passes here first: the STEP line names
++ * the command (and the caller) before the V4L2 core or a handler runs.
++ * The device comes from the node, not the file handle, so the line is
++ * printed even if the per-file context is broken.
++ */
++static long apple_vxd_ioctl(struct file *file, unsigned int cmd,
++			    unsigned long arg)
++{
++	struct apple_vxd_dev *vxd = video_drvdata(file);
++
++	vxd_step_io(vxd->dev, "ioctl %s (%#x) by %s[%d]",
++		    apple_vxd_ioctl_name(cmd), cmd, current->comm,
++		    task_pid_nr(current));
++	return video_ioctl2(file, cmd, arg);
++}
++
++/* --- vb2 / m2m / media ops --------------------------------------------- */
++
+ static int apple_vxd_queue_setup(struct vb2_queue *vq, unsigned int *num_buffers,
+ 				 unsigned int *num_planes, unsigned int sizes[],
+ 				 struct device *alloc_devs[])
+@@ -532,6 +680,8 @@ static int apple_vxd_start_streaming(struct vb2_queue *q, unsigned int count)
+ 	struct apple_vxd_ctx *ctx = vb2_get_drv_priv(q);
+ 	int ret;
+ 
++	vxd_step_io(ctx->vxd->dev, "vb2: start_streaming %s",
++		    V4L2_TYPE_IS_OUTPUT(q->type) ? "output" : "capture");
+ 	if (V4L2_TYPE_IS_CAPTURE(q->type))
+ 		return 0;
+ 
+@@ -573,6 +723,8 @@ static void apple_vxd_stop_streaming(struct vb2_queue *q)
+ {
+ 	struct apple_vxd_ctx *ctx = vb2_get_drv_priv(q);
+ 
++	vxd_step_io(ctx->vxd->dev, "vb2: stop_streaming %s",
++		    V4L2_TYPE_IS_OUTPUT(q->type) ? "output" : "capture");
+ 	if (V4L2_TYPE_IS_OUTPUT(q->type) && ctx->coded_fmt_desc->ops->stop)
+ 		ctx->coded_fmt_desc->ops->stop(ctx);
+ 
+@@ -589,10 +741,15 @@ static const struct vb2_ops apple_vxd_queue_ops = {
+ 	.stop_streaming = apple_vxd_stop_streaming,
+ };
+ 
++/* The media node's only driver hooks are the request ops. */
+ static int apple_vxd_request_validate(struct media_request *req)
+ {
+-	unsigned int count = vb2_request_buffer_cnt(req);
++	struct apple_vxd_dev *vxd = container_of(req->mdev, struct apple_vxd_dev,
++						 mdev);
++	unsigned int count;
+ 
++	vxd_step_io(vxd->dev, "media: request validate");
++	count = vb2_request_buffer_cnt(req);
+ 	if (!count)
+ 		return -ENOENT;
+ 	else if (count > 1)
+@@ -601,9 +758,18 @@ static int apple_vxd_request_validate(struct media_request *req)
+ 	return vb2_request_validate(req);
+ }
+ 
++static void apple_vxd_request_queue(struct media_request *req)
++{
++	struct apple_vxd_dev *vxd = container_of(req->mdev, struct apple_vxd_dev,
++						 mdev);
++
++	vxd_step_io(vxd->dev, "media: request queue");
++	v4l2_m2m_request_queue(req);
++}
++
+ static const struct media_device_ops apple_vxd_media_ops = {
+ 	.req_validate = apple_vxd_request_validate,
+-	.req_queue = v4l2_m2m_request_queue,
++	.req_queue = apple_vxd_request_queue,
+ };
+ 
+ static void apple_vxd_device_run(void *priv)
+@@ -613,6 +779,8 @@ static void apple_vxd_device_run(void *priv)
+ 	const struct apple_vxd_coded_fmt_desc *desc = ctx->coded_fmt_desc;
+ 	int ret;
+ 
++	vxd_step_io(vxd->dev, "m2m: device_run (firmware %s)",
++		    vxd->hw_ready ? "alive" : "not booted");
+ 	if (WARN_ON(!desc))
+ 		return;
+ 
+@@ -673,91 +841,324 @@ static int apple_vxd_queue_init(void *priv, struct vb2_queue *src_vq,
+ 	return vb2_queue_init(dst_vq);
+ }
+ 
+-static int apple_vxd_open(struct file *filp)
++/* --- open / release ---------------------------------------------------- */
++
++/*
++ * The driver half of open(): everything except the v4l2_fh bookkeeping,
++ * which is V4L2 core and needs a real file.  @who prefixes the STEP lines
++ * ("open" or "self-test").  Order matters: the control handler setup runs
++ * s_ctrl, which inspects the m2m queues, so the m2m context comes first.
++ */
++static int apple_vxd_ctx_init(struct apple_vxd_ctx *ctx, const char *who)
+ {
+-	struct apple_vxd_dev *vxd = video_drvdata(filp);
+-	struct apple_vxd_ctx *ctx;
++	struct apple_vxd_dev *vxd = ctx->vxd;
+ 	int ret;
+ 
+-	ctx = kzalloc_obj(*ctx);
+-	if (!ctx)
+-		return -ENOMEM;
++	/*
++	 * Round 2's oops: the coded-format table was never filled and the
++	 * first open() (udev's v4l_id) read coded_fmts[0] at address 0.
++	 */
++	if (!vxd->coded_fmts || !vxd->num_coded_fmts || !vxd->m2m_dev) {
++		dev_err(vxd->dev, "%s: V4L2 state missing (coded fmts %u, m2m %s)\n",
++			who, vxd->num_coded_fmts, vxd->m2m_dev ? "ok" : "none");
++		return -ENODEV;
++	}
+ 
+-	ctx->vxd = vxd;
++	vxd_step(vxd->dev, "%s: format defaults", who);
+ 	apple_vxd_reset_coded_fmt(ctx);
+ 	apple_vxd_reset_decoded_fmt(ctx);
+-	v4l2_fh_init(&ctx->fh, video_devdata(filp));
+ 
++	vxd_step(vxd->dev, "%s: m2m context + vb2 queues", who);
+ 	ctx->fh.m2m_ctx = v4l2_m2m_ctx_init(vxd->m2m_dev, ctx,
+ 					    apple_vxd_queue_init);
+ 	if (IS_ERR(ctx->fh.m2m_ctx)) {
+ 		ret = PTR_ERR(ctx->fh.m2m_ctx);
+-		goto err_free_ctx;
++		ctx->fh.m2m_ctx = NULL;
++		return ret;
+ 	}
+ 
++	vxd_step(vxd->dev, "%s: control handler + setup", who);
+ 	ret = apple_vxd_init_ctrls(ctx);
+-	if (ret)
+-		goto err_cleanup_m2m_ctx;
+-
+-	v4l2_fh_add(&ctx->fh, filp);
++	if (ret) {
++		v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
++		ctx->fh.m2m_ctx = NULL;
++		return ret;
++	}
+ 
+ 	return 0;
++}
+ 
+-err_cleanup_m2m_ctx:
++/* The driver half of release(). */
++static void apple_vxd_ctx_fini(struct apple_vxd_ctx *ctx)
++{
+ 	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
+-err_free_ctx:
+-	kfree(ctx);
+-	return ret;
++	v4l2_ctrl_handler_free(&ctx->ctrl_hdl);
++}
++
++static int apple_vxd_open(struct file *filp)
++{
++	struct video_device *vdev = video_devdata(filp);
++	struct apple_vxd_dev *vxd = video_drvdata(filp);
++	struct apple_vxd_ctx *ctx;
++	int ret;
++
++	vxd_step(vxd->dev, "open: /dev/%s by %s[%d]",
++		 video_device_node_name(vdev), current->comm,
++		 task_pid_nr(current));
++
++	ctx = kzalloc_obj(*ctx);
++	if (!ctx)
++		return -ENOMEM;
++
++	ctx->vxd = vxd;
++	v4l2_fh_init(&ctx->fh, vdev);
++
++	ret = apple_vxd_ctx_init(ctx, "open");
++	if (ret) {
++		v4l2_fh_exit(&ctx->fh);
++		kfree(ctx);
++		return ret;
++	}
++
++	v4l2_fh_add(&ctx->fh, filp);
++	return 0;
+ }
+ 
+ static int apple_vxd_release(struct file *filp)
+ {
+-	struct apple_vxd_ctx *ctx = container_of(file_to_v4l2_fh(filp),
+-						 struct apple_vxd_ctx, fh);
++	struct apple_vxd_dev *vxd = video_drvdata(filp);
++	struct apple_vxd_ctx *ctx = file_to_vxd_ctx(filp);
++
++	vxd_step(vxd->dev, "release: /dev/%s by %s[%d]",
++		 video_device_node_name(&vxd->vdev), current->comm,
++		 task_pid_nr(current));
+ 
+ 	v4l2_fh_del(&ctx->fh, filp);
+-	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
+-	v4l2_ctrl_handler_free(&ctx->ctrl_hdl);
++	apple_vxd_ctx_fini(ctx);
+ 	v4l2_fh_exit(&ctx->fh);
+ 	kfree(ctx);
+ 
+ 	return 0;
+ }
+ 
++static int apple_vxd_mmap(struct file *file, struct vm_area_struct *vma)
++{
++	struct apple_vxd_dev *vxd = video_drvdata(file);
++
++	vxd_step_io(vxd->dev, "mmap: offset %#lx", vma->vm_pgoff << PAGE_SHIFT);
++	return v4l2_m2m_fop_mmap(file, vma);
++}
++
+ static const struct v4l2_file_operations apple_vxd_fops = {
+ 	.owner = THIS_MODULE,
+ 	.open = apple_vxd_open,
+ 	.release = apple_vxd_release,
+ 	.poll = v4l2_m2m_fop_poll,
+-	.unlocked_ioctl = video_ioctl2,
+-	.mmap = v4l2_m2m_fop_mmap,
++	.unlocked_ioctl = apple_vxd_ioctl,
++	.mmap = apple_vxd_mmap,
+ };
+ 
++/* --- register-time self-test ------------------------------------------- */
++
++static int apple_vxd_selftest_check(struct apple_vxd_dev *vxd, int ret,
++				    bool ok, const char *what)
++{
++	if (!ret && ok)
++		return 0;
++
++	dev_err(vxd->dev, "v4l2 self-test FAILED at %s (ret %d)\n", what, ret);
++	return ret ? ret : -EINVAL;
++}
++
++/*
++ * Runs the driver half of open(), every format/enum/framesize handler
++ * body, the querycap fill and the driver half of release() on a private
++ * context, BEFORE any node is exposed.  The round-2 class of bug (state
++ * that some later step was supposed to create) then fails the V4L2
++ * registration with a log line naming the check, instead of oopsing under
++ * udev.  The v4l2_fh bookkeeping is V4L2 core and is not run:
++ * v4l2_fh_init() on a not yet registered node would also mark its
++ * priority ioctls as disabled.
++ */
++static int apple_vxd_v4l2_selftest(struct apple_vxd_dev *vxd)
++{
++	const struct apple_vxd_coded_fmt_desc *desc;
++	struct v4l2_frmsizeenum fsize = { };
++	struct v4l2_capability cap = { };
++	struct v4l2_fmtdesc fdesc = { };
++	struct v4l2_format f = { };
++	struct apple_vxd_ctx *ctx;
++	unsigned int i;
++	int ret = 0;
++
++	vxd_step(vxd->dev, "self-test: static tables + node wiring");
++	for (i = 0; i < vxd->num_coded_fmts; i++) {
++		desc = &vxd->coded_fmts[i];
++		ret = apple_vxd_selftest_check(vxd, 0,
++					       desc->ops && desc->ops->run &&
++					       desc->ctrls && desc->num_decoded_fmts &&
++					       desc->decoded_fmts,
++					       "coded format descriptor");
++		if (ret)
++			return ret;
++	}
++	ret = apple_vxd_selftest_check(vxd, 0,
++				       vxd->v4l2_dev.dev && vxd->vdev.v4l2_dev &&
++				       vxd->vdev.fops && vxd->vdev.ioctl_ops &&
++				       vxd->vdev.device_caps,
++				       "video node wiring");
++	if (ret)
++		return ret;
++
++	ctx = kzalloc_obj(*ctx);
++	if (!ctx)
++		return -ENOMEM;
++	ctx->vxd = vxd;
++
++	/* open() */
++	ret = apple_vxd_ctx_init(ctx, "self-test");
++	if (ret) {
++		dev_err(vxd->dev, "v4l2 self-test FAILED at open (ret %d)\n", ret);
++		kfree(ctx);
++		return ret;
++	}
++
++	/* VIDIOC_QUERYCAP (the driver part; the core fills caps/bus_info) */
++	vxd_step(vxd->dev, "self-test: querycap");
++	apple_vxd_fill_querycap(vxd, &cap);
++	ret = apple_vxd_selftest_check(vxd, 0, cap.driver[0] && cap.card[0],
++				       "querycap");
++	if (ret)
++		goto out;
++
++	/* VIDIOC_ENUM_FMT */
++	vxd_step(vxd->dev, "self-test: enum_fmt");
++	fdesc.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++	ret = apple_vxd_do_enum_output_fmt(ctx, &fdesc);
++	ret = apple_vxd_selftest_check(vxd, ret,
++				       fdesc.pixelformat == vxd->coded_fmts[0].fourcc,
++				       "enum_fmt output 0");
++	if (ret)
++		goto out;
++	fdesc.index = vxd->num_coded_fmts;
++	ret = apple_vxd_selftest_check(vxd, 0,
++				       apple_vxd_do_enum_output_fmt(ctx, &fdesc) == -EINVAL,
++				       "enum_fmt output end");
++	if (ret)
++		goto out;
++	memset(&fdesc, 0, sizeof(fdesc));
++	fdesc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++	ret = apple_vxd_do_enum_capture_fmt(ctx, &fdesc);
++	ret = apple_vxd_selftest_check(vxd, ret, fdesc.pixelformat,
++				       "enum_fmt capture 0");
++	if (ret)
++		goto out;
++
++	/* VIDIOC_G_FMT */
++	vxd_step(vxd->dev, "self-test: g_fmt");
++	ret = apple_vxd_selftest_check(vxd, 0,
++				       ctx->coded_fmt.fmt.pix_mp.num_planes == 1 &&
++				       ctx->coded_fmt.fmt.pix_mp.plane_fmt[0].sizeimage,
++				       "g_fmt output");
++	if (ret)
++		goto out;
++	ret = apple_vxd_selftest_check(vxd, 0,
++				       ctx->decoded_fmt.fmt.pix_mp.num_planes &&
++				       ctx->decoded_fmt.fmt.pix_mp.plane_fmt[0].sizeimage,
++				       "g_fmt capture");
++	if (ret)
++		goto out;
++
++	/* VIDIOC_TRY_FMT: oversized, unknown fourcc -> clamped coded fmt 0 */
++	vxd_step(vxd->dev, "self-test: try_fmt");
++	f.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++	f.fmt.pix_mp.pixelformat = 0;
++	f.fmt.pix_mp.width = 8192;
++	f.fmt.pix_mp.height = 8192;
++	ret = apple_vxd_do_try_output_fmt(ctx, &f);
++	ret = apple_vxd_selftest_check(vxd, ret,
++				       f.fmt.pix_mp.pixelformat == vxd->coded_fmts[0].fourcc &&
++				       f.fmt.pix_mp.width <= APPLE_VXD_MAX_PIC_W &&
++				       f.fmt.pix_mp.height <= APPLE_VXD_MAX_PIC_H,
++				       "try_fmt output");
++	if (ret)
++		goto out;
++	f = ctx->decoded_fmt;
++	ret = apple_vxd_do_try_capture_fmt(ctx, &f);
++	ret = apple_vxd_selftest_check(vxd, ret,
++				       f.fmt.pix_mp.plane_fmt[0].sizeimage,
++				       "try_fmt capture");
++	if (ret)
++		goto out;
++
++	/* VIDIOC_S_FMT: 1080p bitstream, then the matching NV12 surface */
++	vxd_step(vxd->dev, "self-test: s_fmt");
++	memset(&f, 0, sizeof(f));
++	f.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++	f.fmt.pix_mp.pixelformat = vxd->coded_fmts[0].fourcc;
++	f.fmt.pix_mp.width = 1920;
++	f.fmt.pix_mp.height = 1080;
++	ret = apple_vxd_do_s_output_fmt(ctx, &f);
++	ret = apple_vxd_selftest_check(vxd, ret,
++				       ctx->decoded_fmt.fmt.pix_mp.width >= 1920 &&
++				       ctx->decoded_fmt.fmt.pix_mp.height >= 1080,
++				       "s_fmt output");
++	if (ret)
++		goto out;
++	f = ctx->decoded_fmt;
++	ret = apple_vxd_do_s_capture_fmt(ctx, &f);
++	ret = apple_vxd_selftest_check(vxd, ret,
++				       ctx->decoded_fmt.fmt.pix_mp.plane_fmt[0].sizeimage,
++				       "s_fmt capture");
++	if (ret)
++		goto out;
++
++	/* VIDIOC_ENUM_FRAMESIZES */
++	vxd_step(vxd->dev, "self-test: enum_framesizes");
++	fsize.pixel_format = vxd->coded_fmts[0].fourcc;
++	ret = apple_vxd_do_enum_framesizes(ctx, &fsize);
++	ret = apple_vxd_selftest_check(vxd, ret,
++				       fsize.stepwise.max_width == APPLE_VXD_MAX_PIC_W,
++				       "enum_framesizes");
++
++out:
++	/* release() */
++	vxd_step(vxd->dev, "self-test: release");
++	apple_vxd_ctx_fini(ctx);
++	kfree(ctx);
++	if (!ret)
++		dev_info(vxd->dev,
++			 "v4l2 self-test ok: open/querycap/enum/g/try/s_fmt/release\n");
++	return ret;
++}
++
++/* --- registration ------------------------------------------------------ */
++
+ int apple_vxd_v4l2_init(struct apple_vxd_dev *vxd)
+ {
+ 	int ret;
+ 
++	if (!vxd->coded_fmts || !vxd->num_coded_fmts) {
++		dev_err(vxd->dev, "v4l2: no coded formats registered, not exposing a node\n");
++		return -ENODEV;
++	}
++
++	vxd_step(vxd->dev, "v4l2: register v4l2 device");
+ 	ret = v4l2_device_register(vxd->dev, &vxd->v4l2_dev);
+ 	if (ret) {
+ 		dev_err(vxd->dev, "failed to register v4l2 device\n");
+ 		return ret;
+ 	}
+ 
++	vxd_step(vxd->dev, "v4l2: init mem2mem device");
+ 	vxd->m2m_dev = v4l2_m2m_init(&apple_vxd_m2m_ops);
+ 	if (IS_ERR(vxd->m2m_dev)) {
+ 		ret = PTR_ERR(vxd->m2m_dev);
++		vxd->m2m_dev = NULL;
+ 		v4l2_err(&vxd->v4l2_dev, "failed to init mem2mem device\n");
+ 		goto err_unregister_v4l2;
+ 	}
+ 
+-	vxd->mdev.dev = vxd->dev;
+-	strscpy(vxd->mdev.model, "apple-vxd", sizeof(vxd->mdev.model));
+-	strscpy(vxd->mdev.bus_info, "platform:apple-vxd",
+-		sizeof(vxd->mdev.bus_info));
+-	media_device_init(&vxd->mdev);
+-	vxd->mdev.ops = &apple_vxd_media_ops;
+-	vxd->v4l2_dev.mdev = &vxd->mdev;
+-
+ 	vxd->vdev.lock = &vxd->vdev_lock;
+ 	vxd->vdev.v4l2_dev = &vxd->v4l2_dev;
+ 	vxd->vdev.fops = &apple_vxd_fops;
+@@ -767,17 +1168,30 @@ int apple_vxd_v4l2_init(struct apple_vxd_dev *vxd)
+ 				V4L2_CAP_VIDEO_M2M_MPLANE;
+ 	vxd->vdev.ioctl_ops = &apple_vxd_ioctl_ops;
+ 	video_set_drvdata(&vxd->vdev, vxd);
+-	strscpy(vxd->vdev.name, "apple-vxd", sizeof(vxd->vdev.name));
++	strscpy(vxd->vdev.name, APPLE_VXD_DRV_NAME, sizeof(vxd->vdev.name));
++
++	/* Nothing is exposed yet: fail here, not under udev. */
++	ret = apple_vxd_v4l2_selftest(vxd);
++	if (ret)
++		goto err_release_m2m;
+ 
++	/* bus_info stays empty: media_device_init() derives it from mdev.dev. */
++	vxd->mdev.dev = vxd->dev;
++	strscpy(vxd->mdev.model, APPLE_VXD_DRV_NAME, sizeof(vxd->mdev.model));
++	media_device_init(&vxd->mdev);
++	vxd->mdev.ops = &apple_vxd_media_ops;
++	vxd->v4l2_dev.mdev = &vxd->mdev;
++
++	vxd_step(vxd->dev, "v4l2: register video device");
+ 	ret = video_register_device(&vxd->vdev, VFL_TYPE_VIDEO, -1);
+ 	if (ret) {
+ 		v4l2_err(&vxd->v4l2_dev, "failed to register video device\n");
+ 		goto err_cleanup_mc;
+ 	}
+-	vxd->v4l2_ready = true;
+ 	dev_info(vxd->dev, "v4l2: video device /dev/%s registered\n",
+ 		 video_device_node_name(&vxd->vdev));
+ 
++	vxd_step(vxd->dev, "v4l2: register m2m media controller");
+ 	ret = v4l2_m2m_register_media_controller(vxd->m2m_dev, &vxd->vdev,
+ 						 MEDIA_ENT_F_PROC_VIDEO_DECODER);
+ 	if (ret) {
+@@ -786,14 +1200,17 @@ int apple_vxd_v4l2_init(struct apple_vxd_dev *vxd)
+ 		goto err_unregister_vdev;
+ 	}
+ 
++	vxd_step(vxd->dev, "v4l2: register media device");
+ 	ret = media_device_register(&vxd->mdev);
+ 	if (ret) {
+ 		v4l2_err(&vxd->v4l2_dev, "failed to register media device\n");
+ 		goto err_unregister_mc;
+ 	}
+-	dev_info(vxd->dev, "v4l2: media device /dev/media registered (model %s)\n",
+-		 vxd->mdev.model);
++	dev_info(vxd->dev, "v4l2: media device /dev/media%d registered (model %s, bus %s)\n",
++		 vxd->mdev.devnode->minor, vxd->mdev.model, vxd->mdev.bus_info);
+ 
++	/* Only now does remove() own a full teardown. */
++	vxd->v4l2_ready = true;
+ 	return 0;
+ 
+ err_unregister_mc:
+@@ -801,8 +1218,11 @@ int apple_vxd_v4l2_init(struct apple_vxd_dev *vxd)
+ err_unregister_vdev:
+ 	video_unregister_device(&vxd->vdev);
+ err_cleanup_mc:
++	vxd->v4l2_dev.mdev = NULL;
+ 	media_device_cleanup(&vxd->mdev);
++err_release_m2m:
+ 	v4l2_m2m_release(vxd->m2m_dev);
++	vxd->m2m_dev = NULL;
+ err_unregister_v4l2:
+ 	v4l2_device_unregister(&vxd->v4l2_dev);
+ 	return ret;
+@@ -816,5 +1236,6 @@ void apple_vxd_v4l2_cleanup(struct apple_vxd_dev *vxd)
+ 	video_unregister_device(&vxd->vdev);
+ 	media_device_cleanup(&vxd->mdev);
+ 	v4l2_m2m_release(vxd->m2m_dev);
++	vxd->m2m_dev = NULL;
+ 	v4l2_device_unregister(&vxd->v4l2_dev);
+ }
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd.h b/drivers/media/platform/apple/vxd/apple-vxd.h
+index 24dd6b1482aa018556e18229b1e8dd90babba4e3..68eb3b96d193a90a2f55603df083bb017bd953ae 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd.h
++++ b/drivers/media/platform/apple/vxd/apple-vxd.h
+@@ -36,6 +36,7 @@
+ 
+ struct dentry;
+ 
++#define APPLE_VXD_DRV_NAME		"apple-vxd"
+ #define APPLE_VXD_FW_NAME		"apple/vxd-deva.bin"
+ #define APPLE_VXD_FW_MAX_WORDS		0x10000
+ 
+@@ -60,8 +61,6 @@ struct apple_vxd_variant {
+ 	unsigned int vxd_version;	/* ADT "vxd-version" */
+ 	u32 num_gart_pts;		/* mapped page tables (512 = 2 GiB) */
+ 	bool hevc_supported;
+-	const struct apple_vxd_coded_fmt_desc *coded_fmts;
+-	size_t num_coded_fmts;
+ };
+ 
+ /*
+@@ -155,7 +154,15 @@ struct apple_vxd_dev {
+ 	struct video_device vdev;
+ 	struct v4l2_m2m_dev *m2m_dev;
+ 	struct mutex vdev_lock;		/* serializes ioctls */
+-	bool v4l2_ready;
++	bool v4l2_ready;		/* set last, once every node is up */
++	/*
++	 * Coded formats, filled by apple_vxd_h264_register() during probe
++	 * before any V4L2 node exists.  Round 2 never filled them (the
++	 * variant table had no entry), so the first open() of /dev/video0
++	 * read coded_fmts[0] at address 0.
++	 */
++	const struct apple_vxd_coded_fmt_desc *coded_fmts;
++	unsigned int num_coded_fmts;
+ 	struct dentry *debugfs_dir;	/* mbox/regs dumps + boot trigger (R2) */
+ };
+ 
+@@ -226,7 +233,8 @@ void apple_vxd_run_preamble(struct apple_vxd_ctx *ctx,
+ void apple_vxd_run_postamble(struct apple_vxd_ctx *ctx,
+ 			     struct apple_vxd_run *run);
+ void apple_vxd_log_pwrstate(struct apple_vxd_dev *vxd, const char *when);
+-void vxd_step(const struct device *dev, const char *what);
++__printf(2, 3) void vxd_step(const struct device *dev, const char *fmt, ...);
++__printf(2, 3) void vxd_step_io(const struct device *dev, const char *fmt, ...);
+ 
+ /* gart.c */
+ int apple_vxd_gart_init(struct apple_vxd_dev *vxd);
+@@ -254,6 +262,6 @@ void apple_vxd_v4l2_cleanup(struct apple_vxd_dev *vxd);
+ extern const struct v4l2_ctrl_ops apple_vxd_ctrl_ops;
+ 
+ /* h264.c */
+-extern const struct apple_vxd_coded_fmt_desc apple_vxd_coded_fmts[];
++int apple_vxd_h264_register(struct apple_vxd_dev *vxd);
+ 
+ #endif /* __APPLE_VXD_H__ */

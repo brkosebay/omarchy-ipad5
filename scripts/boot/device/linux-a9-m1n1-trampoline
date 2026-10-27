@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Build a kexec-able arm64 Image that re-enters the resident m1n1.
+
+The PSCI m1n1 (patches/boot/m1n1) stays in memory under Linux and records in
+/chosen where to re-enter it ("linux-a9,m1n1-reentry") and a copy of the
+original boot_args ("linux-a9,m1n1-boot-args"). This writes a minimal Image
+(arm64 boot header + 3 instructions + the boot_args) that kexec can load:
+
+    adr x0, boot_args   // m1n1's _start takes the boot_args in x0
+    ldr x1, reentry
+    br  x1              // EL1, MMU and caches off, as kexec leaves them
+
+usage: linux-a9-m1n1-trampoline /proc/device-tree/chosen OUT.Image
+"""
+
+import os
+import struct
+import sys
+
+ARM64_MAGIC = 0x644D5241  # "ARM\x64"
+
+
+def main():
+    if len(sys.argv) != 3:
+        sys.exit(__doc__.strip().splitlines()[-1])
+    chosen, out = sys.argv[1:]
+    with open(os.path.join(chosen, "linux-a9,m1n1-reentry"), "rb") as f:
+        (reentry,) = struct.unpack(">Q", f.read())
+    with open(os.path.join(chosen, "linux-a9,m1n1-boot-args"), "rb") as f:
+        boot_args = f.read()
+    if not reentry or len(boot_args) < 64:
+        sys.exit("implausible m1n1 re-entry properties")
+
+    code = struct.pack(
+        "<IIII",
+        0x100000C0,  # 0x40: adr x0, #0x18 -> 0x58
+        0x58000061,  # 0x44: ldr x1, #0xc -> 0x50
+        0xD61F0020,  # 0x48: br x1
+        0xD503201F,  # 0x4c: nop
+    ) + struct.pack("<Q", reentry)  # 0x50
+    body = code + boot_args  # boot_args at 0x58, 8-byte aligned
+    size = (0x40 + len(body) + 0xFFF) & ~0xFFF
+    header = struct.pack(
+        "<IIQQQQQQII",
+        0x14000010,  # b 0x40
+        0,
+        0,  # text_offset
+        size,  # image_size
+        0x8 | (2 << 1),  # LE, 16K pages, anywhere in memory
+        0, 0, 0,
+        ARM64_MAGIC,
+        0,
+    )
+    image = (header + body).ljust(size, b"\0")
+    with open(out, "wb") as f:
+        f.write(image)
+    print(f"{out}: {size} bytes, m1n1 re-entry at {reentry:#x}, boot_args {len(boot_args)} bytes",
+          file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

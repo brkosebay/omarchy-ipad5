@@ -1,0 +1,179 @@
+From 8f3730511e7c6c7d81a07059fb6b15a8bf8ec803 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Mon, 26 Oct 2026 19:41:03 +0000
+Subject: [PATCH 1/2] nvme-pci: apple-ans: service every CQ on the shared MSI
+
+Apple ANS signals its admin and I/O completion queues through one MSI
+(NVME_QUIRK_SINGLE_VECTOR). nvme-pci registers one shared-IRQ action per
+queue, and each action drains only its own CQ. On j71t, a completion that
+reaches the admin CQ after its action has run, while the I/O action is
+still acknowledging its own CQ, is never signalled again. All 13 logged
+"crawl" boots since 2026-10-22 show the same picture: the IRQ count is
+frozen, both CQs hold a posted but unconsumed CQE at 253 of 257 timeouts,
+and the first lost admin command and the first lost I/O command were
+submitted in the same second. The timeout path then polls only the
+timed-out queue, so the other CQ keeps its entry, the vector stays
+silent, and every later command waits for io_timeout or admin_timeout.
+
+For the ANS shared vector, every invocation now services all CQs on the
+vector and rescans after its doorbell writes. nvme_timeout() drains all
+of them with the IRQ disabled. The drain is logged with the IRQ count,
+and the first MSI after it is reported. One device run therefore shows
+whether the controller signals again once every CQ is empty
+(aggregated-vector model) or stays silent (the loss is upstream, in h9p
+or the AIC).
+
+Threaded interrupts keep the per-queue path, because their handlers can
+run concurrently.
+
+Validated by an ARM64 build only. No device access.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ drivers/nvme/host/pci-internal.h |   1 +
+ drivers/nvme/host/pci.c          | 100 ++++++++++++++++++++++++++++++-
+ 2 files changed, 100 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/nvme/host/pci-internal.h b/drivers/nvme/host/pci-internal.h
+index 9c63318eb5..2407ca7a32 100644
+--- a/drivers/nvme/host/pci-internal.h
++++ b/drivers/nvme/host/pci-internal.h
+@@ -89,6 +89,7 @@ struct nvme_dev {
+ #define ANS_HEALTH_ACTIVE	1
+ #define ANS_RECOVERY_PENDING	2
+ #define ANS_HEALTH_FAILED	3
++#define ANS_VECTOR_DRAINED	4	/* report the next MSI after a timeout drain */
+ 	struct sg_table *hmb_sgt;
+ 	mempool_t *dmavec_mempool;
+ 	const struct nvme_pci_dma_ops *dma_ops;
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 7965200647..1bf4fa793d 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -1732,12 +1732,70 @@ static inline bool nvme_poll_cq(struct nvme_queue *nvmeq,
+ 	return found;
+ }
+ 
++/*
++ * Apple ANS signals the admin and I/O CQs through one MSI
++ * (NVME_QUIRK_SINGLE_VECTOR). Servicing one CQ per shared-IRQ action can
++ * leave a completion that reached the admin CQ after its action ran, while
++ * the I/O action was still acknowledging its own CQ. Warm j71t boots then
++ * got no further MSI: the IRQ count froze with completions waiting in both
++ * CQs and every command waited for its timeout. Each invocation therefore
++ * services every CQ on the vector and rescans after its doorbell writes.
++ * The actions of one IRQ never run concurrently, so this needs no more
++ * locking than one CQ does upstream. Threaded handlers can run concurrently
++ * and keep the per-queue behaviour.
++ */
++static bool nvme_apple_ans_shared_vector(struct nvme_dev *dev)
++{
++	return dev->dma_ops == &nvme_pci_apple_ans_ops &&
++	       (dev->ctrl.quirks & NVME_QUIRK_SINGLE_VECTOR) &&
++	       !use_threaded_interrupts;
++}
++
++static bool nvme_apple_ans_vector_queue(struct nvme_queue *q, u16 vector)
++{
++	return test_bit(NVMEQ_ENABLED, &q->flags) &&
++	       !test_bit(NVMEQ_POLLED, &q->flags) && q->cq_vector == vector;
++}
++
++/* Hard IRQ only: returns after a full pass over the vector finds nothing. */
++static bool nvme_apple_ans_irq_vector(struct nvme_dev *dev, u16 vector,
++				      struct io_comp_batch *iob)
++{
++	bool found = false, more;
++	unsigned int i;
++
++	do {
++		more = false;
++		for (i = 0; i < dev->ctrl.queue_count; i++) {
++			struct nvme_queue *q = &dev->queues[i];
++
++			if (nvme_apple_ans_vector_queue(q, vector) &&
++			    nvme_poll_cq(q, q->qid ? iob : NULL))
++				more = true;
++		}
++		found |= more;
++	} while (more);
++	return found;
++}
++
+ static irqreturn_t nvme_irq(int irq, void *data)
+ {
+ 	struct nvme_queue *nvmeq = data;
++	struct nvme_dev *dev = nvmeq->dev;
+ 	DEFINE_IO_COMP_BATCH(iob);
++	bool found;
+ 
+-	if (nvme_poll_cq(nvmeq, &iob)) {
++	if (nvme_apple_ans_shared_vector(dev)) {
++		/* Device evidence: did the vector signal again after a drain? */
++		if (unlikely(test_bit(ANS_VECTOR_DRAINED, &dev->apple_ans_flags)) &&
++		    test_and_clear_bit(ANS_VECTOR_DRAINED, &dev->apple_ans_flags))
++			dev_info(dev->dev, "Apple ANS: MSI resumed after vector drain (irq %d)\n",
++				 irq);
++		found = nvme_apple_ans_irq_vector(dev, nvmeq->cq_vector, &iob);
++	} else {
++		found = nvme_poll_cq(nvmeq, &iob);
++	}
++	if (found) {
+ 		if (!rq_list_empty(&iob.req_list))
+ 			nvme_pci_complete_batch(&iob);
+ 		return IRQ_HANDLED;
+@@ -1773,6 +1831,44 @@ static void nvme_poll_irqdisable(struct nvme_queue *nvmeq)
+ 	enable_irq(irq);
+ }
+ 
++/*
++ * nvme_poll_irqdisable() for the shared ANS vector. Draining one CQ cannot
++ * restart a silent vector while the other CQ still holds a completion, so
++ * drain all of them. The log line and the "MSI resumed" report that follows
++ * it tell whether the controller signals again once every CQ is empty.
++ */
++static void nvme_apple_ans_drain_vector(struct nvme_queue *nvmeq,
++					const char *reason)
++{
++	struct nvme_dev *dev = nvmeq->dev;
++	int irq = pci_irq_vector(to_pci_dev(dev->dev), nvmeq->cq_vector);
++	unsigned int i, count = irq > 0 ? kstat_irqs_usr(irq) : 0;
++	unsigned long found = 0;
++	bool more, hit;
++
++	disable_irq(irq);
++	do {
++		more = false;
++		for (i = 0; i < dev->ctrl.queue_count; i++) {
++			struct nvme_queue *q = &dev->queues[i];
++
++			if (!nvme_apple_ans_vector_queue(q, nvmeq->cq_vector))
++				continue;
++			spin_lock(&q->cq_poll_lock);
++			hit = nvme_poll_cq(q, NULL);
++			spin_unlock(&q->cq_poll_lock);
++			if (hit) {
++				found |= BIT(min_t(unsigned int, i, BITS_PER_LONG - 1));
++				more = true;
++			}
++		}
++	} while (more);
++	set_bit(ANS_VECTOR_DRAINED, &dev->apple_ans_flags);
++	enable_irq(irq);
++	dev_warn_ratelimited(dev->dev, "Apple ANS: %s: drained every CQ on vector %u, completions on queues %#lx, irq %d count %u\n",
++			     reason, nvmeq->cq_vector, found, irq, count);
++}
++
+ static int nvme_poll(struct blk_mq_hw_ctx *hctx, struct io_comp_batch *iob)
+ {
+ 	struct nvme_queue *nvmeq = hctx->driver_data;
+@@ -2197,6 +2293,8 @@ static enum blk_eh_timer_return nvme_timeout(struct request *req)
+ 	 */
+ 	if (test_bit(NVMEQ_POLLED, &nvmeq->flags))
+ 		nvme_poll(req->mq_hctx, NULL);
++	else if (nvme_apple_ans_shared_vector(dev))
++		nvme_apple_ans_drain_vector(nvmeq, "timeout");
+ 	else
+ 		nvme_poll_irqdisable(nvmeq);
+ 

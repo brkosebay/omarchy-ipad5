@@ -1,0 +1,258 @@
+From 1454b30266090ab3ddab4d4cb86557915759a4ab Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 01:53:44 +0000
+Subject: [PATCH] input: apple_n1: quiesce sleep IRQs and bound runtime rearm
+ recovery
+
+Keep N1 rails, firmware and calibration across sleep. Mask and
+synchronize the IRQ and cancel recovery before the SPI parent can
+suspend. After the parent resumes, send the runtime wake, drain bounded
+reports and rearm with a fresh error budget. Track the existing mask
+depth so a frame error cannot permanently disable touch. Retry runtime
+discovery without bootloading, with a one-second backoff and at most
+three deferred attempts per boot; cancel all work before teardown.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ drivers/input/touchscreen/apple_n1.c | 161 +++++++++++++++++++++++++--
+ 1 file changed, 153 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/input/touchscreen/apple_n1.c b/drivers/input/touchscreen/apple_n1.c
+index eecf94a019704777b54f67d476d472286f88237f..958b9f06fbd394e490c87daafa781976c9cc6c9d 100644
+--- a/drivers/input/touchscreen/apple_n1.c
++++ b/drivers/input/touchscreen/apple_n1.c
+@@ -16,11 +16,14 @@
+ #include <linux/interrupt.h>
+ #include <linux/jiffies.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/pm.h>
+ #include <linux/pinctrl/consumer.h>
+ #include <linux/property.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/spi/spi.h>
+ #include <linux/unaligned.h>
++#include <linux/workqueue.h>
+ 
+ #define N1_XFER_MAX	65536
+ #define N1_FRAME_MAX	4096
+@@ -61,6 +64,13 @@ struct apple_n1 {
+ 	bool wake_valid;
+ 	bool powered;
+ 	bool irq_requested;
++	/* Serialize IRQ, recovery and PM; one disable-depth count at most. */
++	struct mutex lock;
++	struct delayed_work recovery_work;
++	unsigned int irq_errors;
++	unsigned int recovery_attempts;
++	bool irq_masked;
++	bool suspended;
+ };
+ 
+ static u32 n1_sum(const u8 *data, size_t len)
+@@ -699,11 +709,94 @@ static int n1_irq_frame(struct apple_n1 *n1)
+ 	return ret;
+ }
+ 
++static void n1_mask_irq(struct apple_n1 *n1)
++{
++	if (!n1->irq_masked) {
++		disable_irq_nosync(n1->spi->irq);
++		n1->irq_masked = true;
++	}
++}
++
++static int n1_drain(struct apple_n1 *n1)
++{
++	int i, ret;
++
++	for (i = 0; i < 8; i++) {
++		ret = n1_read_frame(n1, true);
++		if (ret <= 0)
++			break;
++	}
++	if (ret < 0 || i == 8)
++		return ret < 0 ? ret : -EOVERFLOW;
++	ret = gpiod_get_value_cansleep(n1->atn);
++	return ret > 0 ? -EBUSY : ret;
++}
++
++/* Called with lock held and ATN IRQ masked, only while SPI is available. */
++static int n1_rearm(struct apple_n1 *n1)
++{
++	int ret;
++
++	n1->wake_valid = false;
++	ret = n1_wake(n1);
++	if (!ret)
++		ret = n1_drain(n1);
++	if (ret) {
++		dev_warn(&n1->spi->dev, "runtime drain failed %d; trying discovery once\n", ret);
++		n1_release_contacts(n1);
++		/* Runtime init only: never reset, reload firmware or calibration. */
++		n1->sequence = 1;
++		ret = n1_discover(n1);
++		if (!ret)
++			ret = n1_drain(n1);
++	}
++	if (ret)
++		return ret;
++
++	n1->irq_errors = 0;
++	if (n1->irq_masked) {
++		n1->irq_masked = false;
++		enable_irq(n1->spi->irq);
++	}
++	dev_info(&n1->spi->dev, "N1 runtime wake/drain complete; IRQ rearmed\n");
++	return 0;
++}
++
++static void n1_queue_recovery(struct apple_n1 *n1)
++{
++	if (n1->recovery_attempts < 3)
++		schedule_delayed_work(&n1->recovery_work, msecs_to_jiffies(1000));
++	else
++		dev_err(&n1->spi->dev, "N1 recovery budget exhausted; rebind to recover\n");
++}
++
++static void n1_recovery_work(struct work_struct *work)
++{
++	struct apple_n1 *n1 = container_of(to_delayed_work(work),
++					  struct apple_n1, recovery_work);
++	int ret;
++
++	mutex_lock(&n1->lock);
++	if (!n1->suspended && n1->irq_requested && n1->recovery_attempts < 3) {
++		n1->recovery_attempts++;
++		ret = n1_rearm(n1);
++		dev_info(&n1->spi->dev, "N1 recovery %u/3 result %d\n",
++			 n1->recovery_attempts, ret);
++		if (ret)
++			n1_queue_recovery(n1);
++	}
++	mutex_unlock(&n1->lock);
++}
++
+ static irqreturn_t n1_irq(int irq, void *data)
+ {
+ 	struct apple_n1 *n1 = data;
+ 	int ret, i, asserted;
+ 
++	mutex_lock(&n1->lock);
++	if (n1->suspended || n1->irq_masked)
++		goto out;
++
+ 	/* A stuck ATN cannot monopolize the IRQ thread. */
+ 	for (i = 0; i < 8; i++) {
+ 		ret = n1_irq_frame(n1);
+@@ -719,11 +812,16 @@ static irqreturn_t n1_irq(int irq, void *data)
+ 	}
+ 	if (ret < 0 || i == 8) {
+ 		n1_release_contacts(n1);
+-		dev_err_ratelimited(&n1->spi->dev, "frame/ATN error %d; rebind to recover\n",
+-				    ret < 0 ? ret : -EOVERFLOW);
+-		disable_irq_nosync(irq);
+-		dev_err(&n1->spi->dev, "IRQ disabled after bounded error budget\n");
++		n1->irq_errors++;
++		dev_err_ratelimited(&n1->spi->dev, "frame/ATN error %d (count %u); IRQ masked\n",
++				    ret < 0 ? ret : -EOVERFLOW, n1->irq_errors);
++		n1_mask_irq(n1);
++		n1_queue_recovery(n1);
++	} else {
++		n1->irq_errors = 0;
+ 	}
++out:
++	mutex_unlock(&n1->lock);
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -802,6 +900,9 @@ static int n1_probe(struct spi_device *spi)
+ 	if (!n1->tx || !n1->rx)
+ 		return -ENOMEM;
+ 	spi_set_drvdata(spi, n1);
++	mutex_init(&n1->lock);
++	INIT_DELAYED_WORK(&n1->recovery_work, n1_recovery_work);
++	n1->irq_masked = true;
+ 	spi->bits_per_word = 8;
+ 	/* N1 configureSPI overrides the ADT +12 word delay from 5000ns to 0. */
+ 	spi->word_delay.value = 0;
+@@ -969,6 +1070,7 @@ static int n1_probe(struct spi_device *spi)
+ 		dev_err(dev, "ATN did not deassert after bounded initial drain\n");
+ 		goto power_off;
+ 	}
++	n1->irq_masked = false;
+ 	enable_irq(spi->irq);
+ 	dev_info(dev, "touchscreen reporting enabled (inverted-y=%u)\n", n1->props.invert_y);
+ 	goto release_firmware;
+@@ -987,10 +1089,12 @@ static void n1_remove(struct spi_device *spi)
+ {
+ 	struct apple_n1 *n1 = spi_get_drvdata(spi);
+ 
+-	/* Free/synchronize even if the error path already masked this IRQ.
+-	 * Do not race an IRQ-thread flag or add another disable-depth count.
+-	 * The managed action is removed here, before contacts and power go away.
+-	 */
++	mutex_lock(&n1->lock);
++	n1->suspended = true;
++	if (n1->irq_requested)
++		n1_mask_irq(n1);
++	mutex_unlock(&n1->lock);
++	cancel_delayed_work_sync(&n1->recovery_work);
+ 	if (n1->irq_requested) {
+ 		devm_free_irq(&spi->dev, spi->irq, n1);
+ 		n1->irq_requested = false;
+@@ -1000,6 +1104,46 @@ static void n1_remove(struct spi_device *spi)
+ 	dev_info(&spi->dev, "N1 stopped; reset asserted\n");
+ }
+ 
++static int n1_suspend(struct device *dev)
++{
++	struct apple_n1 *n1 = dev_get_drvdata(dev);
++
++	if (!n1->irq_requested)
++		return 0;
++	mutex_lock(&n1->lock);
++	n1->suspended = true;
++	n1_mask_irq(n1);
++	mutex_unlock(&n1->lock);
++	/* No thread/work may transfer after the SPI parent/domain suspends. */
++	synchronize_irq(n1->spi->irq);
++	cancel_delayed_work_sync(&n1->recovery_work);
++	n1_release_contacts(n1);
++	dev_info(dev, "N1 suspended: IRQ quiesced, firmware/rails retained\n");
++	return 0;
++}
++
++static int n1_resume(struct device *dev)
++{
++	struct apple_n1 *n1 = dev_get_drvdata(dev);
++	int ret;
++
++	if (!n1->irq_requested)
++		return 0;
++	/* Normal resume runs after the SPI parent and genpd have resumed. */
++	mutex_lock(&n1->lock);
++	n1->suspended = false;
++	n1->irq_errors = 0;
++	ret = n1_rearm(n1);
++	if (ret) {
++		dev_err(dev, "N1 resume failed %d; IRQ stays masked for bounded recovery\n", ret);
++		n1_queue_recovery(n1);
++	}
++	mutex_unlock(&n1->lock);
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(n1_pm_ops, n1_suspend, n1_resume);
++
+ static const struct of_device_id n1_of_match[] = {
+ 	{ .compatible = "apple,j71t-n1" },
+ 	{ }
+@@ -1016,6 +1160,7 @@ static struct spi_driver n1_driver = {
+ 	.driver = {
+ 		.name = "apple-n1",
+ 		.of_match_table = n1_of_match,
++		.pm = pm_sleep_ptr(&n1_pm_ops),
+ 	},
+ 	.probe = n1_probe,
+ 	.remove = n1_remove,

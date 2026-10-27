@@ -1,0 +1,70 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-2.0-only
+     linux-a9 display round 3: visual tearing check for the owner.
+     Vertical bars move sideways every frame. On a tear-free display each
+     bar is one straight, unbroken column. A tear shows as a horizontal line
+     where the upper part of the bars is shifted against the lower part.
+     Options in the URL hash: #speed=24 (device pixels per frame),
+     #bar=64 (bar width). -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>linux-a9 tear test</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #hud { position: fixed; left: 12px; top: 12px; padding: 6px 10px;
+         font: 600 20px/1.3 monospace; color: #0f0; background: #000c; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">starting</div>
+<script>
+"use strict";
+const opts = Object.fromEntries(location.hash.slice(1).split("&")
+  .filter(Boolean).map((kv) => kv.split("=")));
+const speed = Number(opts.speed) || 24;
+const bar = Number(opts.bar) || 64;
+const canvas = document.getElementById("c");
+const hud = document.getElementById("hud");
+const ctx = canvas.getContext("2d", { alpha: false });
+let frames = 0, slow = 0, last = 0, x = 0, fpsStart = 0, fpsFrames = 0, fps = 0;
+
+function resize() {
+  canvas.width = Math.round(innerWidth * devicePixelRatio);
+  canvas.height = Math.round(innerHeight * devicePixelRatio);
+}
+
+function draw(now) {
+  const w = canvas.width, h = canvas.height;
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, w, h);
+  ctx.fillStyle = "#fff";
+  for (let left = (x % (2 * bar)) - 2 * bar; left < w; left += 2 * bar)
+    ctx.fillRect(left, 0, bar, h);
+  /* A marker row every 256 px makes a shifted band easy to spot. */
+  ctx.fillStyle = "#f0f";
+  for (let y = 0; y < h; y += 256)
+    ctx.fillRect(0, y, w, 4);
+  x += speed;
+  frames++;
+  if (last && now - last > 1.5 * (1000 / 60))
+    slow++;
+  last = now;
+  if (now - fpsStart >= 1000) {
+    fps = Math.round(fpsFrames * 1000 / (now - fpsStart));
+    fpsStart = now;
+    fpsFrames = 0;
+  }
+  fpsFrames++;
+  hud.textContent = `frame ${frames}  ${fps} fps  late ${slow}  ${w}x${h}  speed ${speed}`;
+  requestAnimationFrame(draw);
+}
+
+addEventListener("resize", resize);
+resize();
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>

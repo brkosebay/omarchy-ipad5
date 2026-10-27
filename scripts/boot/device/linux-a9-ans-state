@@ -1,0 +1,33 @@
+#!/bin/busybox sh
+# Read-only diagnostics; host mode never reads endpoint BAR/config/doorbells.
+# Queue/register snapshots go to kmsg; the following dmesg tail prints them.
+set -u
+mode=host
+case "${1:-}" in
+  '') ;;
+  --endpoint) mode=endpoint ;;
+  *) echo 'usage: /linux-a9-ans-state [--endpoint]' >&2; exit 2 ;;
+esac
+echo "linux-a9: ANS snapshot mode=$mode boot_id=$(cat /proc/sys/kernel/random/boot_id)"
+cat /proc/uptime /proc/cmdline /proc/interrupts
+for c in /sys/class/nvme/nvme*; do
+  [ -d "$c" ] || continue
+  for f in state transport address; do
+    [ ! -r "$c/$f" ] || { echo "--- $c/$f"; cat "$c/$f"; }
+  done
+  if [ -w "$c/apple_ans_diag" ]; then
+    echo "$mode" >"$c/apple_ans_diag" || echo "linux-a9: $c snapshot busy or endpoint unavailable (host evidence already in kmsg)"
+  else
+    echo "linux-a9: $c has no Round 7 snapshot attribute"
+  fi
+done
+for b in /sys/block/nvme*n*; do
+  [ ! -r "$b/stat" ] || { echo "--- $b/stat"; cat "$b/stat"; }
+  [ ! -r "$b/queue/io_timeout" ] || { echo "--- $b/queue/io_timeout"; cat "$b/queue/io_timeout"; }
+done
+# Print the failing incoming boot's first timeout, even if pstore/other logs
+# pushed it out of a tail. Do not infer this boot from the previous console.
+echo 'linux-a9: incoming NVMe log BEGIN'
+dmesg | grep -Ei 'Apple ANS|nvme|NVMMU|dart|CC.EN|CSTS|deadline'
+echo 'linux-a9: incoming NVMe log END'
+dmesg | tail -200

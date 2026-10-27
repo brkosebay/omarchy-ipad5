@@ -1,0 +1,201 @@
+From fdbc93b5fefbb01bb2c22b0fd9a8de1714cee867 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 13:12:23 +0000
+Subject: [PATCH 27/43] nvme-pci: apple-ans, iommu: apple-dart: Bring-up
+ diagnostics behind a switch
+
+NVMe works now, so the bring-up dumps don't need to be in every boot log.
+Behind nvme.apple_ans_debug=1 (or dynamic debug) now:
+- MSI setup;
+- the SoC-side host/NVMMU/DART dumps before CC.EN and after the watch;
+- the ASQ/ACQ translations and DART walks;
+- the per-change lines of the post-CC.EN watch;
+- the LTR/L1SS, controller stop and HMB/AQ programming lines.
+
+The DART's "boot state" and "attach" lines are dev_dbg.
+
+Unchanged, and always logged:
+- the HMB, CAP and "enabling controller" lines;
+- every fault path: host-side fault with its host dump, DART translation
+  fault with its table walk, NVMMU fault decode;
+- the knobs (dry run, hold, slow, watch).
+---
+ drivers/iommu/apple-dart.c        | 26 ++++++++---------
+ drivers/nvme/host/pci-apple-ans.c | 47 ++++++++++++++++++++++---------
+ 2 files changed, 46 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/iommu/apple-dart.c b/drivers/iommu/apple-dart.c
+index ebb681f2c4..cf72c63da6 100644
+--- a/drivers/iommu/apple-dart.c
++++ b/drivers/iommu/apple-dart.c
+@@ -727,11 +727,11 @@ static void apple_dart_s5l8960x_attach_config(struct apple_dart *dart)
+ 	 * comes back in its reset state, with an error status left over from
+ 	 * before Linux. Clear that so a later read means a new fault.
+ 	 */
+-	dev_info(dart->dev,
+-		 "attach: TCR %#x reflector %#x fetch %#x diag %#x error %#x/%#x (re-applying %#x/%#x/%#x, clearing the error)\n",
+-		 readl(dart->regs + DART_S5L8960X_TCR), reflector, fetch, diag,
+-		 error, readl(dart->regs + DART_S5L8960X_ERROR_ADDR),
+-		 dart->error_reflector, dart->fetch_config, dart->diag_config);
++	dev_dbg(dart->dev,
++		"attach: TCR %#x reflector %#x fetch %#x diag %#x error %#x/%#x (re-applying %#x/%#x/%#x, clearing the error)\n",
++		readl(dart->regs + DART_S5L8960X_TCR), reflector, fetch, diag,
++		error, readl(dart->regs + DART_S5L8960X_ERROR_ADDR),
++		dart->error_reflector, dart->fetch_config, dart->diag_config);
+ 	apple_dart_s5l8960x_hw_config(dart);
+ 	writel(error, dart->regs + DART_S5L8960X_ERROR);
+ }
+@@ -1478,14 +1478,14 @@ static int apple_dart_s5l8960x_parse_config(struct apple_dart *dart)
+ 						      &dart->diag_config);
+ 
+ 	/* All-ones: the DART isn't powered yet (A9 PCIe: until the port is) */
+-	dev_info(dart->dev,
+-		 "boot state: TCR %#x reflector %#x fetch %#x diag %#x error %#x/%#x\n",
+-		 readl(dart->regs + DART_S5L8960X_TCR),
+-		 readl(dart->regs + DART_S5L8960X_ERROR_REFLECTOR),
+-		 readl(dart->regs + DART_S5L8960X_FETCH_CONFIG),
+-		 readl(dart->regs + DART_S5L8960X_DIAG_CONFIG),
+-		 readl(dart->regs + DART_S5L8960X_ERROR),
+-		 readl(dart->regs + DART_S5L8960X_ERROR_ADDR));
++	dev_dbg(dart->dev,
++		"boot state: TCR %#x reflector %#x fetch %#x diag %#x error %#x/%#x\n",
++		readl(dart->regs + DART_S5L8960X_TCR),
++		readl(dart->regs + DART_S5L8960X_ERROR_REFLECTOR),
++		readl(dart->regs + DART_S5L8960X_FETCH_CONFIG),
++		readl(dart->regs + DART_S5L8960X_DIAG_CONFIG),
++		readl(dart->regs + DART_S5L8960X_ERROR),
++		readl(dart->regs + DART_S5L8960X_ERROR_ADDR));
+ 	return 0;
+ }
+ 
+diff --git a/drivers/nvme/host/pci-apple-ans.c b/drivers/nvme/host/pci-apple-ans.c
+index 0a49b5194e..70aad15e87 100644
+--- a/drivers/nvme/host/pci-apple-ans.c
++++ b/drivers/nvme/host/pci-apple-ans.c
+@@ -129,6 +129,20 @@ static const struct kernel_param_ops apple_ans_go_ops = {
+ module_param_cb(apple_ans_go, &apple_ans_go_ops, NULL, 0644);
+ MODULE_PARM_DESC(apple_ans_go, "Apple ANS: write 1 to release apple_ans_hold");
+ 
++static bool apple_ans_debug;
++module_param(apple_ans_debug, bool, 0644);
++MODULE_PARM_DESC(apple_ans_debug,
++	"Apple ANS: log bring-up diagnostics (MSI setup, SoC-side host/NVMMU/DART dumps, DART table walks for the admin queues, SoC-side changes after CC.EN). Fault diagnostics are always logged.");
++
++/* Bring-up detail: dynamic debug, or always with nvme.apple_ans_debug=1 */
++#define ans_dbg(dev, fmt, ...)						\
++	do {								\
++		if (apple_ans_debug)					\
++			dev_info(dev, fmt, ##__VA_ARGS__);		\
++		else							\
++			dev_dbg(dev, fmt, ##__VA_ARGS__);		\
++	} while (0)
++
+ static void apple_ans_settle(void)
+ {
+ 	if (apple_ans_slow_ms)
+@@ -428,7 +442,7 @@ static void nvme_pci_apple_ans_config(struct nvme_dev *dev)
+ 
+ 	ltr = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_LTR);
+ 	l1ss = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_L1SS);
+-	dev_info(dev->dev, "Apple ANS: LTR cap at %#x, L1SS cap at %#x\n",
++	ans_dbg(dev->dev, "Apple ANS: LTR cap at %#x, L1SS cap at %#x\n",
+ 		 ltr, l1ss);
+ 
+ 	if (ltr)
+@@ -471,7 +485,7 @@ static int nvme_pci_apple_ans_preinit(struct nvme_dev *dev)
+ 	log_size = readl(dev->bar + APPLE_ANS_REG_LOG_SIZE);
+ 	hmb_size = readl(dev->bar + APPLE_ANS_REG_HMB_SIZE_REQ);
+ 	hmb_align = readl(dev->bar + APPLE_ANS_REG_HMB_ALIGN_REQ);
+-	dev_info(dev->dev,
++	ans_dbg(dev->dev,
+ 		 "Apple ANS: core_mask=%#x log_size=%#x hmb_req=%#x align=%#x\n",
+ 		 core_mask, log_size, hmb_size, hmb_align);
+ 	bfh = readl(dev->bar + APPLE_ANS_REG_BFH);
+@@ -511,7 +525,7 @@ static int nvme_pci_apple_ans_preinit(struct nvme_dev *dev)
+ 	ret = nvme_pci_apple_ans_check_link(dev, "CC=0");
+ 	if (ret)
+ 		return ret;
+-	dev_info(dev->dev, "Apple ANS: stopping controller (CC=0)\n");
++	ans_dbg(dev->dev, "Apple ANS: stopping controller (CC=0)\n");
+ 	writel(0, dev->bar + NVME_REG_CC);
+ 	ret = readl_poll_timeout(dev->bar + NVME_REG_CSTS, csts,
+ 				 !(csts & (NVME_CSTS_RDY | NVME_CSTS_CFS)),
+@@ -520,7 +534,7 @@ static int nvme_pci_apple_ans_preinit(struct nvme_dev *dev)
+ 		return dev_err_probe(dev->dev, ret,
+ 				     "Apple ANS: controller did not stop (CSTS=%#x)\n",
+ 				     csts);
+-	dev_info(dev->dev, "Apple ANS: controller stopped (CSTS=%#x)\n", csts);
++	ans_dbg(dev->dev, "Apple ANS: controller stopped (CSTS=%#x)\n", csts);
+ 	apple_ans_settle();
+ 
+ 	return 0;
+@@ -548,7 +562,7 @@ static void nvme_pci_apple_ans_log_msi(struct nvme_dev *dev)
+ 	msix = pdev->msix_cap;
+ 	if (msix)
+ 		pci_read_config_word(pdev, msix + PCI_MSIX_FLAGS, &xflags);
+-	dev_info(dev->dev,
++	ans_dbg(dev->dev,
+ 		 "Apple ANS: MSI cap %#x flags %#x addr %#x:%08x data %#x; MSI-X cap %#x flags %#x; irq %d\n",
+ 		 msi, flags, hi, lo, data, msix, xflags, pci_irq_vector(pdev, 0));
+ }
+@@ -560,7 +574,7 @@ static void nvme_pci_apple_ans_log_queue(struct nvme_dev *dev, const char *what,
+ 	struct iommu_domain *dom = iommu_get_domain_for_dev(dev->dev);
+ 	phys_addr_t pa = dom ? iommu_iova_to_phys(dom, iova) : 0;
+ 
+-	dev_info(dev->dev, "Apple ANS: %s IOVA %pad -> PA %pa (Linux view)\n",
++	ans_dbg(dev->dev, "Apple ANS: %s IOVA %pad -> PA %pa (Linux view)\n",
+ 		 what, &iova, &pa);
+ 	apple_ans_dart_walk(dev->dev, what, iova);
+ }
+@@ -617,16 +631,20 @@ static int nvme_pci_apple_ans_prepare_enable(struct nvme_dev *dev)
+ 	writel(ans->hmb_size, dev->bar + APPLE_ANS_REG_HMB_SIZE);
+ 	readl(dev->bar + APPLE_ANS_REG_HMB_SIZE);
+ 
+-	dev_info(dev->dev,
++	ans_dbg(dev->dev,
+ 		 "Apple ANS: HMB DMA %#llx size %#x programmed; AQA %#x ASQ %#llx ACQ %#llx\n",
+ 		 (u64)ans->hmb_dma, ans->hmb_size,
+ 		 readl(dev->bar + NVME_REG_AQA),
+ 		 lo_hi_readq(dev->bar + NVME_REG_ASQ),
+ 		 lo_hi_readq(dev->bar + NVME_REG_ACQ));
+-	nvme_pci_apple_ans_log_msi(dev);
+-	apple_ans_host_dump(dev->dev, "before CC.EN");
+-	nvme_pci_apple_ans_log_queue(dev, "ASQ", dev->queues[0].sq_dma_addr);
+-	nvme_pci_apple_ans_log_queue(dev, "ACQ", dev->queues[0].cq_dma_addr);
++	if (apple_ans_debug) {
++		nvme_pci_apple_ans_log_msi(dev);
++		apple_ans_host_dump(dev->dev, "before CC.EN");
++		nvme_pci_apple_ans_log_queue(dev, "ASQ",
++					     dev->queues[0].sq_dma_addr);
++		nvme_pci_apple_ans_log_queue(dev, "ACQ",
++					     dev->queues[0].cq_dma_addr);
++	}
+ 	apple_ans_settle();
+ 
+ 	ret = nvme_pci_apple_ans_gate(dev);
+@@ -702,7 +720,7 @@ static int nvme_pci_apple_ans_write_cc(struct nvme_dev *dev, u32 cc)
+ 		apple_ans_host_state(dev->dev, &st);
+ 		us = ktime_us_delta(ktime_get(), start);
+ 		if (memcmp(&st, &prev, sizeof(st))) {
+-			dev_info(dev->dev,
++			ans_dbg(dev->dev,
+ 				 "Apple ANS: CC.EN+%lldus: link %u ltssm %#x port irq %#x nvmmu err %#x dart err %#x addr %#x\n",
+ 				 us, st.link_up, st.ltssm, st.port_irq,
+ 				 st.nvmmu_err, st.dart_err, st.dart_addr);
+@@ -718,10 +736,11 @@ static int nvme_pci_apple_ans_write_cc(struct nvme_dev *dev, u32 cc)
+ 		}
+ 	} while (us < apple_ans_watch_ms * USEC_PER_MSEC);
+ 
+-	dev_info(dev->dev,
++	ans_dbg(dev->dev,
+ 		 "Apple ANS: %ums after CC.EN, no host-side fault; polling CSTS\n",
+ 		 apple_ans_watch_ms);
+-	apple_ans_host_dump(dev->dev, "after watch");
++	if (apple_ans_debug)
++		apple_ans_host_dump(dev->dev, "after watch");
+ 	apple_ans_settle();
+ 	return 0;
+ }
+-- 
+2.56.0
+

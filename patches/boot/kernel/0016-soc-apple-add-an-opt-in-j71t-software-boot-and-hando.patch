@@ -1,0 +1,129 @@
+From a1ce00667d48de8816dc4a7d11884cee4b445572 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 13:14:00 +0000
+Subject: [PATCH 16/16] soc: apple: add an opt-in j71t software boot and
+ handoff deadline
+
+Arm apple_boot_watchdog.timeout=30..600 at subsys init, before deferred peripheral probes. Expiry panics without programming the SoC watchdog. A root-only parameter synchronously disarms or rearms the timer for a controlled recovery or outgoing shutdown test. Other boards and capture kernels cannot arm it.
+
+The boot initramfs must write zero only after a usable root is mounted. A software timer requires a live CPU and timer interrupt; the buddy and soft lockup detectors remain separate diagnostics.
+---
+ drivers/soc/apple/Kconfig               | 11 ++++
+ drivers/soc/apple/Makefile              |  2 +
+ drivers/soc/apple/apple-boot-watchdog.c | 72 +++++++++++++++++++++++++
+ 3 files changed, 85 insertions(+)
+ create mode 100644 drivers/soc/apple/apple-boot-watchdog.c
+
+diff --git a/drivers/soc/apple/Kconfig b/drivers/soc/apple/Kconfig
+index 0587472546..f73f8da997 100644
+--- a/drivers/soc/apple/Kconfig
++++ b/drivers/soc/apple/Kconfig
+@@ -75,6 +75,17 @@ config APPLE_TUNABLE
+ 	tristate
+ 	depends on ARCH_APPLE || COMPILE_TEST
+ 
++config APPLE_J71T_BOOT_WATCHDOG
++	bool "Apple j71t opt-in software boot deadline"
++	depends on ARM64 && OF && KEXEC_CORE
++	depends on ARCH_APPLE || COMPILE_TEST
++	help
++	  Allow apple_boot_watchdog.timeout=30..600 to panic if early boot
++	  does not finish in time. Userspace must write 0 to its timeout
++	  parameter after mounting a usable root. Root can explicitly rearm
++	  it before a diagnostic shutdown. Disabled by default and
++	  ignored in capture kernels. This never resets the SoC directly.
++
+ endmenu
+ 
+ endif
+diff --git a/drivers/soc/apple/Makefile b/drivers/soc/apple/Makefile
+index 465b0e3ebb..c7ed216772 100644
+--- a/drivers/soc/apple/Makefile
++++ b/drivers/soc/apple/Makefile
+@@ -17,3 +17,5 @@ apple-tunable-y = tunable.o
+ obj-$(CONFIG_APPLE_PMP_T8015_V1) += pmp_t8015_v1.o
+ obj-$(CONFIG_APPLE_SIO) += apple-sio.o
+ apple-sio-y := apple-sio-core.o
++
++obj-$(CONFIG_APPLE_J71T_BOOT_WATCHDOG) += apple-boot-watchdog.o
+diff --git a/drivers/soc/apple/apple-boot-watchdog.c b/drivers/soc/apple/apple-boot-watchdog.c
+new file mode 100644
+index 0000000000..8790f9a29f
+--- /dev/null
++++ b/drivers/soc/apple/apple-boot-watchdog.c
+@@ -0,0 +1,72 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Opt-in j71t boot deadline. Never programs the SoC reset watchdog. */
++#include <linux/crash_dump.h>
++#include <linux/init.h>
++#include <linux/jiffies.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/timer.h>
++
++static unsigned int timeout;
++static bool initialized;
++static bool supported;
++static struct timer_list boot_timer;
++
++static void apple_boot_expired(struct timer_list *timer)
++{
++	panic("j71t boot deadline expired after %u seconds; inspect retained probe breadcrumbs",
++	      timeout);
++}
++
++static int apple_boot_timeout_set(const char *val, const struct kernel_param *kp)
++{
++	unsigned int seconds;
++	int ret;
++
++	ret = kstrtouint(val, 0, &seconds);
++	if (ret)
++		return ret;
++	if (seconds && (seconds < 30 || seconds > 600))
++		return -EINVAL;
++	if (initialized) {
++		if (seconds && !supported)
++			return -EOPNOTSUPP;
++		timer_delete_sync(&boot_timer);
++	}
++	WRITE_ONCE(timeout, seconds);
++	if (initialized) {
++		if (seconds) {
++			pr_warn("j71t boot deadline rearmed for %u seconds by userspace\n",
++				seconds);
++			mod_timer(&boot_timer, jiffies + seconds * HZ);
++		} else {
++			pr_info("j71t boot deadline disarmed by userspace\n");
++		}
++	}
++	return 0;
++}
++
++static const struct kernel_param_ops apple_boot_timeout_ops = {
++	.set = apple_boot_timeout_set,
++	.get = param_get_uint,
++};
++module_param_cb(timeout, &apple_boot_timeout_ops, &timeout, 0600);
++MODULE_PARM_DESC(timeout, "j71t boot deadline: 0=off, 30..600 seconds; write 0 to disarm");
++
++static int __init apple_boot_watchdog_init(void)
++{
++	timer_setup(&boot_timer, apple_boot_expired, 0);
++	initialized = true;
++	supported = of_machine_is_compatible("apple,j71t") && !is_kdump_kernel();
++	if (!supported) {
++		timeout = 0;
++		return 0;
++	}
++	if (!timeout)
++		return 0;
++	pr_warn("j71t boot deadline armed for %u seconds (software timer, no SoC reset)\n",
++		timeout);
++	mod_timer(&boot_timer, jiffies + timeout * HZ);
++	return 0;
++}
++subsys_initcall(apple_boot_watchdog_init);
+-- 
+2.56.0
+

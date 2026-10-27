@@ -1,0 +1,645 @@
+#!/usr/bin/env python3
+"""Auto-rotate for Omarchy on the iPad (linux-a9).
+
+Follows the accelerometer: when the iPad is held another way up, it runs
+`ipad-rotate <orientation>`, which turns the screen, the touchscreen and the
+gestures together (docs/omarchy/tablet-usage.md). It runs as the user unit
+ipad-autorotate.service, which only starts where an IIO accelerometer exists.
+
+Sensor sources (--source, default auto):
+  proxy   iio-sensor-proxy's orientation, read through its monitor-sensor
+          client (which holds the D-Bus claim while it runs)
+  iio     the kernel's IIO accelerometer straight from sysfs
+          (in_accel_{x,y,z}_raw, scale, mount matrix), polled
+  auto    proxy when it reports an accelerometer, else iio, else wait
+
+Testing without hardware:
+  --mock PATH       read lines from a FIFO (made if missing) or a file:
+                      normal | bottom-up | left-up | right-up | undefined
+                      accel X Y Z      raw gravity in the screen frame, so the
+                                       classifier and its hysteresis run too
+  --mock-iio DIR    a fake sysfs tree (DIR/iio:device0/in_accel_x_raw ...)
+  IPAD_AUTOROTATE_MONITOR_CMD   replaces monitor-sensor (a fake D-Bus client)
+  IPAD_AUTOROTATE_ROTATE        replaces ipad-rotate (the command that turns)
+
+Other options:
+  --dry-run   decide and log, turn nothing
+  --probe [S] dry run for S seconds (default 10) logging every sensor event,
+              for finding out which way the axes point on a new device
+  --list      print the sensors found, then exit
+  --status    print what a running daemon last saw, then exit
+  --debug     log every sensor event
+
+Rotation lock: `ipad-rotate lock on|off|toggle` (the bar button, SUPER + ALT +
+SHIFT + R). While locked the daemon only notes the sensor; unlocking turns the
+screen to however the iPad is held at that moment. Turning by hand
+(ipad-rotate next ...) works either way and stays until the iPad is physically
+turned.
+
+~/.config/linux-a9/autorotate.conf (key = value, # comments; restart to apply):
+  normal = portrait                 sensor orientation -> ipad-rotate name;
+  bottom-up = portrait-flipped      each one can be changed, e.g. if the
+  right-up = landscape              driver's axes turn out the wrong way:
+  left-up = landscape-flipped       swap right-up and left-up
+  debounce = 0.8                    seconds an orientation must hold
+  min_interval = 2.0                seconds between two rotations
+  poll_hz = 4                       iio source: reads per second
+  flat_deg = 20                     iio source: ignore readings this close to flat
+  hysteresis_deg = 10               iio source: extra turn needed to leave an
+                                    orientation (45 + this = 55 degrees)
+  mount_matrix = 1,0,0;0,1,0;0,0,1  iio source: replaces the kernel's matrix
+The iio source uses the same mounted readings as iio-sensor-proxy:
+normal = -Y, bottom-up = +Y, left-up = +X, right-up = -X;
+flat screen-up = +Z. The matrix is applied once, before classification.
+"""
+
+import argparse
+import glob
+import json
+import math
+import os
+import pty
+import re
+import select
+import shlex
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+ORIENTATIONS = ("normal", "bottom-up", "left-up", "right-up")
+ROTATE_NAMES = ("landscape", "portrait", "landscape-flipped", "portrait-flipped")
+DEFAULT_MAP = {
+    "normal": "portrait",  # the panel's own way: home button at the bottom
+    "bottom-up": "portrait-flipped",
+    "right-up": "landscape",  # right side of the screen up = home button on the right
+    "left-up": "landscape-flipped",
+}
+# Angle in iio-sensor-proxy's mounted frame, 0 = normal, towards right-up.
+CENTERS = {"normal": 0.0, "right-up": 90.0, "bottom-up": 180.0, "left-up": -90.0}
+IIO_ROOT = "/sys/bus/iio/devices"
+TICK = 0.25
+
+
+def log(*args):
+    print("ipad-autorotate:", *args, file=sys.stderr, flush=True)
+
+
+# --- configuration ----------------------------------------------------------
+def load_conf():
+    conf = {
+        "map": dict(DEFAULT_MAP),
+        "debounce": 0.8,
+        "min_interval": 2.0,
+        "poll_hz": 4.0,
+        "flat_deg": 20.0,
+        "hysteresis_deg": 10.0,
+        "mount_matrix": None,
+    }
+    home = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    try:
+        with open(os.path.join(home, "linux-a9", "autorotate.conf")) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return conf
+    for line in lines:
+        line = line.split("#", 1)[0].strip()
+        if "=" not in line:
+            continue
+        key, value = (part.strip() for part in line.split("=", 1))
+        if key in ORIENTATIONS:
+            if value in ROTATE_NAMES:
+                conf["map"][key] = value
+            else:
+                log(f"autorotate.conf: {key} = {value}: not one of {', '.join(ROTATE_NAMES)}")
+        elif key == "mount_matrix":
+            conf[key] = parse_matrix(value)
+            if conf[key] is None:
+                log(f"autorotate.conf: mount_matrix needs nine numbers, got '{value}'")
+        elif key in conf:
+            try:
+                conf[key] = float(value)
+            except ValueError:
+                log(f"autorotate.conf: {key} = {value}: not a number")
+    return conf
+
+
+def parse_matrix(text):
+    nums = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", text or "")
+    if len(nums) != 9:
+        return None
+    n = [float(v) for v in nums]
+    return [n[0:3], n[3:6], n[6:9]]
+
+
+def state_path():
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.join(base, "linux-a9", "display")
+
+
+def read_state():
+    values = {}
+    try:
+        with open(state_path()) as f:
+            for line in f:
+                m = re.match(r"\s*([\w]+)\s*=\s*(\S+)", line)
+                if m:
+                    values[m.group(1)] = m.group(2)
+    except OSError:
+        pass
+    return values
+
+
+def current_orientation():
+    value = read_state().get("orientation")
+    return value if value in ROTATE_NAMES else "landscape"
+
+
+# --- classifier (for raw accelerometer readings) ------------------------------
+def angular_distance(a, b):
+    d = abs(a - b) % 360.0
+    return min(d, 360.0 - d)
+
+
+class Classifier:
+    """Match upstream orientation.c's axis signs, with local hysteresis.
+
+    Flat readings change nothing; leaving an orientation takes
+    45 + hysteresis degrees.
+    """
+
+    def __init__(self, flat_deg, hysteresis_deg):
+        self.flat = math.sin(math.radians(flat_deg))
+        self.leave = 45.0 + hysteresis_deg
+        self.current = None
+
+    def feed(self, x, y, z):
+        g = math.sqrt(x * x + y * y + z * z)
+        if g < 1e-6 or math.hypot(x, y) / g < self.flat:
+            return self.current
+        angle = math.degrees(math.atan2(-x, -y))
+        if self.current is not None and angular_distance(angle, CENTERS[self.current]) <= self.leave:
+            return self.current
+        self.current = min(CENTERS, key=lambda name: angular_distance(angle, CENTERS[name]))
+        return self.current
+
+
+# --- sources: poll(timeout) -> [("orientation", name) | ("accel", x, y, z)] ----
+def parse_line(line):
+    line = line.split("#", 1)[0].strip().lower()
+    if not line:
+        return None
+    if line in ORIENTATIONS or line == "undefined":
+        return ("orientation", line)
+    parts = line.split()
+    if parts and parts[0] == "accel":
+        parts = parts[1:]
+    try:
+        x, y, z = (float(p) for p in parts)
+        return ("accel", x, y, z)
+    except ValueError:
+        return None
+
+
+class LineSource:
+    """Lines from a FIFO or a file (--mock)."""
+
+    kind = "mock"
+
+    def __init__(self, path):
+        self.path = path
+        self.buf = b""
+        self.fd = None
+        self.offset = 0
+        if not os.path.exists(path):
+            os.mkfifo(path, 0o600)
+        self.fifo = stat.S_ISFIFO(os.stat(path).st_mode)
+        if self.fifo:
+            # Read-write so it never sees EOF when a writer closes.
+            self.fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        else:
+            with open(path) as f:
+                lines = [ln for ln in f.read().splitlines() if parse_line(ln)]
+            self.offset = os.path.getsize(path)
+            self.pending = lines[-1:]  # a file starts from its last line
+
+    def poll(self, timeout):
+        out = []
+        if self.fifo:
+            ready, _, _ = select.select([self.fd], [], [], timeout)
+            if ready:
+                self.buf += os.read(self.fd, 4096)
+                *lines, self.buf = self.buf.split(b"\n")
+                out = [parse_line(ln.decode(errors="replace")) for ln in lines]
+        else:
+            time.sleep(min(timeout, 0.2))
+            out = [parse_line(ln) for ln in getattr(self, "pending", [])]
+            self.pending = []
+            try:
+                size = os.path.getsize(self.path)
+            except OSError:
+                size = self.offset
+            if size < self.offset:
+                self.offset = 0
+            if size > self.offset:
+                with open(self.path, "rb") as f:
+                    f.seek(self.offset)
+                    data = f.read()
+                self.offset += len(data)
+                out += [parse_line(ln.decode(errors="replace")) for ln in data.splitlines()]
+        return [e for e in out if e]
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+
+
+class ProxySource:
+    """iio-sensor-proxy through monitor-sensor, on a pty so its output isn't
+    block-buffered. Restarts it if it exits."""
+
+    kind = "proxy"
+    PATTERN = re.compile(r"ccelerometer.*orientation(?: changed)?:\s*([a-z-]+)", re.I)
+
+    def __init__(self):
+        self.proc = None
+        self.master = None
+        self.buf = b""
+        self.retry_at = 0.0
+
+    @staticmethod
+    def command():
+        override = os.environ.get("IPAD_AUTOROTATE_MONITOR_CMD")
+        if override:
+            return shlex.split(override)
+        cmd = ["monitor-sensor"]
+        try:
+            help_text = subprocess.run(cmd + ["--help"], capture_output=True, text=True, timeout=5)
+            if "--accel" in help_text.stdout + help_text.stderr:
+                cmd.append("--accel")
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return cmd
+
+    def start(self):
+        cmd = self.command()
+        master, slave = pty.openpty()
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=slave, stderr=slave, close_fds=True)
+        os.close(slave)
+        self.master = master
+        self.buf = b""
+        log("started", " ".join(cmd))
+
+    def stop(self):
+        if self.proc:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        if self.master is not None:
+            os.close(self.master)
+        self.proc = self.master = None
+
+    def poll(self, timeout):
+        if self.proc is None:
+            if time.monotonic() < self.retry_at:
+                time.sleep(timeout)
+                return []
+            try:
+                self.start()
+            except OSError as e:
+                log("cannot start monitor-sensor:", e)
+                self.retry_at = time.monotonic() + 5
+                return []
+        ready, _, _ = select.select([self.master], [], [], timeout)
+        if not ready:
+            if self.proc.poll() is not None:
+                self.exited()
+            return []
+        try:
+            data = os.read(self.master, 4096)
+        except OSError:  # EIO: the child closed the pty
+            data = b""
+        if not data:
+            self.exited()
+            return []
+        self.buf += data
+        *lines, self.buf = self.buf.split(b"\n")
+        out = []
+        for raw in lines:
+            text = raw.decode(errors="replace").strip()
+            m = self.PATTERN.search(text)
+            if m:
+                out.append(("orientation", m.group(1).lower()))
+            elif text:
+                log("monitor-sensor:", text)
+        return out
+
+    def exited(self):
+        log("monitor-sensor exited; retrying in 3 s")
+        self.stop()
+        self.retry_at = time.monotonic() + 3
+
+    def close(self):
+        self.stop()
+
+
+def read_number(path, default=None):
+    try:
+        with open(path) as f:
+            return float(f.read().strip())
+    except (OSError, ValueError):
+        return default
+
+
+def read_text(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def find_iio(root):
+    """The first IIO device with in_accel_{x,y,z}_raw."""
+    for dev in sorted(glob.glob(os.path.join(root, "iio:device*"))):
+        if all(os.path.exists(os.path.join(dev, f"in_accel_{a}_raw")) for a in "xyz"):
+            return dev
+    return None
+
+
+class IioSource:
+    """Gravity from sysfs, put through the mount matrix (the kernel's, or the
+    config's), as ("accel", x, y, z) in the screen frame."""
+
+    kind = "iio"
+
+    def __init__(self, root, hz, matrix_override):
+        self.root = root
+        self.interval = 1.0 / max(hz, 0.5)
+        self.override = matrix_override
+        self.due = 0.0
+        self.warned = False
+
+    def matrix(self, dev):
+        if self.override:
+            return self.override
+        # The installer writes the same measured matrix to udev for the
+        # proxy and here for direct reads. Match only this AOP device.
+        if read_text(os.path.join(dev, "name")) == "apple-a9-aop-accel":
+            m = parse_matrix(read_text("/etc/linux-a9/aop-accel-matrix"))
+            if m:
+                return m
+        for name in ("mount_matrix", "in_accel_mount_matrix", "in_mount_matrix"):
+            m = parse_matrix(read_text(os.path.join(dev, name)))
+            if m:
+                return m
+        return [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+
+    def read(self):
+        dev = find_iio(self.root)
+        if not dev:
+            return None
+        v = []
+        for axis in "xyz":
+            raw = read_number(os.path.join(dev, f"in_accel_{axis}_raw"))
+            if raw is None:
+                return None
+            scale = read_number(os.path.join(dev, f"in_accel_{axis}_scale"))
+            if scale is None:
+                scale = read_number(os.path.join(dev, "in_accel_scale"), 1.0)
+            offset = read_number(os.path.join(dev, f"in_accel_{axis}_offset"), 0.0)
+            v.append((raw + offset) * scale)
+        m = self.matrix(dev)
+        return tuple(sum(m[r][c] * v[c] for c in range(3)) for r in range(3))
+
+    def poll(self, timeout):
+        wait = max(0.0, min(timeout, self.due - time.monotonic()))
+        time.sleep(wait)
+        if time.monotonic() < self.due:
+            return []
+        self.due = time.monotonic() + self.interval
+        v = self.read()
+        if v is None:
+            if not self.warned:
+                log("no readable IIO accelerometer under", self.root)
+                self.warned = True
+            return []
+        self.warned = False
+        return [("accel", *v)]
+
+    def close(self):
+        pass
+
+
+# --- finding the sensor --------------------------------------------------------
+def proxy_has_accelerometer():
+    try:
+        out = subprocess.run(
+            ["busctl", "--system", "get-property", "net.hadess.SensorProxy", "/net/hadess/SensorProxy",
+             "net.hadess.SensorProxy", "HasAccelerometer"],
+            capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return out == "b true"
+
+
+def have_monitor_sensor():
+    if os.environ.get("IPAD_AUTOROTATE_MONITOR_CMD"):
+        return True
+    return shutil.which("monitor-sensor") is not None
+
+
+def make_source(args, conf):
+    if args.mock:
+        return LineSource(args.mock)
+    root = args.mock_iio or IIO_ROOT
+    iio = lambda: IioSource(root, conf["poll_hz"], conf["mount_matrix"])  # noqa: E731
+    if args.mock_iio:
+        return iio()
+    if args.source == "proxy":
+        return ProxySource()
+    if args.source == "iio":
+        return iio()
+    # auto: wait for one of them (the unit's condition says there should be one).
+    announced = False
+    while True:
+        if have_monitor_sensor() and proxy_has_accelerometer():
+            return ProxySource()
+        if find_iio(root):
+            return iio()
+        if args.probe is not None:
+            log("no accelerometer: iio-sensor-proxy has none and there is no IIO device")
+            sys.exit(1)
+        if not announced:
+            log("no accelerometer yet (iio-sensor-proxy has none, no IIO device); waiting")
+            announced = True
+        time.sleep(10)
+
+
+def list_sensors(args, conf):
+    print("iio-sensor-proxy HasAccelerometer:", proxy_has_accelerometer() if shutil.which("busctl") else "no busctl")
+    print("monitor-sensor:", "found" if have_monitor_sensor() else "missing")
+    dev = find_iio(args.mock_iio or IIO_ROOT)
+    print("IIO accelerometer:", dev or "none")
+    if dev:
+        src = IioSource(args.mock_iio or IIO_ROOT, conf["poll_hz"], conf["mount_matrix"])
+        print("  scaled reading (m/s^2, screen frame):", src.read())
+        print("  mount matrix:", src.matrix(dev))
+    print("lock:", read_state().get("rotation_lock", "off"), "| orientation:", current_orientation())
+
+
+# --- the daemon -----------------------------------------------------------------
+def status_path():
+    return os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "ipad-autorotate.json")
+
+
+class Daemon:
+    def __init__(self, conf, source, dry, debug):
+        self.conf, self.source, self.dry, self.debug = conf, source, dry, debug
+        self.classifier = Classifier(conf["flat_deg"], conf["hysteresis_deg"])
+        self.latest = None  # the sensor's orientation now
+        self.latest_since = 0.0
+        self.acted = None  # the sensor orientation last turned to
+        self.last_apply = -1e9
+        self.was_locked = False
+        self.rotations = 0
+        self.stop = False
+        self.rotate_cmd = shlex.split(os.environ.get("IPAD_AUTOROTATE_ROTATE", "ipad-rotate"))
+
+    def on_event(self, event, now):
+        if event[0] == "accel":
+            name = self.classifier.feed(*event[1:])
+            if self.debug:
+                log("accel x=%.2f y=%.2f z=%.2f -> %s" % (*event[1:], name))
+        else:
+            name = event[1]
+            if self.debug:
+                log("orientation", name)
+        if name not in CENTERS or name == self.latest:
+            return
+        self.latest, self.latest_since = name, now
+        log(f"sensor: {name}")
+        self.write_status()
+
+    def tick(self, now):
+        locked = read_state().get("rotation_lock") == "on"
+        if locked:
+            if not self.was_locked:
+                log("locked: following the sensor but not turning")
+                self.was_locked = True
+                self.write_status()
+            return
+        if self.was_locked:
+            # Unlocking turns to however the iPad is held right now.
+            self.was_locked = False
+            self.acted = None
+            log("unlocked")
+        if self.latest is None or self.latest == self.acted:
+            return
+        if now - self.latest_since < self.conf["debounce"] or now - self.last_apply < self.conf["min_interval"]:
+            return
+        target = self.conf["map"][self.latest]
+        if current_orientation() == target:
+            log(f"{self.latest}: already {target}")
+            self.acted = self.latest
+            self.write_status()
+            return
+        self.last_apply = now
+        if self.dry:
+            log(f"{self.latest}: would rotate to {target} (dry run)")
+            self.acted = self.latest
+            self.write_status()
+            return
+        started = time.monotonic()
+        result = subprocess.run(self.rotate_cmd + [target], capture_output=True, text=True)
+        took = time.monotonic() - started
+        if result.returncode == 0:
+            self.rotations += 1
+            self.acted = self.latest
+            log(f"{self.latest}: rotated to {target} ({took:.1f} s)")
+        else:
+            log(f"{self.latest}: ipad-rotate {target} failed ({result.returncode}): {result.stderr.strip()}; will retry")
+        self.write_status()
+
+    def write_status(self):
+        data = {
+            "source": self.source.kind,
+            "sensor": self.latest,
+            "acted": self.acted,
+            "orientation": current_orientation(),
+            "locked": read_state().get("rotation_lock") == "on",
+            "rotations": self.rotations,
+            "pid": os.getpid(),
+            "time": time.time(),
+        }
+        tmp = status_path() + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, status_path())
+        except OSError:
+            pass
+
+    def run(self, seconds=None):
+        end = time.monotonic() + seconds if seconds else None
+        log(f"source {self.source.kind}; debounce {self.conf['debounce']} s, min interval {self.conf['min_interval']} s"
+            + (", dry run" if self.dry else ""))
+        self.write_status()
+        while not self.stop and (end is None or time.monotonic() < end):
+            for event in self.source.poll(TICK):
+                self.on_event(event, time.monotonic())
+            self.tick(time.monotonic())
+        self.source.close()
+        try:
+            os.unlink(status_path())
+        except OSError:
+            pass
+
+
+def main():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--source", choices=("auto", "proxy", "iio"), default="auto")
+    parser.add_argument("--mock")
+    parser.add_argument("--mock-iio")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--probe", nargs="?", const=10, type=float)
+    parser.add_argument("--list", action="store_true")
+    parser.add_argument("--status", action="store_true")
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("-h", "--help", action="store_true")
+    args = parser.parse_args()
+    if args.help:
+        print(__doc__.strip("\n"))
+        return 0
+    if args.status:
+        try:
+            print(open(status_path()).read())
+            return 0
+        except OSError:
+            print("not running", file=sys.stderr)
+            return 1
+    conf = load_conf()
+    if args.list:
+        list_sensors(args, conf)
+        return 0
+    if args.probe is not None:
+        args.dry_run = args.debug = True
+    source = make_source(args, conf)
+    daemon = Daemon(conf, source, args.dry_run, args.debug)
+
+    def stop(*_):
+        daemon.stop = True
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGHUP, lambda *_: daemon.conf.update(load_conf()))
+    daemon.run(args.probe)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

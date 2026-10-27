@@ -1,0 +1,72 @@
+From 55a965f9cfca731f9d79a28363b0dd679545b87c Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 23:16:57 +0000
+Subject: [PATCH 4/7] cpufreq: apple: test thermal fault decisions and forbid
+ emulated protection
+
+---
+ drivers/cpufreq/Kconfig.arm       |  1 +
+ drivers/cpufreq/apple-a9-tuning.h | 26 ++++++++++++++++++++------
+ 2 files changed, 21 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/cpufreq/Kconfig.arm b/drivers/cpufreq/Kconfig.arm
+index b27d863d29..ee94b57414 100644
+--- a/drivers/cpufreq/Kconfig.arm
++++ b/drivers/cpufreq/Kconfig.arm
+@@ -278,6 +278,7 @@ config APPLE_A9_TUNING
+     bool "Guarded experimental S8003 CPU clocks"
+     depends on ARM_APPLE_SOC_CPUFREQ
+     depends on APPLE_S8003_THERMAL=y && CPU_THERMAL && DEBUG_FS
++    depends on !THERMAL_EMULATION
+     help
+       Root-only, default-off, heartbeat-protected S8003 stock boost and
+       experimental clocks. No voltage increase is supported until the DAC
+diff --git a/drivers/cpufreq/apple-a9-tuning.h b/drivers/cpufreq/apple-a9-tuning.h
+index 6eb091c677..0f601bf47a 100644
+--- a/drivers/cpufreq/apple-a9-tuning.h
++++ b/drivers/cpufreq/apple-a9-tuning.h
+@@ -119,21 +119,35 @@ static void a9_revert(struct a9_guard *g, const char *reason)
+ 		dev_err(g->priv->cpu_dev, "A9 stock revert failed: %d\n", g->revert_error);
+ }
+ 
++static const char *a9_guard_fault(int sensor_error, int hottest, bool expired)
++{
++	if (sensor_error)
++		return "sensor-error";
++	if (hottest >= 100000)
++		return "thermal-critical";
++	if (hottest >= 90000)
++		return "thermal-hot";
++	if (hottest >= 80000)
++		return "thermal-passive";
++	if (expired)
++		return "heartbeat-timeout";
++	return NULL;
++}
++
+ static void a9_guard_work(struct work_struct *work)
+ {
+ 	struct a9_guard *g = container_of(to_delayed_work(work), struct a9_guard, work);
+ 	int hottest, ret;
++	const char *fault;
+ 
+ 	mutex_lock(&g->control);
+ 	ret = a9_temperatures(&hottest);
+ 	g->hottest = ret ? INT_MIN : hottest;
+ 	if (g->armed) {
+-		if (ret)
+-			a9_revert(g, "sensor-error");
+-		else if (hottest >= 80000)
+-			a9_revert(g, "thermal-passive");
+-		else if (time_after(jiffies, g->heartbeat + msecs_to_jiffies(A9_HEARTBEAT_MS)))
+-			a9_revert(g, "heartbeat-timeout");
++		fault = a9_guard_fault(ret, hottest,
++			 time_after(jiffies, g->heartbeat + msecs_to_jiffies(A9_HEARTBEAT_MS)));
++		if (fault)
++			a9_revert(g, fault);
+ 	} else if (!ret && hottest >= 90000 && !g->latched) {
+ 		a9_revert(g, "thermal-hot");
+ 	}
+-- 
+2.56.0
+

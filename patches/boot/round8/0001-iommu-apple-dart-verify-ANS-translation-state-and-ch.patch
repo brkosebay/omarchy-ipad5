@@ -1,0 +1,344 @@
+From 0324c6ba6501cb62d063081ae21cfc10a87bd9a0 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 17:53:23 +0000
+Subject: [PATCH 1/2] iommu/apple-dart: verify ANS translation state and check
+ TLB flushes
+
+Log inherited state before W1C, rebuild selected streams in Apple activation order, verify TCR/TTBR readback and propagate bounded invalidate failures. Block DMA and new mappings when the void IOMMU callbacks cannot return a flush error.
+---
+ drivers/iommu/apple-dart.c | 187 +++++++++++++++++++++++++++++--------
+ include/linux/apple-ans.h  |  34 +++++++
+ 2 files changed, 180 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/iommu/apple-dart.c b/drivers/iommu/apple-dart.c
+index cf72c63da6..6bd449f910 100644
+--- a/drivers/iommu/apple-dart.c
++++ b/drivers/iommu/apple-dart.c
+@@ -11,6 +11,7 @@
+  *  Copyright (c) 2011,2016 Samsung Electronics Co., Ltd.
+  */
+ 
++#include <linux/apple-ans.h>
+ #include <linux/atomic.h>
+ #include <linux/bitfield.h>
+ #include <linux/clk.h>
+@@ -316,6 +317,7 @@ struct apple_dart_domain {
+ 	struct io_pgtable_ops *pgtbl_ops;
+ 
+ 	bool finalized;
++	int flush_error; /* a failed invalidate blocks DMA until stopped reinit */
+ 	u64 mask;
+ 	struct mutex init_lock;
+ 	struct apple_dart_atomic_stream_map stream_maps[MAX_DARTS_PER_DEVICE];
+@@ -599,6 +601,26 @@ static void apple_dart_s5l8960x_hw_config(struct apple_dart *dart)
+ 		       dart->regs + DART_S5L8960X_DIAG_CONFIG);
+ }
+ 
++/* Snapshot before any W1C or table replacement. 0x100/0x500 have no
++ * exception-valid bit; direction/attributes alone do not indicate a fault.
++ */
++static void apple_dart_s5l8960x_log_state(struct apple_dart *dart,
++					  const char *when)
++{
++	u32 error = readl(dart->regs + DART_S5L8960X_ERROR);
++	u32 sid = FIELD_GET(DART_S5L8960X_ERROR_STREAM, error);
++
++	dev_info(dart->dev,
++		 "DART %s before ack: err %#x valid %u code %#x sid %u write %u addr %#x TCR %#x TTBR %#x %#x %#x %#x\n",
++		 when, error, !!(error & BIT(31)), error & 0x7f, sid,
++		 !!(error & BIT(10)), readl(dart->regs + DART_S5L8960X_ERROR_ADDR),
++		 readl(dart->regs + DART_S5L8960X_TCR),
++		 readl(dart->regs + DART_TTBR(dart, sid, 0)),
++		 readl(dart->regs + DART_TTBR(dart, sid, 1)),
++		 readl(dart->regs + DART_TTBR(dart, sid, 2)),
++		 readl(dart->regs + DART_TTBR(dart, sid, 3)));
++}
++
+ static int apple_dart_hw_reset(struct apple_dart *dart)
+ {
+ 	u32 config;
+@@ -612,6 +634,8 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
+ 		return -EINVAL;
+ 	}
+ 
++	if (dart->hw->type == DART_S5L8960X)
++		apple_dart_s5l8960x_log_state(dart, "hw_reset");
+ 	stream_map.dart = dart;
+ 	bitmap_zero(stream_map.sidmap, DART_MAX_STREAMS);
+ 	bitmap_set(stream_map.sidmap, 0, dart->num_streams);
+@@ -641,9 +665,9 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
+ 	return dart->hw->invalidate_tlb(&stream_map);
+ }
+ 
+-static void apple_dart_domain_flush_tlb(struct apple_dart_domain *domain)
++static int apple_dart_domain_flush_tlb(struct apple_dart_domain *domain)
+ {
+-	int i, j;
++	int i, j, ret, error = 0;
+ 	struct apple_dart_atomic_stream_map *domain_stream_map;
+ 	struct apple_dart_stream_map stream_map;
+ 
+@@ -653,8 +677,17 @@ static void apple_dart_domain_flush_tlb(struct apple_dart_domain *domain)
+ 		for (j = 0; j < BITS_TO_LONGS(stream_map.dart->num_streams); j++)
+ 			stream_map.sidmap[j] = atomic_long_read(&domain_stream_map->sidmap[j]);
+ 
+-		stream_map.dart->hw->invalidate_tlb(&stream_map);
++		ret = stream_map.dart->hw->invalidate_tlb(&stream_map);
++		if (ret) {
++			if (!READ_ONCE(domain->flush_error))
++				dev_err(stream_map.dart->dev,
++					"DART domain flush failed %d; blocking DMA\n", ret);
++			WRITE_ONCE(domain->flush_error, ret);
++			error = ret;
++			apple_dart_hw_disable_dma(&stream_map);
++		}
+ 	}
++	return error ?: READ_ONCE(domain->flush_error);
+ }
+ 
+ static void apple_dart_flush_iotlb_all(struct iommu_domain *domain)
+@@ -671,8 +704,7 @@ static void apple_dart_iotlb_sync(struct iommu_domain *domain,
+ static int apple_dart_iotlb_sync_map(struct iommu_domain *domain,
+ 				     unsigned long iova, size_t size)
+ {
+-	apple_dart_domain_flush_tlb(to_dart_domain(domain));
+-	return 0;
++	return apple_dart_domain_flush_tlb(to_dart_domain(domain));
+ }
+ 
+ static phys_addr_t apple_dart_iova_to_phys(struct iommu_domain *domain,
+@@ -697,6 +729,8 @@ static int apple_dart_map_pages(struct iommu_domain *domain, unsigned long iova,
+ 
+ 	if (!ops)
+ 		return -ENODEV;
++	if (READ_ONCE(dart_domain->flush_error))
++		return READ_ONCE(dart_domain->flush_error);
+ 
+ 	return ops->map_pages(ops, iova & dart_domain->mask, paddr, pgsize,
+ 			      pgcount, prot, gfp, mapped);
+@@ -716,53 +750,121 @@ static size_t apple_dart_unmap_pages(struct iommu_domain *domain,
+ 
+ static void apple_dart_s5l8960x_attach_config(struct apple_dart *dart)
+ {
+-	u32 reflector = readl(dart->regs + DART_S5L8960X_ERROR_REFLECTOR);
+-	u32 fetch = readl(dart->regs + DART_S5L8960X_FETCH_CONFIG);
+-	u32 diag = readl(dart->regs + DART_S5L8960X_DIAG_CONFIG);
+-	u32 error = readl(dart->regs + DART_S5L8960X_ERROR);
++	u32 error;
+ 
+-	/*
+-	 * Shows whether the DART kept its probe-time setup. Behind the A9
+-	 * PCIe port it doesn't: it reads all-ones until the port powers up and
+-	 * comes back in its reset state, with an error status left over from
+-	 * before Linux. Clear that so a later read means a new fault.
+-	 */
+-	dev_dbg(dart->dev,
+-		"attach: TCR %#x reflector %#x fetch %#x diag %#x error %#x/%#x (re-applying %#x/%#x/%#x, clearing the error)\n",
+-		readl(dart->regs + DART_S5L8960X_TCR), reflector, fetch, diag,
+-		error, readl(dart->regs + DART_S5L8960X_ERROR_ADDR),
+-		dart->error_reflector, dart->fetch_config, dart->diag_config);
+-	apple_dart_s5l8960x_hw_config(dart);
++	apple_dart_s5l8960x_log_state(dart, "attach/reinit");
++	error = readl(dart->regs + DART_S5L8960X_ERROR);
+ 	writel(error, dart->regs + DART_S5L8960X_ERROR);
+ }
+ 
+-static void
++static int
+ apple_dart_setup_translation(struct apple_dart_domain *domain,
+ 			     struct apple_dart_stream_map *stream_map)
+ {
+-	int i;
+-	struct io_pgtable_cfg *pgtbl_cfg =
++	struct apple_dart *dart = stream_map->dart;
++	struct io_pgtable_cfg *cfg =
+ 		&io_pgtable_ops_to_pgtable(domain->pgtbl_ops)->cfg;
++	bool s5l = dart->hw->type == DART_S5L8960X;
++	u32 expected, actual;
++	int i, sid, ret;
+ 
+-	for (i = 0; i < pgtbl_cfg->apple_dart_cfg.n_ttbrs; ++i)
+-		apple_dart_hw_set_ttbr(stream_map, i,
+-				       pgtbl_cfg->apple_dart_cfg.ttbr[i]);
+-	for (; i < stream_map->dart->hw->ttbr_count; ++i)
++	if (s5l) {
++		apple_dart_s5l8960x_attach_config(dart);
++		apple_dart_hw_disable_dma(stream_map);
++		for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
++			if (dart->hw->read_tcr(dart, sid)) {
++				ret = -EIO;
++				goto fail;
++			}
++		}
++		apple_dart_hw_clear_all_ttbrs(stream_map);
++		/* Apple's init: reflector, stream tables, verified TCR, fetch,
++		 * diag. The DART cannot invalidate while TCR is disabled.
++		 */
++		if (dart->error_reflector)
++			writel(dart->error_reflector,
++			       dart->regs + DART_S5L8960X_ERROR_REFLECTOR);
++	}
++	for (i = 0; i < cfg->apple_dart_cfg.n_ttbrs; i++)
++		apple_dart_hw_set_ttbr(stream_map, i, cfg->apple_dart_cfg.ttbr[i]);
++	for (; i < dart->hw->ttbr_count; i++)
+ 		apple_dart_hw_clear_ttbr(stream_map, i);
+ 
+-	/*
+-	 * A DART inside a PCIe port loses its state when the port is powered
+-	 * up after the DART probed (iOS re-runs its hardware init whenever the
+-	 * port marks the DART active). Re-apply the global setup here, which
+-	 * runs when an endpoint is attached, i.e. after its link came up.
+-	 */
+-	if (stream_map->dart->hw->type == DART_S5L8960X)
+-		apple_dart_s5l8960x_attach_config(stream_map->dart);
++	dma_wmb();
++	apple_dart_hw_enable_translation(stream_map, cfg->apple_dart_cfg.n_levels);
++	if (s5l) {
++		for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
++			/* Only selected stream bytes: SID 0 expects 0x80, not
++			 * 0x80808080 (which would enable unowned streams).
++			 */
++			if (dart->hw->read_tcr(dart, sid) != 0x80) {
++				ret = -EIO;
++				goto fail;
++			}
++		}
++		if (dart->has_fetch_config)
++			writel(dart->fetch_config, dart->regs + DART_S5L8960X_FETCH_CONFIG);
++		if (dart->has_diag_config)
++			writel(dart->diag_config, dart->regs + DART_S5L8960X_DIAG_CONFIG);
++	}
++	ret = dart->hw->invalidate_tlb(stream_map);
++	if (ret)
++		goto fail;
++	if (s5l) {
++		for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
++			for (i = 0; i < dart->hw->ttbr_count; i++) {
++				expected = i < cfg->apple_dart_cfg.n_ttbrs ?
++					BIT(31) | (cfg->apple_dart_cfg.ttbr[i] >> 12) : 0;
++				actual = readl(dart->regs + DART_TTBR(dart, sid, i));
++				if (actual != expected || dart->hw->read_tcr(dart, sid) != 0x80) {
++					ret = -EIO;
++					goto fail;
++				}
++			}
++		}
++		dev_info(dart->dev, "DART checked reinit: TCR/TTBR readback and stream flush complete\n");
++	}
++	return 0;
++fail:
++	WRITE_ONCE(domain->flush_error, ret);
++	apple_dart_hw_disable_dma(stream_map);
++	dev_err(dart->dev, "DART reinit/flush failed %d; translation blocked\n", ret);
++	return ret;
++}
+ 
+-	apple_dart_hw_enable_translation(stream_map,
+-					 pgtbl_cfg->apple_dart_cfg.n_levels);
+-	stream_map->dart->hw->invalidate_tlb(stream_map);
++/* Called only by the j71t ANS driver with DMA stopped. Use the domain's
++ * actual TTBRs, never a global reset or the diagnostic mapping of the DART.
++ */
++int apple_ans_dart_set_active(struct device *dev, bool active)
++{
++	struct iommu_domain *domain = iommu_get_domain_for_dev(dev);
++	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
++	struct apple_dart_stream_map *map;
++	struct apple_dart_domain *d;
++	int i, ret;
++
++	if (!of_machine_is_compatible("apple,j71t") || !domain || !cfg ||
++	    !cfg->stream_maps[0].dart ||
++	    (domain->type != IOMMU_DOMAIN_DMA && domain->type != IOMMU_DOMAIN_DMA_FQ))
++		return -ENODEV;
++	d = to_dart_domain(domain);
++	for_each_stream_map(i, cfg, map) {
++		if (map->dart->hw->type != DART_S5L8960X)
++			return -EOPNOTSUPP;
++		if (!active) {
++			apple_dart_hw_disable_dma(map);
++			continue;
++		}
++		ret = apple_dart_setup_translation(d, map);
++		if (ret)
++			return ret;
++	}
++	if (active)
++		WRITE_ONCE(d->flush_error, 0);
++	dev_info(dev, "Apple ANS: DART force_active(%u) complete\n", active);
++	return 0;
+ }
++EXPORT_SYMBOL_GPL(apple_ans_dart_set_active);
+ 
+ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
+ 				      struct apple_dart_master_cfg *cfg)
+@@ -892,8 +994,11 @@ static int apple_dart_attach_dev_paging(struct iommu_domain *domain,
+ 	if (ret)
+ 		return ret;
+ 
+-	for_each_stream_map(i, cfg, stream_map)
+-		apple_dart_setup_translation(dart_domain, stream_map);
++	for_each_stream_map(i, cfg, stream_map) {
++		ret = apple_dart_setup_translation(dart_domain, stream_map);
++		if (ret)
++			return ret;
++	}
+ 	return 0;
+ }
+ 
+diff --git a/include/linux/apple-ans.h b/include/linux/apple-ans.h
+index 5679dd96ab..dfb2df2bb5 100644
+--- a/include/linux/apple-ans.h
++++ b/include/linux/apple-ans.h
+@@ -23,7 +23,26 @@ struct apple_ans_host_state {
+ #define APPLE_ANS_NVMMU_MAX_PAGES	256
+ #define APPLE_ANS_NVMMU_PAGE_SIZE	4096
+ 
++enum apple_ans_boot_mode {
++	APPLE_ANS_ROUND7,
++	APPLE_ANS_HANDOFF,
++	APPLE_ANS_FULL_CYCLE,
++};
++
++#if IS_REACHABLE(CONFIG_APPLE_DART)
++/* Stopped controller / bus mastering blocked; only this device's streams. */
++int apple_ans_dart_set_active(struct device *dev, bool active);
++#else
++static inline int apple_ans_dart_set_active(struct device *dev, bool active)
++{
++	return -EOPNOTSUPP;
++}
++#endif
++
+ #if IS_REACHABLE(CONFIG_PCIE_APPLE_H9P)
++enum apple_ans_boot_mode apple_ans_boot_mode(struct device *dev);
++int apple_ans_nvmmu_drain(struct device *dev);
++int apple_ans_restart_port(struct device *dev);
+ /*
+  * Map @npages 4K pages for FlatDMA slot @tag, or retire the slot when
+  * @npages is 0. @to_memory: the device writes host memory (NVMe Read).
+@@ -39,6 +58,21 @@ int apple_ans_host_state(struct device *dev, struct apple_ans_host_state *st);
+ void apple_ans_host_dump(struct device *dev, const char *when);
+ void apple_ans_dart_walk(struct device *dev, const char *what, u64 iova);
+ #else
++static inline enum apple_ans_boot_mode apple_ans_boot_mode(struct device *dev)
++{
++	return APPLE_ANS_ROUND7;
++}
++
++static inline int apple_ans_nvmmu_drain(struct device *dev)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline int apple_ans_restart_port(struct device *dev)
++{
++	return -EOPNOTSUPP;
++}
++
+ static inline int apple_ans_nvmmu_map(struct device *dev, unsigned int tag,
+ 				      const u64 *pages, unsigned int npages,
+ 				      bool to_memory, dma_addr_t *iova)
+-- 
+2.56.0
+

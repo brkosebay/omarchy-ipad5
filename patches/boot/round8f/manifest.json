@@ -1,0 +1,11 @@
+{
+  "base": "bfe22c60a0035c23d3ff711fa82e69b8e0b8db92",
+  "head": "7954324dfa200be83f40b099c3bc40a556e151af",
+  "branch": "a9/boot",
+  "incremental_after": "patches/boot/round8e",
+  "patches": {
+    "0001-PCI-apple-h9p-recover-stuck-A9-links-with-a-bounded-.patch": "e896daa729d14a29fbd868984e918003b5129de1c0b613d44729fc2bb6f6cf2b"
+  },
+  "device_access": false,
+  "hardware_tested": false
+}

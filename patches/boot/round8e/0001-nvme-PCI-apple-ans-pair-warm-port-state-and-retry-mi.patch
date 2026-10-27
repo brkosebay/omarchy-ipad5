@@ -1,0 +1,240 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 22:11:00 +0000
+Subject: [PATCH] nvme/PCI: apple-ans: pair warm port state and retry missing
+ boot links
+
+Round 8d chain boot 8 exhausts both port-0 link-up polls at status 0x4
+before enumeration, so the NVMe recovery worker never runs. Keep the
+SHST/CC-disable/RDY-zero certificate, retire translations in both trial
+modes and verify RC124/RC114/RC100 down before handoff. Incoming bring-up
+logs the inherited RC state.
+
+After the normal electrical attempts, retry a failed boot link exactly
+once from a verified off state with a 100 ms hold. A restored link
+proceeds through normal NVMMU/DART/controller initialization; exhaustion
+stays isolated for rescue. Existing one-shot controller recovery rearms
+translations in either trial mode and logs the failure code. Keep Round7,
+Wi-Fi, local-error policy and write guards.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ drivers/nvme/host/pci-apple-ans.c       |   9 +-
+ drivers/nvme/host/pci.c                 |   5 +-
+ drivers/pci/controller/pcie-apple-h9p.c | 117 ++++++++++++++++++++----
+ 3 files changed, 108 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/nvme/host/pci-apple-ans.c b/drivers/nvme/host/pci-apple-ans.c
+index 52017b244f..0cd84574b9 100644
+--- a/drivers/nvme/host/pci-apple-ans.c
++++ b/drivers/nvme/host/pci-apple-ans.c
+@@ -918,11 +918,10 @@ static void nvme_pci_apple_ans_shutdown(struct nvme_dev *dev, int shutdown_ret)
+ 	}
+ 	dev_info(dev->dev, "Apple ANS: STEP shutdown disabled CC=%#x CSTS=%#x BME=0 mode=%u\n",
+ 		 cc, csts, mode);
+-	if (mode == APPLE_ANS_FULL_CYCLE) {
+-		ret = apple_ans_dart_set_active(dev->dev, false);
+-		if (ret)
+-			panic("Apple ANS: DART inactive failed %d; refusing kexec", ret);
+-	}
++	/* Both trial modes hand off a fully down port for cold bring-up. */
++	ret = apple_ans_dart_set_active(dev->dev, false);
++	if (ret)
++		panic("Apple ANS: DART inactive failed %d; refusing kexec", ret);
+ }
+ 
+ static blk_status_t nvme_pci_apple_ans_alloc_req(struct nvme_dev *dev,
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 2135a43640..7965200647 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -3935,8 +3935,11 @@ static void nvme_reset_work(struct work_struct *work)
+  out_unlock:
+ 	mutex_unlock(&dev->shutdown_lock);
+  out:
+-	if (nvme_apple_ans_retry(dev))
++	if (nvme_apple_ans_retry(dev)) {
++		dev_warn(dev->dev, "Apple ANS: controller/admin/health bring-up failed %d; one full controller+port retry before namespace publication\n",
++			 result);
+ 		goto retry;
++	}
+ 	/*
+ 	 * Set state to deleting now to avoid blocking nvme_wait_reset(), which
+ 	 * may be holding this pci_dev's device lock.
+diff --git a/drivers/pci/controller/pcie-apple-h9p.c b/drivers/pci/controller/pcie-apple-h9p.c
+index 60f5deb6c7..adf44a100b 100644
+--- a/drivers/pci/controller/pcie-apple-h9p.c
++++ b/drivers/pci/controller/pcie-apple-h9p.c
+@@ -427,6 +427,7 @@ struct apple_h9p_pcie {
+ 
+ 	struct apple_h9p_nvmmu nvmmu;
+ 	enum apple_ans_boot_mode ans_mode;
++	bool ans_boot_retry_used;
+ 
+ 	struct device **pd_dev;
+ 	struct device_link **pd_link;
+@@ -2134,6 +2135,8 @@ static int apple_s8003_setup_port_full(struct apple_h9p_pcie *pcie,
+ static int apple_s8003_setup_port_once(struct apple_h9p_pcie *pcie,
+ 				       unsigned int port)
+ {
++	u32 ctl, pwr, reset;
++
+ 	if (port || pcie->ans_mode == APPLE_ANS_ROUND7)
+ 		return apple_s8003_setup_port_round7(pcie, port);
+ 	/* L0 proves link training, not ownership of inherited DMA state.
+@@ -2143,6 +2146,11 @@ static int apple_s8003_setup_port_once(struct apple_h9p_pcie *pcie,
+ 	 */
+ 	dev_info(pcie->dev, "Apple ANS: %s full port bring-up\n",
+ 		 ans_boot_modes[pcie->ans_mode]);
++	ctl = readl(pcie->base_rc + S8003_RC_PORT_CTL(0));
++	pwr = readl(pcie->base_rc + S8003_RC_PORT_PWR(0));
++	reset = readl(pcie->base_rc + S8003_RC_PORT_REFCLK(0));
++	dev_info(pcie->dev, "Apple ANS: incoming port 0 RC124=%#x RC114=%#x RC100=%#x; policy=full-down/full-bringup\n",
++		 reset, pwr, ctl);
+ 	return apple_s8003_setup_port_full(pcie, port);
+ }
+ 
+@@ -2160,12 +2168,11 @@ int apple_ans_restart_port(struct device *dev)
+ 		APPLE_ANS_FULL_CYCLE : APPLE_ANS_HANDOFF;
+ 	dev_warn(dev, "Apple ANS: one recovery using %s bring-up\n",
+ 		 ans_boot_modes[pcie->ans_mode]);
+-	if (pcie->ans_mode == APPLE_ANS_FULL_CYCLE) {
+-		ret = apple_ans_dart_set_active(dev, false);
+-		if (ret)
+-			return ret;
+-		pcie->nvmmu.active = false;
+-	}
++	/* Both trial modes cycle the port, so both must rearm translations. */
++	ret = apple_ans_dart_set_active(dev, false);
++	if (ret)
++		return ret;
++	pcie->nvmmu.active = false;
+ 	/* Both modes normalize the port before the next controller enable. */
+ 	ret = apple_s8003_setup_port_once(pcie, 0);
+ 	if (ret)
+@@ -2193,6 +2200,58 @@ static int apple_s8003_setup_port(struct apple_h9p_pcie *pcie, unsigned int port
+ 	return ret;
+ }
+ 
++/* Before enumeration there is no controller worker to recover a missing root.
++ * After the usual electrical attempts, allow one cold port-0 retry. Endpoint
++ * preinit then rebuilds DART/NVMMU and the controller/admin queues as usual.
++ * Never touch an endpoint BAR, a shared PMGR domain, or the Wi-Fi port here.
++ */
++static int apple_s8003_boot_retry(struct apple_h9p_pcie *pcie, int reason)
++{
++	void __iomem *rc = pcie->base_rc;
++	u32 ctl, pwr, reset;
++	int ret;
++
++	if (pcie->ans_boot_retry_used ||
++	    pcie->ans_mode == APPLE_ANS_ROUND7 ||
++	    (reason != -ETIMEDOUT && reason != -ENOLINK))
++		return reason;
++	pcie->ans_boot_retry_used = true;
++	dev_warn(pcie->dev, "Apple ANS: no root endpoint: port 0 bring-up failed %d; one full controller+port boot retry\n",
++		 reason);
++	ret = gpiod_direction_output(pcie->perst[0], 1);
++	if (ret)
++		return ret;
++	if ((readl(rc + S8003_RC_PORT_CTL(0)) & S8003_RC_PORT_CTL_ENABLE) &&
++	    (readl(rc + S8003_RC_PORT_PWR(0)) & S8003_RC_PORT_PWR_ON)) {
++		apple_s8003_port_stop(pcie, 0);
++		ret = apple_s8003_port_wait(pcie, 0,
++					    pcie->base_port[0] + H9P_PORT_LTSSMCTL,
++					    H9P_PORT_LTSSM_ENABLE, 0, 250000,
++					    "boot-retry-stop");
++		if (ret)
++			return ret;
++	}
++	apple_s8003_port_off(pcie, 0);
++	ctl = readl(rc + S8003_RC_PORT_CTL(0));
++	pwr = readl(rc + S8003_RC_PORT_PWR(0));
++	reset = readl(rc + S8003_RC_PORT_REFCLK(0));
++	if ((ctl | pwr | reset) & BIT(0))
++		return dev_err_probe(pcie->dev, -EIO,
++				     "STEP port 0 boot-retry-off FAIL ctl=%#x pwr=%#x reset=%#x\n",
++				     ctl, pwr, reset);
++	dev_info(pcie->dev, "Apple ANS: STEP port 0 boot-retry-off hold-100ms\n");
++	msleep(100);
++	ret = apple_s8003_setup_port_full(pcie, 0);
++	if (ret) {
++		gpiod_direction_output(pcie->perst[0], 1);
++		dev_err(pcie->dev, "Apple ANS: boot retry exhausted %d; no root endpoint, leaving rescue armed\n",
++			ret);
++	} else {
++		dev_info(pcie->dev, "Apple ANS: boot retry link restored; proceeding to controller/DMA bring-up\n");
++	}
++	return ret;
++}
++
+ /*
+  * iOS AppleS800xPCIePort::disableGated for a linked port: clear the root
+  * port's command register and bus numbers, so nothing more is routed to
+@@ -2292,6 +2351,8 @@ static int apple_h9p_setup_ports(struct apple_h9p_pcie *pcie)
+ 		 * never reach a dead link; the other ports carry on.
+ 		 */
+ 		ret = pcie->hw->setup_port(pcie, port);
++		if (ret && !port && pcie->ans_mode != APPLE_ANS_ROUND7)
++			ret = apple_s8003_boot_retry(pcie, ret);
+ 		if (ret) {
+ 			gpiod_direction_output(pcie->perst[port], 1);
+ 			pcie->enabled_ports &= ~BIT(port);
+@@ -3034,24 +3095,46 @@ static void apple_h9p_pcie_park(struct apple_h9p_pcie *pcie,
+ {
+ 	void __iomem *rc = pcie->base_rc;
+ 	void __iomem *cfg = pcie->base_config;
++	u32 ctl, pwr, reset;
++	int ret;
+ 
+ 	if (pcie->ans_mode != APPLE_ANS_ROUND7 && (ports & BIT(0))) {
+ 		cancel_delayed_work_sync(&pcie->late_work);
+ 		writew(0, cfg + PCI_COMMAND);
+ 		h9p_rmw(cfg + PCI_PRIMARY_BUS, GENMASK(23, 8), 0);
+-		if (pcie->ans_mode == APPLE_ANS_FULL_CYCLE) {
+-			/* Endpoint shutdown already set DART/NVMMU inactive. */
+-			pcie->nvmmu.active = false;
+-			gpiod_direction_output(pcie->perst[0], 1);
+-			apple_s8003_port_stop(pcie, 0);
+-			h9p_rmw(rc + S8003_RC_PORT_REFCLK(0),
+-				S8003_RC_PORT_REFCLK_ON, 0);
+-			udelay(S8003_PERST_TO_REFCLK_US);
+-			h9p_rmw(rc + S8003_RC_PORT_PWR(0), S8003_RC_PORT_PWR_ON, 0);
+-			h9p_rmw(rc + S8003_RC_PORT_CTL(0), S8003_RC_PORT_CTL_ENABLE, 0);
+-		}
+ 		dev_info(pcie->dev, "Apple ANS: kexec %s; CC.EN=0/RDY=0 certified by endpoint shutdown\n",
+ 			 ans_boot_modes[pcie->ans_mode]);
++		/* Endpoint shutdown retired DART after the 8d certificate. Pair
++		 * that stopped controller with a fully down port in BOTH modes.
++		 * RC 0x124/0x114/0x100 are reset/refclk/power; retain the legacy
++		 * register names, but certify all three bits before the jump.
++		 */
++		WRITE_ONCE(pcie->down_ports, pcie->down_ports | BIT(0));
++		ret = gpiod_direction_output(pcie->perst[0], 1);
++		if (ret)
++			panic("Apple ANS: outgoing PERST failed %d; refusing kexec", ret);
++		apple_s8003_port_stop(pcie, 0);
++		ret = apple_s8003_port_wait(pcie, 0,
++					    pcie->base_port[0] + H9P_PORT_LTSSMCTL,
++					    H9P_PORT_LTSSM_ENABLE, 0, 250000,
++					    "handoff-stop");
++		if (ret)
++			panic("Apple ANS: outgoing LTSSM stop failed %d; refusing kexec", ret);
++		if (pcie->nvmmu.ready) {
++			h9p_writel_flush(0, pcie->nvmmu.base + H9P_NVMMU_SART_CTRL);
++			pcie->nvmmu.ready = false;
++		}
++		pcie->nvmmu.active = false;
++		apple_s8003_port_off(pcie, 0);
++		ctl = readl(rc + S8003_RC_PORT_CTL(0));
++		pwr = readl(rc + S8003_RC_PORT_PWR(0));
++		reset = readl(rc + S8003_RC_PORT_REFCLK(0));
++		if ((ctl | pwr | reset) & BIT(0))
++			panic("Apple ANS: outgoing port 0 not down ctl=%#x pwr=%#x reset=%#x; refusing kexec",
++			      ctl, pwr, reset);
++		dev_info(pcie->dev, "Apple ANS: STEP port 0 handoff-down RC124=%#x RC114=%#x RC100=%#x PERST=asserted; incoming=full\n",
++			 reset, pwr, ctl);
++		pcie->enabled_ports &= ~BIT(0);
+ 		ports &= ~BIT(0);
+ 	}
+ 	/* Other ports keep the established Round 7 shutdown. */

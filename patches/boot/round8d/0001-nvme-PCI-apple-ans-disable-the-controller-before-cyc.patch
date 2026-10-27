@@ -1,0 +1,368 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 21:44:16 +0000
+Subject: [PATCH] nvme/PCI: apple-ans: disable the controller before cycling a
+ warm port
+
+Round 8c reaches root from cold tri32, but its first same-entry jump
+stops after the port tunables. The outgoing ANS retained CC.EN/RDY
+after SHST; tri32's outgoing path instead clears EN/SHN and waits for
+RDY=0. The raw capture cannot identify the firmware-internal stall or
+prove iBoot state.
+
+After certified SHST, clear EN/SHN through the guarded CC writer, wait
+at most two seconds for RDY=0, reject CFS and check CC readback before
+blocking BME or retiring DART. Refuse kexec on any failure. Both trial
+modes now hand a disabled controller to the incoming port sequence;
+Round7 remains a selectable control.
+
+Log STEP breadcrumbs before each full-port phase, including individual
+post-tunable IRQ/enable/MSI operations. Bound stop/off/PHY/link polls
+and report the failed step and last value without speculative timeout
+dumps. All returning bring-up failures drop the port and let early-USB
+rescue run. A software deadline cannot cancel an individual stalled
+MMIO transaction.
+
+Keep the slot ownership, local-error no-reset policy, checked
+DART/NVMMU rebuild and health-gate recovery limits from Round 8c.
+
+Validated with production C ASan/UBSan fixtures, a negative shutdown
+control against Round 8c, injected bring-up poll failures, and kernel
+object builds. No device access; hardware validation remains pending.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ drivers/nvme/host/pci-apple-ans.c       |  44 ++++++--
+ drivers/pci/controller/pcie-apple-h9p.c | 129 ++++++++++++++++++------
+ 2 files changed, 137 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/nvme/host/pci-apple-ans.c b/drivers/nvme/host/pci-apple-ans.c
+index f0a5236a7e..52017b244f 100644
+--- a/drivers/nvme/host/pci-apple-ans.c
++++ b/drivers/nvme/host/pci-apple-ans.c
+@@ -868,29 +868,61 @@ static void nvme_pci_apple_ans_shutdown_round7(struct nvme_dev *dev, int shutdow
+ static void nvme_pci_apple_ans_shutdown(struct nvme_dev *dev, int shutdown_ret)
+ {
+ 	enum apple_ans_boot_mode mode = apple_ans_boot_mode(dev->dev);
+-	u32 csts = ~0U;
+-	int ret;
++	u32 csts = ~0U, cc;
++	int ret, err = 0;
+ 
+ 	if (mode == APPLE_ANS_ROUND7) {
+ 		nvme_pci_apple_ans_shutdown_round7(dev, shutdown_ret);
+ 		return;
+ 	}
+ 	ret = nvme_pci_apple_ans_read_csts(dev, &csts);
+-	if (shutdown_ret || ret || (csts & NVME_CSTS_SHST_MASK) != NVME_CSTS_SHST_CMPLT) {
++	if (shutdown_ret || ret || (csts & NVME_CSTS_CFS) ||
++	    (csts & NVME_CSTS_SHST_MASK) != NVME_CSTS_SHST_CMPLT) {
++		pci_clear_master(to_pci_dev(dev->dev));
+ 		apple_ans_host_dump(dev->dev, "SHST failed; refusing kexec");
+ 		panic("Apple ANS: SHN failed %d/%d CSTS %#x; refusing unsafe handoff",
+ 		      shutdown_ret, ret, csts);
+ 	}
+-	/* SHN completion is the gate: leave CC.EN and all translation state.
+-	 * PCI core blocks BME later too. No endpoint MMIO after this point.
++
++	/* SHST completion is not a controller reset: EN/RDY can both stay 1.
++	 * The incoming full port sequence removes the link/refclk. Finish the
++	 * reset while the old link and DMA translations are still available,
++	 * before either mode is allowed to touch PERST or port power.
+ 	 */
++	dev_info(dev->dev, "Apple ANS: STEP shutdown SHST complete; clearing CC.EN/SHN\n");
++	dev->ctrl.ctrl_config &= ~(NVME_CC_ENABLE | NVME_CC_SHN_MASK);
++	ret = nvme_pci_apple_ans_write_cc(dev, dev->ctrl.ctrl_config);
++	if (!ret) {
++		dev_info(dev->dev, "Apple ANS: STEP shutdown wait-RDY=0 timeout_us=2000000\n");
++		ret = read_poll_timeout(nvme_pci_apple_ans_read_csts, err,
++					err || !(csts & NVME_CSTS_RDY), 1000,
++					2000000, false, dev, &csts);
++		if (!ret)
++			ret = err;
++	}
++	if (!ret && (csts & NVME_CSTS_CFS))
++		ret = -EIO;
++	if (!ret)
++		ret = nvme_pci_apple_ans_check_link(dev, "kexec CC readback");
++	if (!ret) {
++		cc = readl(dev->bar + NVME_REG_CC);
++		if (cc & (NVME_CC_ENABLE | NVME_CC_SHN_MASK))
++			ret = -EIO;
++	}
++	/* No endpoint MMIO after BME is blocked and translations can retire. */
+ 	pci_clear_master(to_pci_dev(dev->dev));
++	if (ret) {
++		apple_ans_host_dump(dev->dev, "CC disable failed; refusing kexec");
++		panic("Apple ANS: CC disable failed %d CSTS %#x; refusing unsafe port reset",
++		      ret, csts);
++	}
++	dev_info(dev->dev, "Apple ANS: STEP shutdown disabled CC=%#x CSTS=%#x BME=0 mode=%u\n",
++		 cc, csts, mode);
+ 	if (mode == APPLE_ANS_FULL_CYCLE) {
+ 		ret = apple_ans_dart_set_active(dev->dev, false);
+ 		if (ret)
+ 			panic("Apple ANS: DART inactive failed %d; refusing kexec", ret);
+ 	}
+-	dev_info(dev->dev, "Apple ANS: SHST complete; CC.EN retained mode %u\n", mode);
+ }
+ 
+ static blk_status_t nvme_pci_apple_ans_alloc_req(struct nvme_dev *dev,
+diff --git a/drivers/pci/controller/pcie-apple-h9p.c b/drivers/pci/controller/pcie-apple-h9p.c
+index fd9f13fc6f..60f5deb6c7 100644
+--- a/drivers/pci/controller/pcie-apple-h9p.c
++++ b/drivers/pci/controller/pcie-apple-h9p.c
+@@ -1708,24 +1708,35 @@ static int apple_s8003_port_power_on(struct apple_h9p_pcie *pcie,
+ 	u32 val;
+ 	int ret;
+ 
++	dev_info(pcie->dev, "Apple ANS: STEP port %u power-on-refclk-off\n", port);
+ 	h9p_rmw(rc + S8003_RC_PORT_REFCLK(port), S8003_RC_PORT_REFCLK_ON, 0);
+ 	/* An old kernel may have allowed CLKREQ# gating: force the clock on. */
++	dev_info(pcie->dev, "Apple ANS: STEP port %u power-on-request\n", port);
+ 	h9p_rmw(rc + S8003_RC_PORT_PWR(port), 0,
+ 		S8003_RC_PORT_PWR_ON | S8003_RC_PORT_REFCLK_NOGATE);
++	dev_info(pcie->dev, "Apple ANS: STEP port %u power-ready-wait-250ms\n", port);
+ 	ret = apple_h9p_wait(rc + S8003_RC_STAT, S8003_RC_STAT_PORT_READY,
+ 			     S8003_RC_STAT_PORT_READY,
+ 			     S8003_RC_STAT_PORT_READY, 250000);
+ 	if (ret)
+-		return ret;
++		return dev_err_probe(pcie->dev, ret, "STEP port %u power-ready FAIL\n", port);
++	dev_info(pcie->dev, "Apple ANS: STEP port %u power-settle-100us\n", port);
+ 	udelay(100);
++	dev_info(pcie->dev, "Apple ANS: STEP port %u port-enable\n", port);
+ 	h9p_rmw(rc + S8003_RC_PORT_CTL(port), 0, S8003_RC_PORT_CTL_ENABLE);
++	dev_info(pcie->dev, "Apple ANS: STEP port %u port-ready-wait-250ms\n", port);
+ 	ret = readl_poll_timeout(rc + S8003_RC_PORT_READY(port), val, val & 1,
+ 				 10, 250000);
+ 	if (ret)
+-		return ret;
++		return dev_err_probe(pcie->dev, ret, "STEP port %u port-ready FAIL last=%#x\n",
++				     port, val);
++	dev_info(pcie->dev, "Apple ANS: STEP port %u port-reset-release\n", port);
+ 	h9p_rmw(rc + S8003_RC_PORT_CTL(port), S8003_RC_PORT_CTL_BIT8, 0);
++	dev_info(pcie->dev, "Apple ANS: STEP port %u refclk-on\n", port);
+ 	h9p_rmw(rc + S8003_RC_PORT_REFCLK(port), 0, S8003_RC_PORT_REFCLK_ON);
++	dev_info(pcie->dev, "Apple ANS: STEP port %u refclk-flush\n", port);
+ 	readl(rc + S8003_RC_PORT_REFCLK(port));
++	dev_info(pcie->dev, "Apple ANS: STEP port %u refclk-settle-100us\n", port);
+ 	udelay(S8003_T_REFCLK_TO_PERST_US);
+ 	return 0;
+ }
+@@ -1921,6 +1932,30 @@ static int apple_s8003_setup_port_round7(struct apple_h9p_pcie *pcie,
+ 	return 0;
+ }
+ 
++/* A timeout cannot cancel a stalled bus transaction. Keep these accesses
++ * host-side, with the register block powered, and log before every phase.
++ * A returning failure drops the port; the early-USB initramfs reaches rescue.
++ */
++static int apple_s8003_port_wait(struct apple_h9p_pcie *pcie, unsigned int port,
++				 void __iomem *addr, u32 mask, u32 expected,
++				 unsigned int timeout_us, const char *step)
++{
++	u32 val;
++	int ret;
++
++	dev_info(pcie->dev, "Apple ANS: STEP port %u %s wait timeout_us=%u\n",
++		 port, step, timeout_us);
++	ret = readl_poll_timeout(addr, val, (val & mask) == expected,
++				 100, timeout_us);
++	if (ret)
++		dev_err(pcie->dev, "Apple ANS: STEP port %u %s FAIL %d last=%#x mask=%#x expected=%#x\n",
++			port, step, ret, val, mask, expected);
++	else
++		dev_info(pcie->dev, "Apple ANS: STEP port %u %s done last=%#x\n",
++			 port, step, val);
++	return ret;
++}
++
+ static int apple_s8003_setup_port_full(struct apple_h9p_pcie *pcie,
+ 				       unsigned int port)
+ {
+@@ -1942,6 +1977,7 @@ static int apple_s8003_setup_port_full(struct apple_h9p_pcie *pcie,
+ 	dev_info(dev, "port %u: bringing up link (Gen%u, lanes %#x)\n", port,
+ 		 speed, lanes);
+ 
++	dev_info(dev, "Apple ANS: STEP port %u perst-assert\n", port);
+ 	/* The endpoint stays in reset (PERST# was asserted at GPIO request) */
+ 	ret = gpiod_direction_output(pcie->perst[port], 1);
+ 	if (ret)
+@@ -1953,34 +1989,62 @@ static int apple_s8003_setup_port_full(struct apple_h9p_pcie *pcie,
+ 	 * rc+124 reset, 60us, rc+114 refclk, rc+100 power (not the legacy
+ 	 * helper's misleading CTL/PWR/REFCLK names).
+ 	 */
++	dev_info(dev, "Apple ANS: STEP port %u inherited-power-check\n", port);
+ 	if ((readl(rc + S8003_RC_PORT_CTL(port)) & S8003_RC_PORT_CTL_ENABLE) &&
+-	    (readl(rc + S8003_RC_PORT_PWR(port)) & S8003_RC_PORT_PWR_ON))
++	    (readl(rc + S8003_RC_PORT_PWR(port)) & S8003_RC_PORT_PWR_ON)) {
++		dev_info(dev, "Apple ANS: STEP port %u inherited-stop\n", port);
+ 		apple_s8003_port_stop(pcie, port);
++		ret = apple_s8003_port_wait(pcie, port, pb + H9P_PORT_LTSSMCTL,
++					    H9P_PORT_LTSSM_ENABLE, 0, 250000,
++					    "inherited-LTSSM-stop");
++		if (ret)
++			return ret;
++	}
++	dev_info(dev, "Apple ANS: STEP port %u refclk-off\n", port);
+ 	h9p_rmw(rc + S8003_RC_PORT_REFCLK(port), S8003_RC_PORT_REFCLK_ON, 0);
++	dev_info(dev, "Apple ANS: STEP port %u perst-to-refclk-delay-60us\n", port);
+ 	udelay(S8003_PERST_TO_REFCLK_US);
++	dev_info(dev, "Apple ANS: STEP port %u power-off\n", port);
+ 	h9p_rmw(rc + S8003_RC_PORT_PWR(port), S8003_RC_PORT_PWR_ON, 0);
++	dev_info(dev, "Apple ANS: STEP port %u port-disable\n", port);
+ 	h9p_rmw(rc + S8003_RC_PORT_CTL(port), S8003_RC_PORT_CTL_ENABLE, 0);
++	dev_info(dev, "Apple ANS: STEP port %u power-off-settle-10ms\n", port);
+ 	usleep_range(10000, 11000);
++	ret = apple_s8003_port_wait(pcie, port, rc + S8003_RC_PORT_CTL(port),
++				    S8003_RC_PORT_CTL_ENABLE, 0, 250000, "port-off");
++	if (ret)
++		return ret;
+ 	if (pcie->nvme_mode[port]) {
++		dev_info(dev, "Apple ANS: STEP port %u nvme-mode0\n", port);
+ 		writel(1, rc + S8003_RC_NVME_MODE0);
+ 		usleep_range(100, 200);
++		dev_info(dev, "Apple ANS: STEP port %u nvme-mode1\n", port);
+ 		h9p_writel_flush(1, rc + S8003_RC_NVME_MODE1);
+ 	}
+ 	ret = apple_s8003_port_power_on(pcie, port);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "port %u full-cycle power timeout\n", port);
++	dev_info(dev, "Apple ANS: STEP port %u powered-stop\n", port);
+ 	apple_s8003_port_stop(pcie, port);
++	ret = apple_s8003_port_wait(pcie, port, pb + H9P_PORT_LTSSMCTL,
++				    H9P_PORT_LTSSM_ENABLE, 0, 250000, "powered-LTSSM-stop");
++	if (ret)
++		return ret;
++	dev_info(dev, "Apple ANS: STEP port %u link-counters\n", port);
+ 	writel(3, rc + S8003_RC_PORT_LSCNT(port));
++	dev_info(dev, "Apple ANS: STEP port %u link-pmgr-ack\n", port);
+ 	val = readl(pb + S8003_PORT_LINKPMGRSTS);
+ 	if (val)
+ 		writel(val, pb + S8003_PORT_LINKPMGRSTS);
+ 
++	dev_info(dev, "Apple ANS: STEP port %u root-capability-scan-max48\n", port);
+ 	cap = apple_h9p_read_pci_cap(pcie, port << 3, PCI_CAP_ID_EXP);
+ 	if (!cap)
+ 		return dev_err_probe(dev, -ENODEV,
+ 				     "port %u root port has no PCIe capability\n",
+ 				     port);
+ 	/* Clamp to LNKCAP2 like iOS setMaximumLinkSpeed */
++	dev_info(dev, "Apple ANS: STEP port %u link-speed-config\n", port);
+ 	lnkcap2_speeds = (readl(pcie->base_config + port * H9P_CFG_PORT_STRIDE +
+ 				cap + PCI_EXP_LNKCAP2) >> 1) & 0x7f;
+ 	while (speed > H9P_LINK_SPEED_2_5GT &&
+@@ -1999,6 +2063,7 @@ static int apple_s8003_setup_port_full(struct apple_h9p_pcie *pcie,
+ 		 speed);
+ 
+ 	/* iOS: pcie-rc-tunables (root port config), apcie-config-tunables */
++	dev_info(dev, "Apple ANS: STEP port %u root-tunables\n", port);
+ 	ret = apple_h9p_apply_tunables(pcie, pcie->port_nodes[port],
+ 				       "apple,tunable-rc",
+ 				       pcie->base_config +
+@@ -2006,57 +2071,61 @@ static int apple_s8003_setup_port_full(struct apple_h9p_pcie *pcie,
+ 				       H9P_CFG_SIZE, "root port");
+ 	if (ret)
+ 		return ret;
++	dev_info(dev, "Apple ANS: STEP port %u port-tunables\n", port);
+ 	ret = apple_h9p_apply_tunables(pcie, pcie->port_nodes[port],
+ 				       "apple,tunable-config", pb,
+ 				       H9P_PORT_SIZE, "port");
+ 	if (ret)
+ 		return ret;
+ 
++	dev_info(dev, "Apple ANS: STEP port %u irq-mask\n", port);
+ 	writel(H9P_PORT_IRQMASK_PRE_LINK, pb + H9P_PORT_IRQMASK);
++	dev_info(dev, "Apple ANS: STEP port %u irq-ack\n", port);
+ 	writel(H9P_PORT_IRQSTAT_PRE_LINK, pb + H9P_PORT_IRQSTAT);
++	dev_info(dev, "Apple ANS: STEP port %u apple-port-enable\n", port);
+ 	h9p_rmw(pb + H9P_PORT_ENABLE, 0, H9P_PORT_ENABLE_APPLE);
++	dev_info(dev, "Apple ANS: STEP port %u msi-control\n", port);
+ 	writel(1 | ilog2(H9P_MSI_PER_PORT) << 4, pb + S8003_PORT_MSICTL);
++	dev_info(dev, "Apple ANS: STEP port %u msi-vector-base\n", port);
+ 	writel(port * 0x10001 * H9P_MSI_PER_PORT, pb + H9P_PORT_MSIVECBASE);
+ 
+ 	/* Clock is stable and reset is held even when GPIO ownership survived. */
++	dev_info(dev, "Apple ANS: STEP port %u perst-hold-100ms\n", port);
+ 	msleep(S8003_PORT_RESET_MS);
++	dev_info(dev, "Apple ANS: STEP port %u perst-release\n", port);
+ 	ret = gpiod_direction_output(pcie->perst[port], 0);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret,
+ 				     "failed to deassert port %u PERST#\n", port);
+ 
+-	ret = apple_h9p_wait(pcie->base_phy + H9P_PHY_PORTMASK, lanes, lanes,
+-			     lanes, 250000);
++	ret = apple_s8003_port_wait(pcie, port, pcie->base_phy + H9P_PHY_PORTMASK,
++				    lanes, lanes, 250000, "phy-lanes-ready");
+ 	if (ret)
+-		return dev_err_probe(dev, ret,
+-				     "port %u PHY lanes %#x not ready (%#x)\n",
+-				     port, lanes,
+-				     readl(pcie->base_phy + H9P_PHY_PORTMASK));
++		return ret;
+ 
++	dev_info(dev, "Apple ANS: STEP port %u phy-ip-init\n", port);
+ 	apple_s8003_phy_ip_init(pcie, port, lanes, speed);
+ 
++	dev_info(dev, "Apple ANS: STEP port %u link-irq-mask\n", port);
+ 	writel(H9P_PORT_IRQMASK_LINK_UP, pb + H9P_PORT_IRQMASK);
++	dev_info(dev, "Apple ANS: STEP port %u ltssm-start\n", port);
+ 	h9p_rmw(pb + H9P_PORT_LTSSMCTL, 0, H9P_PORT_LTSSM_ENABLE);
+ 
+-	ret = readl_poll_timeout(pb + S8003_PORT_LINKSTS, val,
+-				 val & S8003_PORT_LINKSTS_UP, 1000, 500000);
+-	val = FIELD_GET(S8003_PORT_LINKCDMSTS_LTSSM,
+-			readl(pb + S8003_PORT_LINKCDMSTS));
+-	if (ret) {
+-		apple_s8003_port_dump(pcie, port, "training timeout");
+-		return dev_err_probe(dev, ret,
+-				     "port %u link did not come up (LTSSM %#x)\n",
+-				     port, val);
+-	}
+-
+-	/* Link-up is reported during the Gen2 recovery; let it settle in L0 */
+-	ret = readl_poll_timeout(pb + S8003_PORT_LINKCDMSTS, val,
+-				 FIELD_GET(S8003_PORT_LINKCDMSTS_LTSSM, val) ==
+-				 S8003_LTSSM_L0, 100, 100000);
+-	if (ret || !(readl(pb + S8003_PORT_LINKSTS) & S8003_PORT_LINKSTS_UP)) {
+-		apple_s8003_port_dump(pcie, port, "L0 timeout");
+-		return -ETIMEDOUT;
+-	}
++	ret = apple_s8003_port_wait(pcie, port, pb + S8003_PORT_LINKSTS,
++				    S8003_PORT_LINKSTS_UP, S8003_PORT_LINKSTS_UP,
++				    500000, "link-up");
++	if (ret)
++		return ret;
++	ret = apple_s8003_port_wait(pcie, port, pb + S8003_PORT_LINKCDMSTS,
++				    S8003_PORT_LINKCDMSTS_LTSSM,
++				    S8003_LTSSM_L0 << 9, 100000, "link-L0");
++	if (ret)
++		return ret;
++	dev_info(dev, "Apple ANS: STEP port %u link-up-confirm\n", port);
++	if (!(readl(pb + S8003_PORT_LINKSTS) & S8003_PORT_LINKSTS_UP))
++		return dev_err_probe(dev, -ENOLINK, "STEP port %u link lost after L0\n", port);
++	val = readl(pb + S8003_PORT_LINKCDMSTS);
++	dev_info(dev, "Apple ANS: STEP port %u full-bringup-done\n", port);
+ 	dev_info(dev, "port %u: link up (LTSSM %#lx)\n", port,
+ 		 FIELD_GET(S8003_PORT_LINKCDMSTS_LTSSM, val));
+ 	return 0;
+@@ -2070,7 +2139,7 @@ static int apple_s8003_setup_port_once(struct apple_h9p_pcie *pcie,
+ 	/* L0 proves link training, not ownership of inherited DMA state.
+ 	 * Normalize same-entry jumps just like the successful cold entry:
+ 	 * PERST and full port bring-up before installing new translations.
+-	 * The outgoing drain/SHST/BME contract remains mandatory.
++	 * The outgoing drain/SHST/CC-disable/BME contract is mandatory.
+ 	 */
+ 	dev_info(pcie->dev, "Apple ANS: %s full port bring-up\n",
+ 		 ans_boot_modes[pcie->ans_mode]);
+@@ -2981,7 +3050,7 @@ static void apple_h9p_pcie_park(struct apple_h9p_pcie *pcie,
+ 			h9p_rmw(rc + S8003_RC_PORT_PWR(0), S8003_RC_PORT_PWR_ON, 0);
+ 			h9p_rmw(rc + S8003_RC_PORT_CTL(0), S8003_RC_PORT_CTL_ENABLE, 0);
+ 		}
+-		dev_info(pcie->dev, "Apple ANS: kexec %s; CC.EN/SHST retained\n",
++		dev_info(pcie->dev, "Apple ANS: kexec %s; CC.EN=0/RDY=0 certified by endpoint shutdown\n",
+ 			 ans_boot_modes[pcie->ans_mode]);
+ 		ports &= ~BIT(0);
+ 	}

@@ -1,0 +1,55 @@
+From 1ab2c6c1990b21a9802391fed64372abc131c5fb Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 14:01:16 +0000
+Subject: [PATCH 3/5] dt-bindings: gpio: apple-d2365: describe the opt-in hall
+ event IRQs
+
+The iPad 5 Smart Cover halls are D2365 GPIO lines 0 and 10. iOS takes
+them as PMIC events 0x30 and 0x3a through the PMIC interrupt output on
+AP GPIO 76, which is what lets the cover wake the system. Add a boolean
+that opts a board into serving those two events, and let the reserved
+ranges describe up to twelve pairs: the J71t already reserves three.
+DTs without the property keep plain GPIO operation and the driver never
+reaches the event registers.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ .../bindings/gpio/apple,d2365-pmic-gpio.yaml      | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/gpio/apple,d2365-pmic-gpio.yaml b/Documentation/devicetree/bindings/gpio/apple,d2365-pmic-gpio.yaml
+index d45829d0fa..93b320d18d 100644
+--- a/Documentation/devicetree/bindings/gpio/apple,d2365-pmic-gpio.yaml
++++ b/Documentation/devicetree/bindings/gpio/apple,d2365-pmic-gpio.yaml
+@@ -10,7 +10,7 @@ maintainers:
+   - Paul Praschl <maintainer@example.invalid>
+ 
+ description: |
+-  The Dialog D2365 PMIC used in Apple A10 devices provides 24 GPIOs. The
++  The Dialog D2365 PMIC used in Apple A9/A10 devices provides 24 GPIOs. The
+   controller is accessed through the regmap exported by the parent Apple I2C
+   PMIC device.
+ 
+@@ -24,7 +24,18 @@ properties:
+     const: 2
+ 
+   gpio-reserved-ranges:
+-    maxItems: 2
++    minItems: 1
++    maxItems: 12
++
++  apple,enable-hall-irqs:
++    type: boolean
++    description: |
++      Serve the GPIO events of lines 0 and 10 (PMIC events 0x30 and 0x3a,
++      the iPad 5 Smart Cover hall sensors) through the interrupt domain of
++      the parent PMIC, which must then describe its AP interrupt and be an
++      interrupt controller. The line function and edge configuration left by
++      the boot firmware are used as they are. Without this property the
++      driver never reads the event or writes the interrupt mask registers.
+ 
+ required:
+   - compatible
+-- 
+2.56.0
+

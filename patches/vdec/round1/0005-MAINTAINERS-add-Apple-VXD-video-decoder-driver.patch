@@ -1,0 +1,37 @@
+From a9eba48f72061585e470700743b7d203bf0ec355 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 17:17:08 +0000
+Subject: [PATCH 5/5] MAINTAINERS: add Apple VXD video decoder driver
+
+Track the apple,s8000-vxd binding and the drivers/media/platform/apple
+tree.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ MAINTAINERS | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 7cb94e3bd9..c33e0584c9 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -2707,6 +2707,16 @@ F:	include/linux/mfd/macsmc.h
+ F:	include/linux/soc/apple/*
+ F:	include/uapi/drm/asahi_drm.h
+ 
++ARM/APPLE VXD VIDEO DECODER DRIVER
++M:	Berkay Kosebay <maintainer@example.invalid>
++L:	maintainer@example.invalid
++S:	Maintained
++F:	Documentation/devicetree/bindings/media/apple,s8000-vxd.yaml
++F:	drivers/media/platform/apple/
++
++ARM/ARTPEC MACHINE SUPPORT
++M:	Jesper Nilsson <maintainer@example.invalid>
++M:	Lars Persson <maintainer@example.invalid>
+ ARM/ARTPEC MACHINE SUPPORT
+ M:	Jesper Nilsson <maintainer@example.invalid>
+ M:	Lars Persson <maintainer@example.invalid>
+-- 
+2.56.0
+

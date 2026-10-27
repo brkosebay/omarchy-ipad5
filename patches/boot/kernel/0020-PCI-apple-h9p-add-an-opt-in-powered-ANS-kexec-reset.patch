@@ -1,0 +1,246 @@
+From a412bc8f04aeb9ac04796064d127db59811510fc Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sun, 25 Oct 2026 00:28:54 +0000
+Subject: [PATCH] PCI: apple-h9p: add an opt-in powered ANS kexec reset
+
+The r46c capture fails port-0 training before NVMe enumeration. Nine
+training attempts, including the Gen1 deep ladder, leave the link down
+in POLL_COMPLIANCE. The outgoing CC=0/RDY=0 and port-down certificates
+match the incoming state. The later generic speed-retrain warning is
+Wi-Fi and is also present on successful warm and cold boots.
+
+Offer a supervised alternative to removing ANS port power/refclk during
+kexec: ans_keep_power=1 in handoff mode keeps them on under PERST after
+the existing drain/SHST/CC-disable/BME/DART/LTSSM/SART teardown. Require
+powered/ready/nogate/PERST readbacks before allowing the jump.
+
+A matching warm incoming boot holds reset for 100 ms and replays the
+normal per-port/PHY/MSI setup without another clock/power edge. It still
+requires fresh link training and rebuilds controller/DMA state. Cold
+boots, partial retained state, and link-training failure use the full
+sequence and its existing finite recovery ladder. Wi-Fi and shared
+PMGR/DART domains are not reset. Default the option off; the physical
+cause of the intermittent failure and this remedy need hardware testing.
+
+Validated by ARM64 object build, 23 existing handoff tests, two missing-ANS
+routing tests, and two new powered-reset/fallback/certificate MMIO tests
+under ASan/UBSan. Both new tests fail on the parent at the power-retention
+assertions. No device access.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ drivers/pci/controller/pcie-apple-h9p.c | 148 +++++++++++++++++-------
+ 1 file changed, 106 insertions(+), 42 deletions(-)
+
+diff --git a/drivers/pci/controller/pcie-apple-h9p.c b/drivers/pci/controller/pcie-apple-h9p.c
+index 3a60a3ac3c..b5b683e472 100644
+--- a/drivers/pci/controller/pcie-apple-h9p.c
++++ b/drivers/pci/controller/pcie-apple-h9p.c
+@@ -363,6 +363,12 @@ static const struct kernel_param_ops ans_boot_mode_ops = {
+ module_param_cb(ans_boot_mode, &ans_boot_mode_ops, &ans_boot_mode, 0444);
+ MODULE_PARM_DESC(ans_boot_mode, "j71t ANS warm boot: handoff (trial default), full-cycle, round7");
+ 
++/* Supervised alternative to clock removal; full-cycle remains the control. */
++static bool ans_keep_power;
++module_param(ans_keep_power, bool, 0444);
++MODULE_PARM_DESC(ans_keep_power,
++		 "j71t handoff: retain port 0 power/refclk under PERST across kexec (default false)");
++
+ struct apple_h9p_nvmmu {
+ 	struct apple_h9p_pcie *pcie;
+ 	void __iomem *base;
+@@ -2097,8 +2103,8 @@ static int apple_s8003_link_finish(struct apple_h9p_pcie *pcie,
+ 	return 0;
+ }
+ 
+-static int apple_s8003_setup_port_full(struct apple_h9p_pcie *pcie,
+-				       unsigned int port)
++static int apple_s8003_setup_port_reset(struct apple_h9p_pcie *pcie,
++					unsigned int port, bool keep_power)
+ {
+ 	void __iomem *rc = pcie->base_rc;
+ 	void __iomem *pb = pcie->base_port[port];
+@@ -2142,30 +2148,41 @@ static int apple_s8003_setup_port_full(struct apple_h9p_pcie *pcie,
+ 		if (ret)
+ 			return ret;
+ 	}
+-	dev_info(dev, "Apple ANS: STEP port %u refclk-off\n", port);
+-	h9p_rmw(rc + S8003_RC_PORT_REFCLK(port), S8003_RC_PORT_REFCLK_ON, 0);
+-	dev_info(dev, "Apple ANS: STEP port %u perst-to-refclk-delay-60us\n", port);
+-	udelay(S8003_PERST_TO_REFCLK_US);
+-	dev_info(dev, "Apple ANS: STEP port %u power-off\n", port);
+-	h9p_rmw(rc + S8003_RC_PORT_PWR(port), S8003_RC_PORT_PWR_ON, 0);
+-	dev_info(dev, "Apple ANS: STEP port %u port-disable\n", port);
+-	h9p_rmw(rc + S8003_RC_PORT_CTL(port), S8003_RC_PORT_CTL_ENABLE, 0);
+-	dev_info(dev, "Apple ANS: STEP port %u power-off-settle-10ms\n", port);
+-	usleep_range(10000, 11000);
+-	ret = apple_s8003_port_wait(pcie, port, rc + S8003_RC_PORT_CTL(port),
+-				    S8003_RC_PORT_CTL_ENABLE, 0, 250000, "port-off");
+-	if (ret)
+-		return ret;
+-	if (pcie->nvme_mode[port]) {
+-		dev_info(dev, "Apple ANS: STEP port %u nvme-mode0\n", port);
+-		writel(1, rc + S8003_RC_NVME_MODE0);
+-		usleep_range(100, 200);
+-		dev_info(dev, "Apple ANS: STEP port %u nvme-mode1\n", port);
+-		h9p_writel_flush(1, rc + S8003_RC_NVME_MODE1);
++	if (keep_power) {
++		/* PERST and the stopped LTSSM isolate the endpoint. Keep the
++		 * already stable clock instead of making another off/on edge.
++		 * Controller queues and DMA translations are rebuilt as usual.
++		 */
++		dev_info(dev, "Apple ANS: STEP port 0 reset with power/refclk retained\n");
++		h9p_rmw(rc + S8003_RC_PORT_PWR(port), 0,
++			S8003_RC_PORT_REFCLK_NOGATE);
++		readl(rc + S8003_RC_PORT_PWR(port));
++	} else {
++		dev_info(dev, "Apple ANS: STEP port %u refclk-off\n", port);
++		h9p_rmw(rc + S8003_RC_PORT_REFCLK(port), S8003_RC_PORT_REFCLK_ON, 0);
++		dev_info(dev, "Apple ANS: STEP port %u perst-to-refclk-delay-60us\n", port);
++		udelay(S8003_PERST_TO_REFCLK_US);
++		dev_info(dev, "Apple ANS: STEP port %u power-off\n", port);
++		h9p_rmw(rc + S8003_RC_PORT_PWR(port), S8003_RC_PORT_PWR_ON, 0);
++		dev_info(dev, "Apple ANS: STEP port %u port-disable\n", port);
++		h9p_rmw(rc + S8003_RC_PORT_CTL(port), S8003_RC_PORT_CTL_ENABLE, 0);
++		dev_info(dev, "Apple ANS: STEP port %u power-off-settle-10ms\n", port);
++		usleep_range(10000, 11000);
++		ret = apple_s8003_port_wait(pcie, port, rc + S8003_RC_PORT_CTL(port),
++					    S8003_RC_PORT_CTL_ENABLE, 0, 250000, "port-off");
++		if (ret)
++			return ret;
++		if (pcie->nvme_mode[port]) {
++			dev_info(dev, "Apple ANS: STEP port %u nvme-mode0\n", port);
++			writel(1, rc + S8003_RC_NVME_MODE0);
++			usleep_range(100, 200);
++			dev_info(dev, "Apple ANS: STEP port %u nvme-mode1\n", port);
++			h9p_writel_flush(1, rc + S8003_RC_NVME_MODE1);
++		}
++		ret = apple_s8003_port_power_on(pcie, port);
++		if (ret)
++			return dev_err_probe(dev, ret, "port %u full-cycle power timeout\n", port);
+ 	}
+-	ret = apple_s8003_port_power_on(pcie, port);
+-	if (ret)
+-		return dev_err_probe(dev, ret, "port %u full-cycle power timeout\n", port);
+ 	dev_info(dev, "Apple ANS: STEP port %u powered-stop\n", port);
+ 	apple_s8003_port_stop(pcie, port);
+ 	ret = apple_s8003_port_wait(pcie, port, pb + H9P_PORT_LTSSMCTL,
+@@ -2269,6 +2286,13 @@ static int apple_s8003_setup_port_full(struct apple_h9p_pcie *pcie,
+ 	return apple_s8003_link_finish(pcie, port, 500000);
+ }
+ 
++/* Recovery and cold boots always retain the complete off/on sequence. */
++static int apple_s8003_setup_port_full(struct apple_h9p_pcie *pcie,
++				       unsigned int port)
++{
++	return apple_s8003_setup_port_reset(pcie, port, false);
++}
++
+ static int apple_s8003_setup_port_once(struct apple_h9p_pcie *pcie,
+ 				       unsigned int port)
+ {
+@@ -2277,8 +2301,7 @@ static int apple_s8003_setup_port_once(struct apple_h9p_pcie *pcie,
+ 	if (port || pcie->ans_mode == APPLE_ANS_ROUND7)
+ 		return apple_s8003_setup_port_round7(pcie, port);
+ 	/* L0 proves link training, not ownership of inherited DMA state.
+-	 * Normalize same-entry jumps just like the successful cold entry:
+-	 * PERST and full port bring-up before installing new translations.
++	 * Both paths assert PERST before installing new translations.
+ 	 * The outgoing drain/SHST/CC-disable/BME contract is mandatory.
+ 	 */
+ 	dev_info(pcie->dev, "Apple ANS: %s full port bring-up\n",
+@@ -2286,8 +2309,32 @@ static int apple_s8003_setup_port_once(struct apple_h9p_pcie *pcie,
+ 	ctl = readl(pcie->base_rc + S8003_RC_PORT_CTL(0));
+ 	pwr = readl(pcie->base_rc + S8003_RC_PORT_PWR(0));
+ 	reset = readl(pcie->base_rc + S8003_RC_PORT_REFCLK(0));
+-	dev_info(pcie->dev, "Apple ANS: incoming port 0 RC124=%#x RC114=%#x RC100=%#x; policy=full-down/full-bringup\n",
+-		 reset, pwr, ctl);
++	dev_info(pcie->dev, "Apple ANS: incoming port 0 RC124=%#x RC114=%#x RC100=%#x; policy=%s\n",
++		 reset, pwr, ctl, ans_keep_power && pcie->ans_mode == APPLE_ANS_HANDOFF ?
++		 "powered-reset-trial/full-fallback" : "full-down/full-bringup");
++	/* Accept only the opt-in, powered, reset-held warm handoff. A cold
++	 * boot, old outgoing kernel, or incomplete certificate uses full reset.
++	 * No live-link/old-queue shortcut: setup still holds PERST for 100 ms,
++	 * replays port/PHY/MSI setup and requires fresh UP/L0 before enumeration.
++	 */
++	if (ans_keep_power && pcie->ans_mode == APPLE_ANS_HANDOFF &&
++	    of_property_read_bool(of_chosen, "linux,booted-from-kexec") &&
++	    (ctl & S8003_RC_PORT_CTL_ENABLE) &&
++	    !(ctl & S8003_RC_PORT_CTL_BIT8) &&
++	    (pwr & S8003_RC_PORT_PWR_ON) &&
++	    (pwr & S8003_RC_PORT_REFCLK_NOGATE) &&
++	    (reset & S8003_RC_PORT_REFCLK_ON) &&
++	    (readl(pcie->base_rc + S8003_RC_PORT_READY(0)) & BIT(0)) &&
++	    gpiod_get_value_cansleep(pcie->perst[0]) == 1) {
++		int ret;
++
++		ret = apple_s8003_setup_port_reset(pcie, port, true);
++		if (!ret || (ret != -ETIMEDOUT && ret != -ENOLINK))
++			return ret;
++		dev_warn(pcie->dev,
++			 "Apple ANS: powered reset failed %d; falling back to full port cycle\n",
++			 ret);
++	}
+ 	return apple_s8003_setup_port_full(pcie, port);
+ }
+ 
+@@ -3569,10 +3616,9 @@ static void apple_h9p_pcie_park(struct apple_h9p_pcie *pcie,
+ 		h9p_rmw(cfg + PCI_PRIMARY_BUS, GENMASK(23, 8), 0);
+ 		dev_info(pcie->dev, "Apple ANS: kexec %s; CC.EN=0/RDY=0 certified by endpoint shutdown\n",
+ 			 ans_boot_modes[pcie->ans_mode]);
+-		/* Endpoint shutdown retired DART after the 8d certificate. Pair
+-		 * that stopped controller with a fully down port in BOTH modes.
+-		 * RC 0x124/0x114/0x100 are reset/refclk/power; retain the legacy
+-		 * register names, but certify all three bits before the jump.
++		/* Endpoint shutdown retired DART after the CC-disable certificate.
++		 * Both policies isolate with PERST/LTSSM before retiring SART.
++		 * The opt-in handoff keeps only host power/refclk, never queues.
+ 		 */
+ 		WRITE_ONCE(pcie->down_ports, pcie->down_ports | BIT(0));
+ 		ret = gpiod_direction_output(pcie->perst[0], 1);
+@@ -3590,15 +3636,33 @@ static void apple_h9p_pcie_park(struct apple_h9p_pcie *pcie,
+ 			pcie->nvmmu.ready = false;
+ 		}
+ 		pcie->nvmmu.active = false;
+-		apple_s8003_port_off(pcie, 0);
+-		ctl = readl(rc + S8003_RC_PORT_CTL(0));
+-		pwr = readl(rc + S8003_RC_PORT_PWR(0));
+-		reset = readl(rc + S8003_RC_PORT_REFCLK(0));
+-		if ((ctl | pwr | reset) & BIT(0))
+-			panic("Apple ANS: outgoing port 0 not down ctl=%#x pwr=%#x reset=%#x; refusing kexec",
+-			      ctl, pwr, reset);
+-		dev_info(pcie->dev, "Apple ANS: STEP port 0 handoff-down RC124=%#x RC114=%#x RC100=%#x PERST=asserted; incoming=full\n",
+-			 reset, pwr, ctl);
++		if (ans_keep_power && pcie->ans_mode == APPLE_ANS_HANDOFF) {
++			h9p_rmw(rc + S8003_RC_PORT_PWR(0), 0,
++				S8003_RC_PORT_REFCLK_NOGATE);
++			ctl = readl(rc + S8003_RC_PORT_CTL(0));
++			pwr = readl(rc + S8003_RC_PORT_PWR(0));
++			reset = readl(rc + S8003_RC_PORT_REFCLK(0));
++			if (!(ctl & S8003_RC_PORT_CTL_ENABLE) ||
++			    (ctl & S8003_RC_PORT_CTL_BIT8) ||
++			    !(pwr & S8003_RC_PORT_PWR_ON) ||
++			    !(pwr & S8003_RC_PORT_REFCLK_NOGATE) ||
++			    !(reset & S8003_RC_PORT_REFCLK_ON) ||
++			    !(readl(rc + S8003_RC_PORT_READY(0)) & BIT(0)) ||
++			    gpiod_get_value_cansleep(pcie->perst[0]) != 1)
++				panic("Apple ANS: outgoing powered port certificate failed; refusing kexec");
++			dev_info(pcie->dev, "Apple ANS: STEP port 0 handoff-powered RC124=%#x RC114=%#x RC100=%#x PERST=asserted; incoming=powered-reset\n",
++				 reset, pwr, ctl);
++		} else {
++			apple_s8003_port_off(pcie, 0);
++			ctl = readl(rc + S8003_RC_PORT_CTL(0));
++			pwr = readl(rc + S8003_RC_PORT_PWR(0));
++			reset = readl(rc + S8003_RC_PORT_REFCLK(0));
++			if ((ctl | pwr | reset) & BIT(0))
++				panic("Apple ANS: outgoing port 0 not down ctl=%#x pwr=%#x reset=%#x; refusing kexec",
++				      ctl, pwr, reset);
++			dev_info(pcie->dev, "Apple ANS: STEP port 0 handoff-down RC124=%#x RC114=%#x RC100=%#x PERST=asserted; incoming=full\n",
++				 reset, pwr, ctl);
++		}
+ 		pcie->enabled_ports &= ~BIT(0);
+ 		ports &= ~BIT(0);
+ 	}
+-- 
+2.56.0
+

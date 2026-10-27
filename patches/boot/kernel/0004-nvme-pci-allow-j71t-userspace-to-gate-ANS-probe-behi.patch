@@ -1,0 +1,85 @@
+From f645a3c0ae7c342f6e3bbeb2d428ad31511ebe69 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 00:31:41 +0000
+Subject: [PATCH 4/4] nvme-pci: allow j71t userspace to gate ANS probe behind
+ early USB
+
+---
+ drivers/nvme/host/Kconfig         | 10 ++++++++++
+ drivers/nvme/host/pci-apple-ans.c | 11 +++++++++++
+ drivers/nvme/host/pci-internal.h  |  1 +
+ drivers/nvme/host/pci.c           |  4 ++++
+ 4 files changed, 26 insertions(+)
+
+diff --git a/drivers/nvme/host/Kconfig b/drivers/nvme/host/Kconfig
+index 85be74a909..7846bc7a61 100644
+--- a/drivers/nvme/host/Kconfig
++++ b/drivers/nvme/host/Kconfig
+@@ -14,6 +14,16 @@ config BLK_DEV_NVME
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called nvme.
+ 
++config NVME_APPLE_ANS_EARLY_USB
++	bool "Defer j71t PCI ANS probe until early USB userspace is ready"
++	depends on BLK_DEV_NVME && PCIE_APPLE_H9P
++	help
++	  Default nvme.apple_ans_probe to false on j71t. The boot initramfs
++	  must bring up USB logging/rescue access, set the parameter to true
++	  and write the endpoint BDF to /sys/bus/pci/drivers_probe. This keeps
++	  a fabric stall in ANS enable from hiding the failure before /init.
++	  Other boards are unchanged. Requires the linux-a9 boot initramfs.
++
+ config NVME_PCI_READ_ONLY
+ 	bool "Refuse writes to NVMe PCI devices"
+ 	depends on BLK_DEV_NVME
+diff --git a/drivers/nvme/host/pci-apple-ans.c b/drivers/nvme/host/pci-apple-ans.c
+index ebfbc17a00..0c0d30433e 100644
+--- a/drivers/nvme/host/pci-apple-ans.c
++++ b/drivers/nvme/host/pci-apple-ans.c
+@@ -82,6 +82,17 @@ MODULE_PARM_DESC(apple_ans_dart_hmb,
+  * says go, slowed down so each step reaches the screen, and is followed by
+  * a watch of SoC-side state only.
+  */
++static bool apple_ans_probe = !IS_ENABLED(CONFIG_NVME_APPLE_ANS_EARLY_USB);
++module_param(apple_ans_probe, bool, 0644);
++MODULE_PARM_DESC(apple_ans_probe,
++	"j71t: allow PCI ANS probe (boot initramfs releases after USB logging is ready)");
++
++bool nvme_pci_apple_ans_probe_allowed(struct pci_dev *pdev)
++{
++	return !of_machine_is_compatible("apple,j71t") ||
++	       READ_ONCE(apple_ans_probe) || !nvme_pci_apple_ans_match(pdev);
++}
++
+ static unsigned int apple_ans_enable = 1;
+ module_param(apple_ans_enable, uint, 0644);
+ MODULE_PARM_DESC(apple_ans_enable,
+diff --git a/drivers/nvme/host/pci-internal.h b/drivers/nvme/host/pci-internal.h
+index 887847bc70..3f3f91edc4 100644
+--- a/drivers/nvme/host/pci-internal.h
++++ b/drivers/nvme/host/pci-internal.h
+@@ -202,5 +202,6 @@ struct nvme_iod {
+ 
+ extern const struct nvme_pci_dma_ops nvme_pci_apple_ans_ops;
+ bool nvme_pci_apple_ans_match(struct pci_dev *pdev);
++bool nvme_pci_apple_ans_probe_allowed(struct pci_dev *pdev);
+ 
+ #endif /* _NVME_PCI_INTERNAL_H */
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index fbce887177..040d9ef50a 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -3824,6 +3824,10 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	struct nvme_dev *dev;
+ 	int result = -ENOMEM;
+ 
++	if (!nvme_pci_apple_ans_probe_allowed(pdev))
++		return dev_err_probe(&pdev->dev, -EPROBE_DEFER,
++			"Apple ANS: held for initramfs USB diagnostics\n");
++
+ 	dev = nvme_pci_alloc_dev(pdev, id);
+ 	if (IS_ERR(dev))
+ 		return PTR_ERR(dev);
+-- 
+2.56.0
+

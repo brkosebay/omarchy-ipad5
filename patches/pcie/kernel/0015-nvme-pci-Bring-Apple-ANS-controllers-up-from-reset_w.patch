@@ -1,0 +1,70 @@
+From 1e342d43fb4210b258f1e1ae9f57b50b0426f89a Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 11:16:15 +0000
+Subject: [PATCH 15/43] nvme-pci: Bring Apple ANS controllers up from
+ reset_work
+
+nvme_probe() enables the controller synchronously, and nvme-pci probes
+asynchronously, in the domain kernel_init() waits for before it runs
+/init. On j71t a bring-up that hangs (round 1) or waits out CAP.TO
+(minutes) therefore kept the initramfs shell from ever starting.
+
+For Apple ANS, queue the first enable on nvme_reset_wq instead, as
+nvme-pci did before it became synchronous: probe returns after mapping
+the BAR, reset_work allocates the admin tag set on its first run and
+does the rest. A failure leaves the controller DEAD instead of
+blocking boot.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ drivers/nvme/host/pci.c | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 4cb72adc35..7e4773b78c 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -3404,6 +3404,13 @@ static void nvme_reset_work(struct work_struct *work)
+ 	result = nvme_pci_enable(dev);
+ 	if (result)
+ 		goto out_unlock;
++	if (!dev->ctrl.admin_q) {
++		/* First enable, deferred from nvme_probe() (Apple ANS) */
++		result = nvme_alloc_admin_tag_set(&dev->ctrl, &dev->admin_tagset,
++				&nvme_mq_admin_ops, sizeof(struct nvme_iod));
++		if (result)
++			goto out_unlock;
++	}
+ 	nvme_unquiesce_admin_queue(&dev->ctrl);
+ 	mutex_unlock(&dev->shutdown_lock);
+ 
+@@ -3784,6 +3791,26 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 
+ 	dev_info(dev->ctrl.device, "pci function %s\n", dev_name(&pdev->dev));
+ 
++	/*
++	 * Apple ANS: do the first enable from reset_work on nvme_reset_wq, like
++	 * nvme-pci did before it went synchronous. The probe itself runs in the
++	 * async domain that kernel_init() waits for before starting /init, so a
++	 * bring-up that hangs or times out (CAP.TO can be minutes) would
++	 * otherwise keep the shell from ever coming up.
++	 */
++	if (dev->dma_ops == &nvme_pci_apple_ans_ops) {
++		if (!nvme_change_ctrl_state(&dev->ctrl, NVME_CTRL_RESETTING)) {
++			result = -EBUSY;
++			goto out_release_iod_mempool;
++		}
++		pci_set_drvdata(pdev, dev);
++		dev_info(dev->ctrl.device,
++			 "Apple ANS: controller bring-up continues in the background\n");
++		queue_work(nvme_reset_wq, &dev->ctrl.reset_work);
++		nvme_put_ctrl(&dev->ctrl);
++		return 0;
++	}
++
+ 	result = nvme_pci_enable(dev);
+ 	if (result)
+ 		goto out_release_iod_mempool;
+-- 
+2.56.0
+

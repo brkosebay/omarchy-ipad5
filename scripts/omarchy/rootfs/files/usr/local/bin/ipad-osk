@@ -1,0 +1,89 @@
+#!/bin/bash
+# On-screen keyboard for the iPad, on demand (the keyboard button on the bar,
+# Super + Alt + K, a swipe down from the top edge).
+#
+#   ipad-osk toggle    show it if hidden, hide it if shown [default]
+#   ipad-osk show | hide
+#   ipad-osk status    which keyboard, and whether it's shown
+#
+# squeekboard (Arch Linux ARM extra) is the keyboard: it runs hidden from
+# session start (linux-a9-osk.service, a user unit) so it appears at once,
+# and this flips its visibility over D-Bus. While shown, GNOME's a11y
+# "screen-keyboard-enabled" is on, which squeekboard needs to stay up; hiding
+# turns it off again, so it never pops up by itself over a Bluetooth keyboard.
+# If wvkbd-mobintl is installed it is used instead (lighter, no D-Bus).
+#
+# linux-a9 (docs/omarchy/tablet-usage.md). Works from the desktop and over SSH.
+set -uo pipefail
+
+export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+export DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}
+if [[ -z ${WAYLAND_DISPLAY:-} ]]; then
+  sock=$(ls -t "$XDG_RUNTIME_DIR"/wayland-[0-9] 2>/dev/null | head -1)
+  [[ -n $sock ]] && export WAYLAND_DISPLAY=${sock##*/}
+fi
+
+A11Y=org.gnome.desktop.a11y.applications
+OSK=(sm.puri.OSK0 /sm/puri/OSK0 sm.puri.OSK0)
+want=${1:-toggle}
+
+# --- wvkbd -------------------------------------------------------------------
+if command -v wvkbd-mobintl >/dev/null; then
+  running() { pgrep -u "$(id -u)" -x wvkbd-mobintl >/dev/null; }
+  if ! running; then
+    [[ $want == hide || $want == status ]] && { echo "wvkbd: not running"; exit 0; }
+    # Heights in logical pixels: a third of the 768 (landscape) or 1024 high desktop.
+    setsid -f wvkbd-mobintl -L 260 -H 320 --fn "Sans 13" >/dev/null 2>&1
+    exit 0
+  fi
+  case $want in
+    toggle) pkill -RTMIN -u "$(id -u)" -x wvkbd-mobintl ;;
+    show) pkill -USR2 -u "$(id -u)" -x wvkbd-mobintl ;;
+    hide) pkill -USR1 -u "$(id -u)" -x wvkbd-mobintl ;;
+    status) echo "wvkbd: running" ;;
+    *) echo "usage: ipad-osk [toggle|show|hide|status]" >&2; exit 2 ;;
+  esac
+  exit 0
+fi
+
+# --- squeekboard ---------------------------------------------------------------
+if ! command -v squeekboard >/dev/null; then
+  msg="No on-screen keyboard installed: sudo pacman -S squeekboard"
+  echo "$msg" >&2
+  notify-send -t 4000 "On-screen keyboard" "$msg" 2>/dev/null || true
+  exit 1
+fi
+
+visible() {
+  [[ $(busctl --user get-property "${OSK[@]}" Visible 2>/dev/null) == "b true" ]]
+}
+
+# Started by linux-a9-osk.service at login; start it here if it isn't (a
+# session from before the unit was installed). D-Bus needs a moment.
+if ! busctl --user status sm.puri.OSK0 >/dev/null 2>&1; then
+  [[ $want == hide || $want == status ]] && { echo "squeekboard: not running"; exit 0; }
+  systemctl --user start linux-a9-osk.service 2>/dev/null ||
+    setsid -f squeekboard >/dev/null 2>&1
+  for _ in $(seq 30); do
+    busctl --user status sm.puri.OSK0 >/dev/null 2>&1 && break
+    sleep 0.2
+  done
+fi
+
+if [[ $want == toggle ]]; then
+  if visible; then want=hide; else want=show; fi
+fi
+case $want in
+  show)
+    gsettings set $A11Y screen-keyboard-enabled true 2>/dev/null
+    busctl --user call "${OSK[@]}" SetVisible b true
+    ;;
+  hide)
+    busctl --user call "${OSK[@]}" SetVisible b false
+    gsettings set $A11Y screen-keyboard-enabled false 2>/dev/null
+    ;;
+  status)
+    if visible; then echo "squeekboard: shown"; else echo "squeekboard: hidden"; fi
+    ;;
+  *) echo "usage: ipad-osk [toggle|show|hide|status]" >&2; exit 2 ;;
+esac

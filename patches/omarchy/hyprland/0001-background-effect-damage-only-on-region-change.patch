@@ -1,0 +1,67 @@
+From ff2c5c8f25a09be7dec26168f9ba1cc310d16457 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Berkay=20K=C3=B6sebay?= <maintainer@example.invalid>
+Date: Thu, 22 Oct 2026 16:52:13 +0200
+Subject: [PATCH] protocols/background-effect: damage the surface only when its
+ blur region changes
+
+The ext-background-effect commit listener damaged the surface's whole box on
+every commit while an effect object existed, whether or not the blur region
+had changed. foot creates such an object for every window as soon as the
+compositor offers the protocol, so each keystroke, cursor blink or line of
+output repainted the entire terminal. Track whether set_blur_region was called
+since the last commit and damage the box only then; the surface's own damage
+covers its contents.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ src/protocols/BackgroundEffect.cpp | 13 ++++++++++++-
+ src/protocols/BackgroundEffect.hpp |  1 +
+ 2 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/src/protocols/BackgroundEffect.cpp b/src/protocols/BackgroundEffect.cpp
+index 7af91af..c404ce2 100644
+--- a/src/protocols/BackgroundEffect.cpp
++++ b/src/protocols/BackgroundEffect.cpp
+@@ -29,6 +29,8 @@ void CBackgroundEffect::setResource(SP<CExtBackgroundEffectSurfaceV1> resource)
+             return;
+         }
+ 
++        m_blurRegionChanged = true;
++
+         if (!region) {
+             m_blurRegion.clear();
+             return;
+@@ -56,8 +58,17 @@ void CBackgroundEffect::setResource(SP<CExtBackgroundEffectSurfaceV1> resource)
+ 
+         hlSurface->m_hasBackgroundEffect = true;
+         hlSurface->m_blurRegion          = m_blurRegion;
+-        auto box                         = hlSurface->getSurfaceBoxGlobal();
+ 
++        // Only a new blur region changes what is drawn behind the surface; its
++        // own buffer damage covers the rest. Damaging the whole box on every
++        // commit made clients that keep an effect object around (foot creates
++        // one for every window) repaint their entire surface per frame.
++        if (!m_blurRegionChanged)
++            return;
++
++        m_blurRegionChanged = false;
++
++        auto box = hlSurface->getSurfaceBoxGlobal();
+         if (box.has_value())
+             g_pHyprRenderer->damageBox(*box);
+     });
+diff --git a/src/protocols/BackgroundEffect.hpp b/src/protocols/BackgroundEffect.hpp
+index eb3f6fd..5f38a05 100644
+--- a/src/protocols/BackgroundEffect.hpp
++++ b/src/protocols/BackgroundEffect.hpp
+@@ -21,6 +21,7 @@ class CBackgroundEffect {
+     SP<CExtBackgroundEffectSurfaceV1> m_resource;
+     WP<CWLSurfaceResource>            m_surface;
+     CRegion                           m_blurRegion;
++    bool                              m_blurRegionChanged = true;
+ 
+     void                              destroy();
+ 
+-- 
+2.49.0
+

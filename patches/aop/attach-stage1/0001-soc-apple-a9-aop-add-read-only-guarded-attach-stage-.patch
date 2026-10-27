@@ -1,0 +1,308 @@
+From b74b884a77510a4aec64b5caeed724539fa6a45c Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sun, 25 Oct 2026 09:48:02 +0000
+Subject: [PATCH] soc: apple-a9-aop: add read-only guarded attach stage 1
+
+Preserve the canonical staged attach implementation unchanged. Stage 1
+freezes four mailbox status words under the existing PMGR observation
+guard, without FIFO reads, writes, IRQ registration or DMA allocation.
+Debugfs serves the frozen result, and all other AOP modes are excluded.
+Stages 2 and 3 refuse before mapping or observing hardware.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ Documentation/driver-api/apple-a9-aop.rst |  30 ++++++
+ drivers/soc/apple/Kconfig                 |   4 +
+ drivers/soc/apple/a9-aop-ring-reader.c    |   3 +
+ drivers/soc/apple/a9-aop.h                |   3 +
+ drivers/soc/apple/apple-a9-aop-active.c   |   3 +-
+ drivers/soc/apple/apple-a9-aop.c          | 107 +++++++++++++++++++++-
+ 6 files changed, 146 insertions(+), 4 deletions(-)
+
+diff --git a/Documentation/driver-api/apple-a9-aop.rst b/Documentation/driver-api/apple-a9-aop.rst
+index d258d68208..e33022aadf 100644
+--- a/Documentation/driver-api/apple-a9-aop.rst
++++ b/Documentation/driver-api/apple-a9-aop.rst
+@@ -105,6 +105,36 @@ separate two-word snapshot. The probe runs after the ordinary PMGR provider,
+ whose existing always-on policy may already have powered a domain; it is not
+ a pre-Linux rail measurement. Hardware automatic gating is not inhibited.
+ 
++Staged attach research (2026-10-25)
++==================================
++
++``apple_a9_aop.attach_stage=1`` freezes four status registers once at probe:
++CPU status +0xb88, inbox control +0x4008, outbox control +0x4020, and idle
++status +0x4040. The same five-domain PMGR guard precedes the reads. A domain
++error skips the wrapper; mailbox faults, stopped CPU or disabled outbox end
++the observation. Pending data is reported without consuming it. Read the
++frozen result at ``/sys/kernel/debug/apple-a9-aop/attach_status`` (0400), or
++in the kernel log. Repeated file reads issue no hardware transactions.
++
++Use debug=0, state_probe=0, attach=0, active=0, ring_scan=0, ring_iio=0 and
++omit ring_pa/ring_pa_size. Staged mode refuses combinations with any other
++observer mode. Every nonzero attach_stage also excludes the active driver
++before resource access, even if active=1 was accidentally retained.
++
++Stage 2 is reserved for HELLO/EPMAP only; stage 3 for fresh AFK buffers and
++accel enable. Both currently report ``refused-no-verified-host-epoch`` before
++mapping hardware, reading PMGR or touching a FIFO. Neither is an implemented
++handshake/streaming mode. Values outside 0..3 fail probe. All selectors are
++immutable boot parameters, and 0 preserves existing behavior.
++
++The iOS host code does not establish that duplicate HELLO_REPLY, AP power
++notifications or endpoint stop/start release a surviving firmware's old DMA
++addresses. A new EPMAP alone cannot prove that release. The older speculative
++Round 4 attach below remains a separate experiment, is excluded by staged
++mode, and is not recommended for the currently observed inherited instance.
++The protocol and prerequisites for implementing stages 2/3 are recorded in
++the workspace docs/periph/ds-aop-attach.md and aop-attach-test-plan.md.
++
+ Active driver (CONFIG_APPLE_A9_AOP_ACTIVE)
+ ==========================================
+ 
+diff --git a/drivers/soc/apple/Kconfig b/drivers/soc/apple/Kconfig
+index 03ee67b263..7c42bd46f4 100644
+--- a/drivers/soc/apple/Kconfig
++++ b/drivers/soc/apple/Kconfig
+@@ -28,6 +28,10 @@ config APPLE_A9_AOP
+ 	  Independent state_probe=1 captures only CPU status and outbox enable at
+ 	  probe after the five-domain PMGR check; debugfs repeats the saved line.
+ 	  It needs neither debug=1 nor ring mode and excludes the active driver.
++	  Independent attach_stage=1 freezes four PMGR-guarded mailbox status
++	  registers at probe, without consuming data. Stages 2/3 refuse before
++	  mapping hardware until a host epoch reset and old DMA release are proved.
++	  Staged research requires all other observer modes off, and blocks active.
+ 
+ config APPLE_A9_AOP_IIO
+ 	bool "J71t AOP accelerometer IIO consumer"
+diff --git a/drivers/soc/apple/a9-aop-ring-reader.c b/drivers/soc/apple/a9-aop-ring-reader.c
+index 08d787d0b8..5f4ab41a51 100644
+--- a/drivers/soc/apple/a9-aop-ring-reader.c
++++ b/drivers/soc/apple/a9-aop-ring-reader.c
+@@ -888,6 +888,9 @@ static int early_errno;
+ 
+ static int __init rr_early_init(void)
+ {
++	/* Boot-time research excludes RAM captures even with conflicting tokens. */
++	if (apple_a9_aop_attach_stage())
++		return 0;
+ 	if (!of_machine_is_compatible("apple,j71t"))
+ 		return 0;
+ 	/* Exact PA evidence must precede both the allocator-backed reader and sweep. */
+diff --git a/drivers/soc/apple/a9-aop.h b/drivers/soc/apple/a9-aop.h
+index 270ab12e5b..edb94494af 100644
+--- a/drivers/soc/apple/a9-aop.h
++++ b/drivers/soc/apple/a9-aop.h
+@@ -17,6 +17,9 @@ bool apple_a9_aop_debug(void);
+ /* Independent read-only state capture excludes the active driver. */
+ bool apple_a9_aop_state_probe(void);
+ 
++/* Staged research mode excludes every active path, including cold loading. */
++unsigned int apple_a9_aop_attach_stage(void);
++
+ /* Shared attach gate; the active driver additionally requires active=1. */
+ bool apple_a9_aop_attach(void);
+ 
+diff --git a/drivers/soc/apple/apple-a9-aop-active.c b/drivers/soc/apple/apple-a9-aop-active.c
+index 1ec8f62176..0ed1242190 100644
+--- a/drivers/soc/apple/apple-a9-aop-active.c
++++ b/drivers/soc/apple/apple-a9-aop-active.c
+@@ -2364,7 +2364,8 @@ static int a9_aop_probe(struct platform_device *pdev)
+ 	/* No resource is touched unless explicitly enabled on this board. */
+ 	if (!active || !of_machine_is_compatible("apple,j71t"))
+ 		return -ENODEV;
+-	if (apple_a9_aop_ring_mode() || apple_a9_aop_state_probe())
++	if (apple_a9_aop_ring_mode() || apple_a9_aop_state_probe() ||
++	    apple_a9_aop_attach_stage())
+ 		return dev_err_probe(dev, -EBUSY, "read-only diagnostics exclude active AOP\n");
+ 	aop = devm_kzalloc(dev, sizeof(*aop), GFP_KERNEL);
+ 	if (!aop)
+diff --git a/drivers/soc/apple/apple-a9-aop.c b/drivers/soc/apple/apple-a9-aop.c
+index 1bcec498ba..cafc16efc2 100644
+--- a/drivers/soc/apple/apple-a9-aop.c
++++ b/drivers/soc/apple/apple-a9-aop.c
+@@ -24,6 +24,9 @@ MODULE_PARM_DESC(debug, "Enable read-only J71t AOP debugfs (default off)");
+ static bool state_probe;
+ module_param(state_probe, bool, 0400);
+ MODULE_PARM_DESC(state_probe, "Capture powered/running AOP state once at probe, PMGR guarded (default off)");
++static unsigned int attach_stage;
++module_param(attach_stage, uint, 0400);
++MODULE_PARM_DESC(attach_stage, "Staged attach research: 1=status only, 2/3=refused pending host-epoch proof (default 0)");
+ static bool attach;
+ module_param(attach, bool, 0400);
+ MODULE_PARM_DESC(attach, "Allow running-AOP handshake with active=1; observer stays read-only (default off)");
+@@ -58,6 +61,11 @@ bool apple_a9_aop_state_probe(void)
+ 	return state_probe;
+ }
+ 
++unsigned int apple_a9_aop_attach_stage(void)
++{
++	return attach_stage;
++}
++
+ bool apple_a9_aop_ring_scan_early(void)
+ {
+ 	return debug && ring_scan && ring_scan_early;
+@@ -115,6 +123,7 @@ struct a9_aop {
+ 	void __iomem *regs[AOP_REGS];
+ 	struct device_node *domains[AOP_DOMAINS];
+ 	char state_line[192];
++	char attach_line[512];
+ };
+ 
+ struct a9_aop_snapshot {
+@@ -133,7 +142,7 @@ static void a9_aop_read_state(void *data)
+ }
+ 
+ static void a9_aop_state_format(char *line, size_t size, u32 pmgr, u32 cpu_status,
+-			      u32 outbox, int guard_errno)
++				u32 outbox, int guard_errno)
+ {
+ 	u32 target = pmgr & 15, actual = (pmgr >> 4) & 15;
+ 
+@@ -178,6 +187,72 @@ static int a9_aop_state_show(struct seq_file *s, void *unused)
+ }
+ DEFINE_SHOW_ATTRIBUTE(a9_aop_state);
+ 
++/* Status only. Reading FIFO data would consume a message, so cannot be stage 1. */
++static void a9_aop_read_attach_status(void *data)
++{
++	struct a9_aop_snapshot *snapshot = data;
++	unsigned int i;
++
++	for (i = 1; i < AOP_REGS; i++)
++		snapshot->values[i] = readl(snapshot->aop->regs[i]);
++}
++
++static int a9_aop_capture_attach(struct a9_aop *aop)
++{
++	struct apple_pmgr_observation states[AOP_DOMAINS] = {};
++	struct a9_aop_snapshot snapshot = { .aop = aop };
++	u32 *v = snapshot.values;
++	const char *result;
++	int ret;
++
++	if (!attach_stage || attach_stage > 3)
++		return -EINVAL;
++	/*
++	 * A duplicate HELLO_REPLY, endpoint restart or address publication does
++	 * not prove that a surviving master's old DMA references are gone.
++	 * Keep stages 2/3 fail-closed, before even mapping their resources.
++	 */
++	if (attach_stage > 1) {
++		scnprintf(aop->attach_line, sizeof(aop->attach_line),
++			  "format=1 stage=%u result=refused-no-verified-host-epoch wrapper=skipped hardware_writes=none fifo_reads=none irqs=none dma=none\n",
++			  attach_stage);
++		return 0;
++	}
++	ret = apple_pmgr_observe(aop->domains, AOP_DOMAINS, states,
++				 a9_aop_read_attach_status, &snapshot);
++	if (ret == -EPROBE_DEFER)
++		return ret;
++	if (ret) {
++		scnprintf(aop->attach_line, sizeof(aop->attach_line),
++			  "format=1 stage=1 result=aborted-domain-guard guard_errno=%d wrapper=skipped hardware_writes=none fifo_reads=none irqs=none dma=none\n",
++			  ret);
++		return 0;
++	}
++	if ((v[2] | v[3]) & (BIT(18) | BIT(19)))
++		result = "aborted-mailbox-fault";
++	else if (!(v[1] & 1))
++		result = "aborted-cpu-stopped";
++	else if (!(v[3] & 1))
++		result = "aborted-outbox-disabled";
++	else if (!(v[3] & BIT(17)))
++		result = "observed-pending-unconsumed";
++	else
++		result = "observed-running-empty";
++	scnprintf(aop->attach_line, sizeof(aop->attach_line),
++		  "format=1 stage=1 result=%s guard_errno=0 cpu_status=0x%08x inbox=0x%08x outbox=0x%08x idle=0x%08x hardware_writes=none fifo_reads=none irqs=none dma=none\n",
++		  result, v[1], v[2], v[3], v[4]);
++	return 0;
++}
++
++static int a9_aop_attach_status_show(struct seq_file *s, void *unused)
++{
++	struct a9_aop *aop = s->private;
++
++	seq_puts(s, aop->attach_line);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(a9_aop_attach_status);
++
+ static void a9_aop_read_status(void *data)
+ {
+ 	struct a9_aop_snapshot *snapshot = data;
+@@ -297,8 +372,14 @@ static int a9_aop_probe(struct platform_device *pdev)
+ 	int ret;
+ 
+ 	/* No resource requests or MMIO on the ordinary boot path. */
+-	if ((!debug && !state_probe) || !of_machine_is_compatible("apple,j71t"))
++	if ((!debug && !state_probe && !attach_stage) ||
++	    !of_machine_is_compatible("apple,j71t"))
+ 		return -ENODEV;
++	if (attach_stage > 3)
++		return dev_err_probe(dev, -EINVAL, "attach_stage must be 0..3\n");
++	if (attach_stage && (debug || state_probe || attach || apple_a9_aop_ring_mode()))
++		return dev_err_probe(dev, -EBUSY,
++				     "attach_stage requires other observer modes off\n");
+ 	if (of_find_property(dev->of_node, "power-domains", NULL) ||
+ 	    platform_get_resource(pdev, IORESOURCE_MEM, AOP_REGS))
+ 		return -EINVAL;
+@@ -306,12 +387,22 @@ static int a9_aop_probe(struct platform_device *pdev)
+ 	if (!aop)
+ 		return -ENOMEM;
+ 	aop->dev = dev;
++	if (attach_stage > 1) {
++		ret = a9_aop_capture_attach(aop);
++		if (ret)
++			return ret;
++		goto debugfs;
++	}
+ 	/* Ring-only mode leaves the wrapper untouched; state_probe is independent. */
+ 	if (apple_a9_aop_ring_mode() && !state_probe)
+ 		goto debugfs;
+ 	for (i = 0; i < AOP_REGS; i++) {
+-		if ((apple_a9_aop_ring_mode() || !debug) && i != 1 && i != 3)
++		if (attach_stage == 1) {
++			if (!i)
++				continue;
++		} else if ((apple_a9_aop_ring_mode() || !debug) && i != 1 && i != 3) {
+ 			continue;
++		}
+ 		res = platform_get_resource(pdev, IORESOURCE_MEM, i);
+ 		if (!res || res->start != reg_addresses[i] || resource_size(res) != 4)
+ 			return -EINVAL;
+@@ -337,6 +428,11 @@ static int a9_aop_probe(struct platform_device *pdev)
+ 		if (ret)
+ 			return dev_err_probe(dev, ret, "state probe needs PMGR providers\n");
+ 	}
++	if (attach_stage) {
++		ret = a9_aop_capture_attach(aop);
++		if (ret)
++			return dev_err_probe(dev, ret, "attach observation needs PMGR providers\n");
++	}
+ debugfs:
+ 	dir = debugfs_create_dir("apple-a9-aop", NULL);
+ 	if (IS_ERR(dir))
+@@ -353,12 +449,17 @@ static int a9_aop_probe(struct platform_device *pdev)
+ 	}
+ 	if (state_probe)
+ 		debugfs_create_file("state_probe", 0400, dir, aop, &a9_aop_state_fops);
++	if (attach_stage)
++		debugfs_create_file("attach_status", 0400, dir, aop,
++				    &a9_aop_attach_status_fops);
+ 	/* Register last: remove open debugfs users before any private data/maps. */
+ 	ret = devm_add_action_or_reset(dev, a9_aop_remove_debugfs, dir);
+ 	if (ret)
+ 		return ret;
+ 	if (state_probe)
+ 		pr_info("%s", aop->state_line);
++	if (attach_stage)
++		dev_info(dev, "%s", aop->attach_line);
+ 	if (debug && apple_a9_aop_ring_mode())
+ 		dev_info(dev, "read-only RAM reader ready; scan=%u iio=%u; wrapper=%s mailbox=none\n",
+ 			 ring_scan, ring_iio, state_probe ? "state-probe-only" : "none");
+-- 
+2.56.0
+

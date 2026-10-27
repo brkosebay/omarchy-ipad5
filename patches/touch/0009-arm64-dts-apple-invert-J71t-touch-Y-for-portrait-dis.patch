@@ -1,0 +1,31 @@
+From 6ca4db775649909602763aa6bfd7bcbbe867285a Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 12:54:24 +0000
+Subject: [PATCH 9/9] arm64: dts: apple: invert J71t touch Y for portrait
+ display
+
+Owner-confirmed top-left/top-right/bottom-left taps show X agrees with the portrait framebuffer and raw Y increases upward. Apply the standard touchscreen-inverted-y property only to J71t. The generic helper maps Y to 19538 minus the origin-normalized coordinate; no X inversion or axis swap is needed.
+---
+ arch/arm64/boot/dts/apple/s8003-j71t-touch.dtsi | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/boot/dts/apple/s8003-j71t-touch.dtsi b/arch/arm64/boot/dts/apple/s8003-j71t-touch.dtsi
+index 2c25a692db5461edd597a34d997725160e1d34e9..9645a33f2afb6d0771cc37d0377ec495874027c6 100644
+--- a/arch/arm64/boot/dts/apple/s8003-j71t-touch.dtsi
++++ b/arch/arm64/boot/dts/apple/s8003-j71t-touch.dtsi
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: GPL-2.0+ OR MIT
+-/* J71t N1 touch wiring. Controller/input protocol are first-test candidates. */
++/* J71t N1 touch wiring; portrait framebuffer, home button at the bottom. */
+ / {
+ 	/* Live iOS arm-io clock-frequencies[0x130 - 0x100]. */
+ 	spi3_nclk: clock-spi3 {
+@@ -56,6 +56,8 @@ spi3: spi@20a08c000 {
+ 		touchscreen@0 {
+ 			compatible = "apple,j71t-n1";
+ 			reg = <0>;
++			/* Owner-confirmed corner taps: X agrees, raw Y grows upward. */
++			touchscreen-inverted-y;
+ 			/* N1 selects 83 ns; controller rounds up to divider 6. */
+ 			spi-max-frequency = <12048192>;
+ 			/* This pinned SPI core applies GPIO CS setup twice. */

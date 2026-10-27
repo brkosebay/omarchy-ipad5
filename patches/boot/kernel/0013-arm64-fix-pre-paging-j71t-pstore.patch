@@ -1,0 +1,129 @@
+diff --git a/arch/arm64/include/asm/mmu.h b/arch/arm64/include/asm/mmu.h
+index 5e1211c540..bd37fd14a2 100644
+--- a/arch/arm64/include/asm/mmu.h
++++ b/arch/arm64/include/asm/mmu.h
+@@ -62,6 +62,7 @@ static inline bool arm64_kernel_unmapped_at_el0(void)
+ 
+ extern void arm64_memblock_init(void);
+ extern void paging_init(void);
++extern void apple_j71t_publish_pstore(void);
+ extern void bootmem_init(void);
+ extern void create_mapping_noalloc(phys_addr_t phys, unsigned long virt,
+ 				   phys_addr_t size, pgprot_t prot);
+diff --git a/arch/arm64/kernel/setup.c b/arch/arm64/kernel/setup.c
+index 29c6100f0c..40946928d8 100644
+--- a/arch/arm64/kernel/setup.c
++++ b/arch/arm64/kernel/setup.c
+@@ -332,6 +332,7 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
+ 	arm64_memblock_init();
+ 
+ 	paging_init();
++	apple_j71t_publish_pstore();
+ 
+ 	acpi_table_upgrade();
+ 
+diff --git a/arch/arm64/mm/init.c b/arch/arm64/mm/init.c
+index a7b1c6b510..025d4f4e92 100644
+--- a/arch/arm64/mm/init.c
++++ b/arch/arm64/mm/init.c
+@@ -23,6 +23,7 @@
+ #include <linux/of.h>
+ #include <linux/of_fdt.h>
+ #include <linux/libfdt.h>
++#include <linux/io.h>
+ #include <linux/dma-direct.h>
+ #include <linux/dma-map-ops.h>
+ #include <linux/efi.h>
+@@ -194,18 +195,21 @@ static int __init early_mem(char *p)
+ }
+ early_param("mem", early_mem);
+ 
++static phys_addr_t apple_j71t_pstore_fdt __initdata;
++
+ /*
+- * Allocate once, before paging/CMA/crashkernel, and publish the reservation in
+- * the FDT used by both kexec loaders. Never choose a fresh address in kdump:
+- * that kernel must use the first kernel's region outside its usable RAM.
++ * Reserve before paging/CMA/crashkernel, without touching the linear map:
++ * paging_init() has not built it yet. Prepare the replacement FDT through a
++ * temporary early mapping and publish its linear alias only after paging.
++ * Never choose a fresh address in kdump; reuse the first kernel's region.
+  */
+ static void __init apple_j71t_reserve_pstore(void)
+ {
+ 	void *fdt = initial_boot_params, *copy;
+-	phys_addr_t base;
++	phys_addr_t base, copy_pa;
+ 	fdt64_t reg[2];
+ 	char name[40];
+-	int root, parent, node, size, ret;
++	int parent, node, size, ret;
+ 
+ 	if (!IS_BUILTIN(CONFIG_PSTORE_RAM) || !fdt ||
+ 	    fdt_node_check_compatible(fdt, 0, "apple,j71t"))
+@@ -226,17 +230,20 @@ static void __init apple_j71t_reserve_pstore(void)
+ 	if (!base)
+ 		return;
+ 	size = fdt_totalsize(fdt) + SZ_4K;
+-	copy = memblock_alloc(size, SMP_CACHE_BYTES);
+-	if (!copy)
++	copy_pa = memblock_phys_alloc(size, SMP_CACHE_BYTES);
++	if (!copy_pa)
+ 		goto free_region;
++	copy = early_memremap(copy_pa, size);
++	if (!copy)
++		goto free_copy;
+ 	ret = fdt_open_into(fdt, copy, size);
+ 	if (ret)
+-		goto free_copy;
++		goto unmap_copy;
+ 	parent = fdt_path_offset(copy, "/reserved-memory");
+ 	snprintf(name, sizeof(name), "ramoops@%llx", (u64)base);
+ 	node = fdt_add_subnode(copy, parent, name);
+ 	if (node < 0)
+-		goto free_copy;
++		goto unmap_copy;
+ 	reg[0] = cpu_to_fdt64(base);
+ 	reg[1] = cpu_to_fdt64(SZ_2M);
+ 	if (fdt_setprop(copy, node, "compatible", "ramoops", sizeof("ramoops")) ||
+@@ -246,25 +253,32 @@ static void __init apple_j71t_reserve_pstore(void)
+ 	    fdt_setprop_u32(copy, node, "console-size", SZ_1M) ||
+ 	    fdt_setprop_u32(copy, node, "max-reason", 2) ||
+ 	    fdt_add_mem_rsv(copy, base, SZ_2M))
+-		goto free_copy;
++		goto unmap_copy;
+ 	/* No cached linear alias of ramoops' write-combined persistent mapping. */
+ 	if (memblock_mark_nomap(base, SZ_2M))
+-		goto free_copy;
+-	root = early_init_dt_verify(copy, __pa(copy));
+-	if (!root) {
+-		memblock_clear_nomap(base, SZ_2M);
+-		goto free_copy;
+-	}
++		goto unmap_copy;
++	early_memunmap(copy, size);
++	apple_j71t_pstore_fdt = copy_pa;
+ 	pr_info("j71t pstore: reserved 2 MiB at %pa, carried in kexec FDT\n", &base);
+ 	return;
+ 
++unmap_copy:
++	early_memunmap(copy, size);
+ free_copy:
+-	memblock_free(copy, size);
++	memblock_phys_free(copy_pa, size);
+ free_region:
+ 	memblock_phys_free(base, SZ_2M);
+ 	pr_warn("j71t pstore: reservation failed\n");
+ }
+ 
++/* The linear map now exists; unflattening must see the prepared FDT. */
++void __init apple_j71t_publish_pstore(void)
++{
++	if (apple_j71t_pstore_fdt)
++		early_init_dt_verify(phys_to_virt(apple_j71t_pstore_fdt),
++				     apple_j71t_pstore_fdt);
++}
++
+ void __init arm64_memblock_init(void)
+ {
+ 	s64 linear_region_size = PAGE_END - _PAGE_OFFSET(vabits_actual);

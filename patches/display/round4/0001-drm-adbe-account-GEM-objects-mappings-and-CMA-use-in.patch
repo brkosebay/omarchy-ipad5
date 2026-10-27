@@ -1,0 +1,496 @@
+From 04ca5aa8f24f4c6cca628dd4e0619146289ec019 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 14:59:46 +0000
+Subject: [PATCH] drm/adbe: account GEM objects, mappings and CMA use in
+ debugfs
+
+A 30-minute soak (a 1080p decode loop plus a video player window
+restarted every 10 s under Hyprland) ended with CMA allocation failures,
+heavy reclaim and the compositor OOM-killed. The driver itself takes no
+framebuffer or GEM references: every buffer's lifetime belongs to the
+atomic helpers, and the flip paths (interrupt, VBI fallback, timeout
+timer, CRTC disable) only move the pending event and balance their
+vblank reference. A leak therefore has to be found from what clients
+keep alive, which debugfs could not show so far.
+
+Wrap the GEM DMA objects to track each one: kind (dumb buffer allocated
+here, or a PRIME import of another device's memory), size, whether it
+sits in the CMA area, live CPU mappings, and creator. The mappings count
+because each one holds an object reference after the handle is gone. A
+CMA fallback shows up too: once CMA is full, the DMA allocator takes one
+high-order page block per buffer (order 10 for a 12 MiB scanout
+buffer), which is where reclaim and compaction pressure comes from. The
+CMA accessors are not exported, so a modular build reports "?" there.
+
+adbe_state gains three kinds of lines:
+
+  gem dumb=N/K import=N/K dumb-peak=K orphans=N/K mmaps=N
+      dumb-in-cma=K import-in-cma=K fbs=N cma-free=K
+  vblank refcount=N enabled=N vbi=N vbl-events=N flip-pending=N timer=N
+  client COMM[PID] master=y|n fbs=N dumb=N/K import=N/K   (one per file)
+
+Orphans are objects with no handle left, kept alive only by a
+framebuffer, a mapping, a dma-buf export or the kernel's fbdev client.
+vbi counts VBI interrupts and vbl-events counts flip events armed with
+nothing to push, so an idle desktop that keeps vblank on or keeps
+committing shows up as a moving counter. The new adbe_bos file lists
+every live object, oldest first.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ drivers/gpu/drm/adbe/adbe_drv.c | 329 +++++++++++++++++++++++++++++++-
+ 1 file changed, 327 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/adbe/adbe_drv.c b/drivers/gpu/drm/adbe/adbe_drv.c
+index 304b4fee45..c18ca346bf 100644
+--- a/drivers/gpu/drm/adbe/adbe_drv.c
++++ b/drivers/gpu/drm/adbe/adbe_drv.c
+@@ -22,33 +22,50 @@
+  * offset taken from the live scanout). Buffers are ordinary DMA allocations,
+  * so probe requires the display DART to pass the scanout through without
+  * translation; it checks this by reading the DART, never by writing it.
++ *
++ * The driver holds no framebuffer or GEM references of its own: the atomic
++ * helpers own every buffer's lifetime. debugfs (adbe_state, adbe_bos) still
++ * tracks each GEM object, its CPU mappings and whether it sits in CMA, so
++ * that a soak shows a buffer leak, and who holds it, directly.
+  */
+ #include <linux/aperture.h>
++#include <linux/cma.h>
++#include <linux/dma-direct.h>
++#include <linux/dma-map-ops.h>
+ #include <linux/dma-mapping.h>
++#include <linux/idr.h>
+ #include <linux/interrupt.h>
+ #include <linux/io.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+ #include <linux/of_platform.h>
+ #include <linux/of_reserved_mem.h>
++#include <linux/pid.h>
+ #include <linux/platform_device.h>
++#include <linux/sched.h>
+ #include <linux/seq_file.h>
+ #include <linux/string.h>
+ #include <linux/timer.h>
++#include <linux/vmstat.h>
+ 
+ #include <drm/clients/drm_client_setup.h>
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_helper.h>
++#include <drm/drm_auth.h>
+ #include <drm/drm_debugfs.h>
+ #include <drm/drm_drv.h>
+ #include <drm/drm_dumb_buffers.h>
+ #include <drm/drm_fb_dma_helper.h>
+ #include <drm/drm_fbdev_dma.h>
++#include <drm/drm_file.h>
+ #include <drm/drm_fourcc.h>
+ #include <drm/drm_framebuffer.h>
++#include <drm/drm_gem.h>
+ #include <drm/drm_gem_dma_helper.h>
+ #include <drm/drm_gem_framebuffer_helper.h>
++#include <drm/drm_managed.h>
+ #include <drm/drm_modeset_helper.h>
+ #include <drm/drm_print.h>
+ #include <drm/drm_probe_helper.h>
+@@ -66,6 +83,8 @@
+ #define ADBE_LAT_BUCKETS	4	/* flip latency 0, 1, 2, 3+ frames */
+ /* Interrupt sources while vblank is on (added to iBoot's mask). */
+ #define ADBE_INTEN_VBLANK	(ADP_ST_VBI | ADP_ST_APPLIED)
++/* The CMA area accessors are not exported: only a built-in driver can tell. */
++#define ADBE_CMA_KNOWN		(IS_BUILTIN(CONFIG_DRM_APPLE_ADBE) && IS_ENABLED(CONFIG_DMA_CMA))
+ 
+ /* Kill switch: apple_adbe_drm.enable=0 leaves the display to simpledrm. */
+ static bool enable = true;
+@@ -81,6 +100,31 @@ static char *token = "next";
+ module_param(token, charp, 0600);
+ MODULE_PARM_DESC(token, "Preamble token (loaded into the frame counter): next (counter + 1), same, serial");
+ 
++enum adbe_bo_kind {
++	ADBE_BO_DUMB,		/* allocated here: scanout or fbdev buffer */
++	ADBE_BO_IMPORT,		/* PRIME import, another device's memory */
++	ADBE_BO_KINDS,
++};
++
++static const char * const adbe_bo_kind_names[ADBE_BO_KINDS] = {
++	[ADBE_BO_DUMB] = "dumb",
++	[ADBE_BO_IMPORT] = "import",
++};
++
++/* A GEM object with debugfs bookkeeping. */
++struct adbe_bo {
++	struct drm_gem_dma_object dma;	/* first: the helpers kfree() it */
++	struct list_head node;		/* adbe->bos once accounted, else empty */
++	enum adbe_bo_kind kind;
++	bool in_cma;
++	atomic_t mmaps;			/* live CPU mappings (VMAs) */
++	ktime_t born;
++	pid_t pid;			/* creator */
++	char comm[TASK_COMM_LEN];
++};
++
++static_assert(offsetof(struct adbe_bo, dma) == 0);
++
+ struct adbe {
+ 	struct drm_device drm;
+ 	struct drm_plane plane;
+@@ -138,6 +182,15 @@ struct adbe {
+ 	u32 lat_us_max;
+ 	u64 lat_us_sum;
+ 	u32 lat_count;
++	atomic_t vbis;		/* VBI interrupts handled while vblank is on */
++	atomic_t vbl_events;	/* flip events armed with nothing to push */
++	/* Live GEM objects, protected by bo_lock. */
++	struct mutex bo_lock;
++	struct list_head bos;
++	unsigned int bo_count[ADBE_BO_KINDS];
++	u64 bo_bytes[ADBE_BO_KINDS];
++	u64 bo_cma_bytes[ADBE_BO_KINDS];
++	u64 bo_dumb_peak;
+ };
+ 
+ static struct adbe *to_adbe(struct drm_device *drm)
+@@ -145,6 +198,11 @@ static struct adbe *to_adbe(struct drm_device *drm)
+ 	return container_of(drm, struct adbe, drm);
+ }
+ 
++static struct adbe_bo *to_adbe_bo(struct drm_gem_object *obj)
++{
++	return container_of(obj, struct adbe_bo, dma.base);
++}
++
+ static const struct drm_display_mode adbe_mode = {
+ 	DRM_MODE_INIT(60, ADBE_WIDTH, ADBE_HEIGHT, 148, 197),
+ };
+@@ -253,6 +311,7 @@ static irqreturn_t adbe_irq(int irq, void *data)
+ 			atomic_inc(&adbe->frame_jumps);
+ 		adbe->last_frame = frame;
+ 		adbe->frame_valid = true;
++		atomic_inc(&adbe->vbis);
+ 		drm_crtc_handle_vblank(&adbe->crtc);
+ 	}
+ 	/* The event carries this boundary's vblank sequence and timestamp. */
+@@ -500,6 +559,7 @@ static void adbe_crtc_atomic_flush(struct drm_crtc *crtc,
+ 		return;
+ 	/* Nothing pushed: complete at the next vblank, or now if it is off. */
+ 	spin_lock_irqsave(&crtc->dev->event_lock, flags);
++	atomic_inc(&adbe->vbl_events);
+ 	if (drm_crtc_vblank_get(crtc) == 0)
+ 		drm_crtc_arm_vblank_event(crtc, event);
+ 	else
+@@ -605,12 +665,269 @@ static const struct drm_mode_config_helper_funcs adbe_mode_config_helpers = {
+ 	.atomic_commit_tail = drm_atomic_helper_commit_tail_rpm,
+ };
+ 
++/*
++ * Whether a buffer sits in the default CMA area. When CMA is full, the DMA
++ * allocator falls back to one high-order page allocation per buffer (order
++ * 10 for a 12 MiB scanout buffer), and that is where reclaim and compaction
++ * pressure comes from.
++ */
++static bool adbe_in_cma(struct device *dev, dma_addr_t addr, size_t size)
++{
++#if ADBE_CMA_KNOWN
++	struct cma *cma = dev_get_cma_area(dev);
++	phys_addr_t pa = dma_to_phys(dev, addr), base;
++
++	if (!cma)
++		return false;
++	base = cma_get_base(cma);
++	return pa >= base && pa + size <= base + cma_get_size(cma);
++#else
++	return false;
++#endif
++}
++
++/*
++ * Start tracking a new object; the caller holds a reference to it. A dumb
++ * handle closed and reused by another thread before the lookup can name an
++ * object that is already tracked: leave that one alone.
++ */
++static void adbe_bo_account(struct adbe *adbe, struct drm_gem_object *obj,
++			    enum adbe_bo_kind kind)
++{
++	struct adbe_bo *bo = to_adbe_bo(obj);
++
++	mutex_lock(&adbe->bo_lock);
++	if (!list_empty(&bo->node)) {
++		mutex_unlock(&adbe->bo_lock);
++		return;
++	}
++	bo->kind = kind;
++	bo->in_cma = adbe_in_cma(adbe->drm.dev, bo->dma.dma_addr, obj->size);
++	bo->born = ktime_get();
++	bo->pid = task_tgid_nr(current);
++	get_task_comm(bo->comm, current);
++	list_add_tail(&bo->node, &adbe->bos);
++	adbe->bo_count[kind]++;
++	adbe->bo_bytes[kind] += obj->size;
++	if (bo->in_cma)
++		adbe->bo_cma_bytes[kind] += obj->size;
++	adbe->bo_dumb_peak = max(adbe->bo_dumb_peak, adbe->bo_bytes[ADBE_BO_DUMB]);
++	mutex_unlock(&adbe->bo_lock);
++}
++
++static void adbe_gem_free(struct drm_gem_object *obj)
++{
++	struct adbe *adbe = to_adbe(obj->dev);
++	struct adbe_bo *bo = to_adbe_bo(obj);
++
++	mutex_lock(&adbe->bo_lock);
++	if (!list_empty(&bo->node)) {
++		list_del(&bo->node);
++		adbe->bo_count[bo->kind]--;
++		adbe->bo_bytes[bo->kind] -= obj->size;
++		if (bo->in_cma)
++			adbe->bo_cma_bytes[bo->kind] -= obj->size;
++	}
++	mutex_unlock(&adbe->bo_lock);
++	drm_gem_dma_free(&bo->dma);
++}
++
++/* A mapping holds an object reference: count them, for orphaned mmaps. */
++static void adbe_gem_vm_open(struct vm_area_struct *vma)
++{
++	atomic_inc(&to_adbe_bo(vma->vm_private_data)->mmaps);
++	drm_gem_vm_open(vma);
++}
++
++static void adbe_gem_vm_close(struct vm_area_struct *vma)
++{
++	atomic_dec(&to_adbe_bo(vma->vm_private_data)->mmaps);
++	drm_gem_vm_close(vma);
++}
++
++static const struct vm_operations_struct adbe_gem_vm_ops = {
++	.open = adbe_gem_vm_open,
++	.close = adbe_gem_vm_close,
++};
++
++static int adbe_gem_mmap(struct drm_gem_object *obj, struct vm_area_struct *vma)
++{
++	int ret = drm_gem_dma_mmap(to_drm_gem_dma_obj(obj), vma);
++
++	if (!ret)
++		atomic_inc(&to_adbe_bo(obj)->mmaps);
++	return ret;
++}
++
++/* drm_gem_dma_default_funcs, plus the bookkeeping. */
++static const struct drm_gem_object_funcs adbe_gem_funcs = {
++	.free = adbe_gem_free,
++	.print_info = drm_gem_dma_object_print_info,
++	.get_sg_table = drm_gem_dma_object_get_sg_table,
++	.vmap = drm_gem_dma_object_vmap,
++	.mmap = adbe_gem_mmap,
++	.vm_ops = &adbe_gem_vm_ops,
++};
++
++static struct drm_gem_object *adbe_gem_create_object(struct drm_device *drm,
++						     size_t size)
++{
++	struct adbe_bo *bo = kzalloc(sizeof(*bo), GFP_KERNEL);
++
++	if (!bo)
++		return ERR_PTR(-ENOMEM);
++	INIT_LIST_HEAD(&bo->node);
++	bo->dma.base.funcs = &adbe_gem_funcs;
++	return &bo->dma.base;
++}
++
+ static int adbe_dumb_create(struct drm_file *file, struct drm_device *drm,
+ 			    struct drm_mode_create_dumb *args)
+ {
++	struct drm_gem_object *obj;
+ 	int ret = drm_mode_size_dumb(drm, args, ADBE_ALIGN, 0);
+ 
+-	return ret ?: drm_gem_dma_dumb_create_internal(file, drm, args);
++	if (!ret)
++		ret = drm_gem_dma_dumb_create_internal(file, drm, args);
++	if (ret)
++		return ret;
++	/* Only the handle holds it, and another thread may close it already. */
++	obj = drm_gem_object_lookup(file, args->handle);
++	if (obj) {
++		adbe_bo_account(to_adbe(drm), obj, ADBE_BO_DUMB);
++		drm_gem_object_put(obj);
++	}
++	return 0;
++}
++
++static struct drm_gem_object *
++adbe_gem_prime_import_sg_table(struct drm_device *drm,
++			       struct dma_buf_attachment *attach,
++			       struct sg_table *sgt)
++{
++	struct drm_gem_object *obj;
++
++	obj = drm_gem_dma_prime_import_sg_table(drm, attach, sgt);
++	if (!IS_ERR(obj))
++		adbe_bo_account(to_adbe(drm), obj, ADBE_BO_IMPORT);
++	return obj;
++}
++
++/* Buffers per client: GEM handles and the framebuffers made from them. */
++static void adbe_show_clients(struct seq_file *m, struct adbe *adbe)
++{
++	struct drm_device *drm = &adbe->drm;
++	struct drm_file *file;
++
++	mutex_lock(&drm->filelist_mutex);
++	list_for_each_entry_reverse(file, &drm->filelist, lhead) {
++		unsigned int handles[ADBE_BO_KINDS] = {}, fbs = 0;
++		u64 bytes[ADBE_BO_KINDS] = {};
++		bool master = drm_is_current_master(file);
++		struct drm_framebuffer *fb;
++		struct drm_gem_object *obj;
++		struct task_struct *task;
++		struct pid *pid;
++		int id;
++
++		spin_lock(&file->table_lock);
++		idr_for_each_entry(&file->object_idr, obj, id) {
++			enum adbe_bo_kind kind = to_adbe_bo(obj)->kind;
++
++			handles[kind]++;
++			bytes[kind] += obj->size;
++		}
++		spin_unlock(&file->table_lock);
++		mutex_lock(&file->fbs_lock);
++		list_for_each_entry(fb, &file->fbs, filp_head)
++			fbs++;
++		mutex_unlock(&file->fbs_lock);
++
++		rcu_read_lock();	/* file->pid and the task's comm */
++		pid = rcu_dereference(file->pid);
++		task = pid_task(pid, PIDTYPE_TGID);
++		seq_printf(m, "client %s[%d] master=%c fbs=%u dumb=%u/%lluK import=%u/%lluK\n",
++			   task ? task->comm : "?", pid_vnr(pid), master ? 'y' : 'n',
++			   fbs, handles[ADBE_BO_DUMB], bytes[ADBE_BO_DUMB] >> 10,
++			   handles[ADBE_BO_IMPORT], bytes[ADBE_BO_IMPORT] >> 10);
++		rcu_read_unlock();
++	}
++	mutex_unlock(&drm->filelist_mutex);
++}
++
++/*
++ * Memory summary. Orphans have no handle left: only a framebuffer, a CPU
++ * mapping, a dma-buf export or the kernel (fbdev) keeps them alive.
++ */
++static void adbe_show_memory(struct seq_file *m, struct adbe *adbe)
++{
++	struct drm_vblank_crtc *vblank = drm_crtc_vblank_crtc(&adbe->crtc);
++	unsigned int orphans = 0, mmaps = 0;
++	u64 orphan_bytes = 0;
++	struct adbe_bo *bo;
++	unsigned long flags;
++	bool pending;
++	int fbs;
++
++	mutex_lock(&adbe->bo_lock);
++	list_for_each_entry(bo, &adbe->bos, node) {
++		mmaps += atomic_read(&bo->mmaps);
++		if (!READ_ONCE(bo->dma.base.handle_count)) {
++			orphans++;
++			orphan_bytes += bo->dma.base.size;
++		}
++	}
++	seq_printf(m, "gem dumb=%u/%lluK import=%u/%lluK dumb-peak=%lluK orphans=%u/%lluK mmaps=%u",
++		   adbe->bo_count[ADBE_BO_DUMB], adbe->bo_bytes[ADBE_BO_DUMB] >> 10,
++		   adbe->bo_count[ADBE_BO_IMPORT], adbe->bo_bytes[ADBE_BO_IMPORT] >> 10,
++		   adbe->bo_dumb_peak >> 10, orphans, orphan_bytes >> 10, mmaps);
++	if (ADBE_CMA_KNOWN)
++		seq_printf(m, " dumb-in-cma=%lluK import-in-cma=%lluK",
++			   adbe->bo_cma_bytes[ADBE_BO_DUMB] >> 10,
++			   adbe->bo_cma_bytes[ADBE_BO_IMPORT] >> 10);
++	else
++		seq_puts(m, " dumb-in-cma=? import-in-cma=?");
++	mutex_unlock(&adbe->bo_lock);
++
++	mutex_lock(&adbe->drm.mode_config.fb_lock);
++	fbs = adbe->drm.mode_config.num_fb;
++	mutex_unlock(&adbe->drm.mode_config.fb_lock);
++	seq_printf(m, " fbs=%d cma-free=%luK\n", fbs,
++		   global_zone_page_state(NR_FREE_CMA_PAGES) << (PAGE_SHIFT - 10));
++
++	spin_lock_irqsave(&adbe->drm.event_lock, flags);
++	pending = adbe->event;
++	spin_unlock_irqrestore(&adbe->drm.event_lock, flags);
++	seq_printf(m, "vblank refcount=%d enabled=%d vbi=%d vbl-events=%d flip-pending=%d timer=%d\n",
++		   atomic_read(&vblank->refcount), READ_ONCE(vblank->enabled),
++		   atomic_read(&adbe->vbis), atomic_read(&adbe->vbl_events),
++		   pending, timer_pending(&adbe->flip_timer));
++	adbe_show_clients(m, adbe);
++}
++
++/* One line per live GEM object, oldest first. */
++static int adbe_bos_show(struct seq_file *m, void *data)
++{
++	struct drm_debugfs_entry *entry = m->private;
++	struct adbe *adbe = to_adbe(entry->dev);
++	ktime_t now = ktime_get();
++	struct adbe_bo *bo;
++
++	mutex_lock(&adbe->bo_lock);
++	list_for_each_entry(bo, &adbe->bos, node) {
++		struct drm_gem_object *obj = &bo->dma.base;
++
++		seq_printf(m, "%-6s %6zuK dma=%pad cma=%c handles=%u mmaps=%d refs=%u exported=%c age=%llds by %s[%d]\n",
++			   adbe_bo_kind_names[bo->kind], obj->size >> 10,
++			   &bo->dma.dma_addr,
++			   ADBE_CMA_KNOWN ? (bo->in_cma ? 'y' : 'n') : '?',
++			   READ_ONCE(obj->handle_count), atomic_read(&bo->mmaps),
++			   kref_read(&obj->refcount), READ_ONCE(obj->dma_buf) ? 'y' : 'n',
++			   ktime_ms_delta(now, bo->born) / MSEC_PER_SEC,
++			   bo->comm, bo->pid);
++	}
++	mutex_unlock(&adbe->bo_lock);
++	return 0;
+ }
+ 
+ static int adbe_state_show(struct seq_file *m, void *data)
+@@ -642,6 +959,7 @@ static int adbe_state_show(struct seq_file *m, void *data)
+ 		   readl(adbe->adp + ADP_STATUS),
+ 		   readl(adbe->adp + ADP_FRAME) & 0xffff,
+ 		   readl(adbe->adp + ADP_PARMST), readl(adbe->adp + ADP_FIFO_PTR));
++	adbe_show_memory(m, adbe);
+ 	return 0;
+ }
+ 
+@@ -650,7 +968,9 @@ DEFINE_DRM_GEM_DMA_FOPS(adbe_fops);
+ static const struct drm_driver adbe_drm_driver = {
+ 	.driver_features = DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
+ 	.fops = &adbe_fops,
+-	DRM_GEM_DMA_DRIVER_OPS_WITH_DUMB_CREATE(adbe_dumb_create),
++	.gem_create_object = adbe_gem_create_object,
++	.dumb_create = adbe_dumb_create,
++	.gem_prime_import_sg_table = adbe_gem_prime_import_sg_table,
+ 	DRM_FBDEV_DMA_DRIVER_OPS,
+ 	.name = "adbe",
+ 	.desc = "Apple A9 display pipe",
+@@ -858,6 +1178,10 @@ static int adbe_probe(struct platform_device *pdev)
+ 	if (ret < 0)
+ 		return dev_err_probe(dev, ret, "commit: base|full|sync, token: next|same|serial\n");
+ 	timer_setup(&adbe->flip_timer, adbe_flip_timeout, 0);
++	INIT_LIST_HEAD(&adbe->bos);
++	ret = drmm_mutex_init(&adbe->drm, &adbe->bo_lock);
++	if (ret)
++		return ret;
+ 
+ 	adbe->adp = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR(adbe->adp))
+@@ -895,6 +1219,7 @@ static int adbe_probe(struct platform_device *pdev)
+ 		return ret;
+ 	}
+ 	drm_debugfs_add_file(&adbe->drm, "adbe_state", adbe_state_show, NULL);
++	drm_debugfs_add_file(&adbe->drm, "adbe_bos", adbe_bos_show, NULL);
+ 	drm_client_setup(&adbe->drm, NULL);
+ 	return 0;
+ }
+-- 
+2.56.0
+

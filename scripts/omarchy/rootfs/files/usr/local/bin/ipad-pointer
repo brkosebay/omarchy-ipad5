@@ -1,0 +1,73 @@
+#!/bin/bash
+# How the iPad shows the pointer when the only inputs are touch and a keyboard.
+#
+#   ipad-pointer visible   always drawn where it was last; a tap doesn't move it
+#                          [default]
+#   ipad-pointer auto      hidden after a tap or a key press until a mouse
+#                          moves (Hyprland's own behaviour: without a mouse it
+#                          stays hidden)
+#   ipad-pointer hidden    never drawn, like iPadOS without a pointing device
+#   ipad-pointer           print the current mode
+#
+# Kept as pointer=... in ~/.local/state/linux-a9/display, which
+# ~/.config/hypr/ipad.lua reads; a Hyprland reload applies it at once.
+#
+# linux-a9 (docs/omarchy/hyprland.md). Works from the desktop and over SSH.
+set -euo pipefail
+
+state=${XDG_STATE_HOME:-$HOME/.local/state}/linux-a9/display
+
+# No state file yet (a fresh image) means the default. Under set -e a failing
+# sed in the substitution would end the script silently, so don't run it then.
+current() {
+  local value=""
+  if [[ -r $state ]]; then
+    value=$(sed -n 's/^[[:space:]]*pointer[[:space:]]*=[[:space:]]*//p' "$state" | tail -1)
+  fi
+  case $value in
+    visible | auto | hidden) echo "$value" ;;
+    *) echo visible ;;
+  esac
+}
+
+set_state() {
+  local tmp
+  mkdir -p "${state%/*}"
+  tmp=$(mktemp "$state.XXXXXX")
+  grep -v "^[[:space:]]*$1[[:space:]]*=" "$state" 2>/dev/null >"$tmp" || true
+  echo "$1=$2" >>"$tmp"
+  mv -f "$tmp" "$state"
+}
+
+reload_hyprland() {
+  if [[ -z ${HYPRLAND_INSTANCE_SIGNATURE:-} ]]; then
+    export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+    local sig=""
+    # No hypr directory (Hyprland never ran this boot) isn't an error.
+    [[ -d $XDG_RUNTIME_DIR/hypr ]] && sig=$(ls -t "$XDG_RUNTIME_DIR/hypr" | head -1)
+    if [[ -z $sig || ! -S $XDG_RUNTIME_DIR/hypr/$sig/.socket.sock ]]; then
+      echo "Hyprland isn't running; the next login applies it"
+      return 0
+    fi
+    export HYPRLAND_INSTANCE_SIGNATURE=$sig
+  fi
+  hyprctl reload >/dev/null
+}
+
+case ${1:-} in
+  "")
+    current
+    ;;
+  visible | auto | hidden)
+    set_state pointer "$1"
+    reload_hyprland
+    echo "$1"
+    ;;
+  -h | --help | help)
+    awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"
+    ;;
+  *)
+    echo "usage: ipad-pointer [visible|auto|hidden]" >&2
+    exit 2
+    ;;
+esac

@@ -1,0 +1,12 @@
+[Unit]
+Description=Automount iPad USB drives
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/udiskie --config=/etc/linux-a9/udiskie.yml --automount --no-tray --no-notify --no-password-prompt
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

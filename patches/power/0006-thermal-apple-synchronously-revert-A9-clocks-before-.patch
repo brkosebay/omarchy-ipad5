@@ -1,0 +1,214 @@
+From 022ae8309515b3f4fbbacaae89ac36006891642c Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 23:27:16 +0000
+Subject: [PATCH 6/7] thermal: apple: synchronously revert A9 clocks before
+ critical shutdown
+
+---
+ drivers/cpufreq/Kconfig.arm           |  2 +-
+ drivers/cpufreq/apple-a9-tuning.h     | 48 +++++++++++++++++++++++++++
+ drivers/cpufreq/apple-soc-cpufreq.c   |  2 ++
+ drivers/thermal/apple-s8003-thermal.c | 15 +++++++++
+ include/linux/soc/apple/s8003-power.h | 13 ++++++++
+ 5 files changed, 79 insertions(+), 1 deletion(-)
+ create mode 100644 include/linux/soc/apple/s8003-power.h
+
+diff --git a/drivers/cpufreq/Kconfig.arm b/drivers/cpufreq/Kconfig.arm
+index ee94b57414..c95a44aed3 100644
+--- a/drivers/cpufreq/Kconfig.arm
++++ b/drivers/cpufreq/Kconfig.arm
+@@ -276,7 +276,7 @@ config ARM_PXA2xx_CPUFREQ
+ 
+ config APPLE_A9_TUNING
+     bool "Guarded experimental S8003 CPU clocks"
+-    depends on ARM_APPLE_SOC_CPUFREQ
++    depends on ARM_APPLE_SOC_CPUFREQ=y
+     depends on APPLE_S8003_THERMAL=y && CPU_THERMAL && DEBUG_FS
+     depends on !THERMAL_EMULATION
+     help
+diff --git a/drivers/cpufreq/apple-a9-tuning.h b/drivers/cpufreq/apple-a9-tuning.h
+index 0f601bf47a..23193851eb 100644
+--- a/drivers/cpufreq/apple-a9-tuning.h
++++ b/drivers/cpufreq/apple-a9-tuning.h
+@@ -28,12 +28,16 @@ struct a9_guard {
+ 	struct dentry *directory;
+ 	u64 stock1[16], stock2[16];
+ 	unsigned int limit, configured, dirty;
++	u32 trip_generation;
+ 	unsigned long heartbeat;
+ 	bool armed, ready, latched;
++	bool thermal_qos_pending;
+ 	const char *reason;
+ 	int revert_error, hottest;
+ };
+ 
++static struct a9_guard __rcu *a9_active_guard;
++
+ static unsigned int a9_psinfo1_offset(unsigned int state)
+ {
+ 	return state < 8 ? 0x68 + state * 8 : 0x368 + (state - 8) * 8;
+@@ -119,6 +123,33 @@ static void a9_revert(struct a9_guard *g, const char *reason)
+ 		dev_err(g->priv->cpu_dev, "A9 stock revert failed: %d\n", g->revert_error);
+ }
+ 
++/* Thermal callbacks hold a zone mutex. Do not take g->control here: the
++ * polling worker may hold it while acquiring that same zone mutex. RCU keeps
++ * the driver state alive and priv->lock serializes the bounded MMIO sequence.
++ */
++void apple_a9_thermal_revert(void)
++{
++	struct a9_guard *g;
++	unsigned long flags;
++
++	rcu_read_lock();
++	g = rcu_dereference(a9_active_guard);
++	if (g) {
++		raw_spin_lock_irqsave(&g->priv->lock, flags);
++		g->trip_generation++;
++		g->armed = false;
++		g->latched = true;
++		g->reason = "thermal-trip";
++		g->revert_error = a9_restore_locked(g);
++		WRITE_ONCE(g->thermal_qos_pending, true);
++		raw_spin_unlock_irqrestore(&g->priv->lock, flags);
++		/* QoS notification can sleep; finish it outside this RCU section. */
++		mod_delayed_work(system_wq, &g->work, 0);
++	}
++	rcu_read_unlock();
++}
++EXPORT_SYMBOL_GPL(apple_a9_thermal_revert);
++
+ static const char *a9_guard_fault(int sensor_error, int hottest, bool expired)
+ {
+ 	if (sensor_error)
+@@ -141,6 +172,10 @@ static void a9_guard_work(struct work_struct *work)
+ 	const char *fault;
+ 
+ 	mutex_lock(&g->control);
++	if (READ_ONCE(g->thermal_qos_pending)) {
++		freq_qos_update_request(&g->qos, A9_STOCK_KHZ);
++		WRITE_ONCE(g->thermal_qos_pending, false);
++	}
+ 	ret = a9_temperatures(&hottest);
+ 	g->hottest = ret ? INT_MIN : hottest;
+ 	if (g->armed) {
+@@ -184,6 +219,7 @@ static int a9_check_stock(struct a9_guard *g)
+ static int a9_arm(struct a9_guard *g)
+ {
+ 	unsigned long flags;
++	u32 generation = READ_ONCE(g->trip_generation);
+ 	int ret, hottest;
+ 
+ 	if (!a9_tuning || !g->ready)
+@@ -197,6 +233,10 @@ static int a9_arm(struct a9_guard *g)
+ 	if (g->dirty || g->revert_error || g->armed)
+ 		return -EBUSY;
+ 	raw_spin_lock_irqsave(&g->priv->lock, flags);
++	if (generation != g->trip_generation) {
++		raw_spin_unlock_irqrestore(&g->priv->lock, flags);
++		return -EAGAIN;
++	}
+ 	g->latched = false;
+ 	g->armed = true;
+ 	g->limit = A9_BOOST_KHZ;
+@@ -238,6 +278,11 @@ static int a9_configure(struct a9_guard *g, unsigned int khz, unsigned int delta
+ 		return -EINVAL;
+ 	state = i + 9;
+ 	raw_spin_lock_irqsave(&priv->lock, flags);
++	/* A thermal callback may have latched while temperatures were sampled. */
++	if (!g->armed || time_after(jiffies, g->heartbeat + msecs_to_jiffies(A9_HEARTBEAT_MS))) {
++		ret = -EPERM;
++		goto unlock;
++	}
+ 	ret = a9_restore_locked(g);
+ 	if (ret)
+ 		goto unlock;
+@@ -381,6 +426,7 @@ static void a9_guard_ready(struct cpufreq_policy *policy)
+ 		return;
+ 	}
+ 	g->ready = true;
++	rcu_assign_pointer(a9_active_guard, g);
+ 	g->directory = debugfs_create_dir("a9_tuning", NULL);
+ 	debugfs_create_file("status", 0400, g->directory, g, &a9_status_fops);
+ 	debugfs_create_file("control", 0200, g->directory, g, &a9_control_fops);
+@@ -393,6 +439,8 @@ static void a9_guard_exit(struct apple_cpu_priv *priv)
+ 
+ 	if (!g)
+ 		return;
++	RCU_INIT_POINTER(a9_active_guard, NULL);
++	synchronize_rcu();
+ 	debugfs_remove_recursive(g->directory);
+ 	cancel_delayed_work_sync(&g->work);
+ 	a9_revert(g, "driver-exit");
+diff --git a/drivers/cpufreq/apple-soc-cpufreq.c b/drivers/cpufreq/apple-soc-cpufreq.c
+index 60dc3a4297..13070b97e7 100644
+--- a/drivers/cpufreq/apple-soc-cpufreq.c
++++ b/drivers/cpufreq/apple-soc-cpufreq.c
+@@ -23,8 +23,10 @@
+ #include <linux/of_address.h>
+ #include <linux/pm_opp.h>
+ #include <linux/pm_qos.h>
++#include <linux/rcupdate.h>
+ #include <linux/seq_file.h>
+ #include <linux/spinlock.h>
++#include <linux/soc/apple/s8003-power.h>
+ #include <linux/thermal.h>
+ #include <linux/uaccess.h>
+ #include <linux/workqueue.h>
+diff --git a/drivers/thermal/apple-s8003-thermal.c b/drivers/thermal/apple-s8003-thermal.c
+index b855e9672c..be569be84f 100644
+--- a/drivers/thermal/apple-s8003-thermal.c
++++ b/drivers/thermal/apple-s8003-thermal.c
+@@ -14,6 +14,7 @@
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/seq_file.h>
++#include <linux/soc/apple/s8003-power.h>
+ #include <linux/thermal.h>
+ #include <linux/workqueue.h>
+ 
+@@ -109,8 +110,22 @@ static int a9_get_temp(struct thermal_zone_device *tz, int *temp)
+ 	return a9_sensor_temp(thermal_zone_device_priv(tz), temp);
+ }
+ 
++static void a9_thermal_hot(struct thermal_zone_device *tz)
++{
++	apple_a9_thermal_revert();
++}
++
++static void a9_thermal_critical(struct thermal_zone_device *tz)
++{
++	/* Synchronous bounded fallback first, then the normal shutdown path. */
++	apple_a9_thermal_revert();
++	thermal_zone_device_critical(tz);
++}
++
+ static const struct thermal_zone_device_ops a9_thermal_ops = {
+ 	.get_temp = a9_get_temp,
++	.hot = a9_thermal_hot,
++	.critical = a9_thermal_critical,
+ };
+ 
+ static umode_t a9_hwmon_visible(const void *data, enum hwmon_sensor_types type,
+diff --git a/include/linux/soc/apple/s8003-power.h b/include/linux/soc/apple/s8003-power.h
+new file mode 100644
+index 0000000000..bdaa9540f5
+--- /dev/null
++++ b/include/linux/soc/apple/s8003-power.h
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_SOC_APPLE_S8003_POWER_H
++#define _LINUX_SOC_APPLE_S8003_POWER_H
++
++#include <linux/kconfig.h>
++
++#if IS_ENABLED(CONFIG_APPLE_A9_TUNING)
++void apple_a9_thermal_revert(void);
++#else
++static inline void apple_a9_thermal_revert(void) {}
++#endif
++
++#endif
+-- 
+2.56.0
+

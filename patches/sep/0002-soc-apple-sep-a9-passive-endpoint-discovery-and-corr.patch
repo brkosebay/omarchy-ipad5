@@ -1,0 +1,1538 @@
+From 2b11b79ed65e362c21a381cb1f7b57954f442b67 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Mon, 26 Oct 2026 12:12:18 +0000
+Subject: [PATCH 2/3] soc: apple: sep-a9: passive endpoint discovery and
+ corrected transfers
+
+The first sepOS boot (2026-10-26, pongoOS cold path) showed how sepOS
+announces its services on endpoint 0xfd: op 0 with param = endpoint ID
+and its 4CC in data (most significant byte first), then op 1 with the
+OOL page-count ranges, data bytes LSB first = in min, in max, out min,
+out max in 4 KiB pages (AppleSEPDiscovery, "OOL in [%u,%u] OOL out
+[%u,%u]"):
+
+  ep=fd op=00 param=00 data=636e746c   cntl
+  ep=fd op=01 param=00 data=00000000   no OOL
+  ep=fd op=00 param=10 data=78617273   xars
+  ep=fd op=01 param=10 data=08080808   32 KiB in and out
+  ep=fd op=00 param=13 data=7861726d   xarm
+
+Rework the driver to match (docs/sep/linux-bringup-next.md section 2):
+
+- endpoint table for the whole 8-bit namespace (was 16 entries; 0x10
+  and 0x13 were rejected), filled passively from op 0/op 1 pairs. An
+  endpoint is usable only when both halves are known. debugfs
+  "endpoints" lists name, ID, source and page ranges; "log" annotates
+  the 0xfd lines.
+- "advertise" declares an advertisement by hand from a pongoOS capture
+  (fields or the two raw data words). It only fills the table and can't
+  override a value the mailbox delivered.
+- "ool" takes "EP SEND RECV": separate sizes, 4 KiB multiples inside
+  the advertised ranges ("in" = send). Both buffers are zeroed,
+  cleaned+invalidated, published through cntl (0x04/0x02/0x05/0x03) and
+  never freed once any control message went out.
+- every write waits for room in the AP->SEP FIFO (snd_sts bit 16, as in
+  all Apple mailbox variants) and is refused before the mailbox is armed.
+- a transfer completes only on its endpoint plus tag and command; a tag
+  0xff reply decodes the status word at receive OOL offset 0x10, and the
+  0xfd/0xfe chunk tags fail the transfer instead of passing for
+  completion.
+- the completion data field is the payload length; the 7-byte header is
+  not part of it (the old code turned the 32-byte 0x2b reply into 25
+  bytes). Invalidate [recv, recv + 7 + len) before copying.
+- "sbio" accepts only an endpoint whose complete advertisement names it
+  'sbio'; a successful debugfs 0x73 on it marks SBIO ready.
+- /dev/sep-bio never sends: enrol/verify return -ENOSYS until the real
+  EnrollMode/MatchMode payloads exist. The zero-payload path, the
+  bio_payload override and the sbio_ep module parameter are gone.
+
+Nothing is sent automatically: arming, publishing and every command are
+explicit debugfs writes. Multi-chunk transfers and IRQs are still not
+implemented.
+---
+ drivers/soc/apple/sep-a9.c | 1054 +++++++++++++++++++++++-------------
+ 1 file changed, 690 insertions(+), 364 deletions(-)
+
+diff --git a/drivers/soc/apple/sep-a9.c b/drivers/soc/apple/sep-a9.c
+index d6fdc26da5..b9b65b0b5a 100644
+--- a/drivers/soc/apple/sep-a9.c
++++ b/drivers/soc/apple/sep-a9.c
+@@ -12,20 +12,25 @@
+  *	bits 24..31	parameter
+  *	bits 32..63	data
+  *
+- * Every endpoint owns a page-sized send and receive "OOL" (out-of-line)
+- * buffer. Their size and physical address are published to the SEP with
+- * control messages on endpoint 0 (see sep_ool_publish()), after which the
+- * endpoint can be used for commands. Those opcodes were recovered from the
+- * iOS 16.7.10 AppleSEPManager kext; see docs/sep/driver-notes.md.
++ * sepOS announces its services on endpoint 0xfd: op 0 carries the endpoint's
++ * 4CC, op 1 its OOL (out-of-line buffer) page-count ranges. The driver only
++ * listens; it never asks for, guesses or probes an endpoint. A service is
++ * usable once both halves of its advertisement are known, either from the
++ * mailbox or declared by hand from a pongoOS capture.
+  *
+- * This first stage only owns the mailbox: it drains and logs messages and
+- * exposes a raw send path for bring-up. The OOL buffers and the per-endpoint
+- * command framing come next.
++ * A usable endpoint gets a send and a receive OOL buffer, published with four
++ * control messages on endpoint 0 ('cntl'). Commands then use tag 0xfc with the
++ * command in the opcode field; payloads live in the OOL buffers. See
++ * docs/sep/driver-notes.md and docs/sep/linux-bringup-next.md.
++ *
++ * Nothing is ever sent automatically: arming the mailbox, publishing buffers
++ * and every command are explicit debugfs writes.
+  */
+ 
+ #include <linux/debugfs.h>
+ #include <linux/delay.h>
+ #include <linux/fs.h>
++#include <linux/iopoll.h>
+ #include <linux/jiffies.h>
+ #include <linux/mm.h>
+ #include <linux/completion.h>
+@@ -37,6 +42,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
+ #include <linux/uaccess.h>
++#include <linux/unaligned.h>
+ #include <linux/workqueue.h>
+ 
+ #include <asm/cacheflush.h>
+@@ -56,10 +62,16 @@
+ #define SEP_MBOX_RECV0		0x34
+ #define SEP_MBOX_RECV1		0x38
+ 
+-/* recv_sts bit clear => a message is waiting (pongoOS sep_check_mailbox) */
+-#define SEP_MBOX_RECV_EMPTY	0x20000
++/*
++ * Status bits, as in every Apple mailbox variant: bit 16 full, bit 17 empty.
++ * recv_sts bit 17 clear => a message is waiting (pongoOS sep_check_mailbox);
++ * snd_sts bit 16 set => the AP->SEP FIFO has no room.
++ */
++#define SEP_MBOX_STS_FULL	0x10000
++#define SEP_MBOX_STS_EMPTY	0x20000
+ /* pongoOS enables exactly this interrupt bit after probe */
+ #define SEP_MBOX_INT_ENABLE	0x1000
++#define SEP_TX_TIMEOUT_US	100000
+ 
+ #define SEP_LOG_ENTRIES		256
+ 
+@@ -78,29 +90,52 @@
+ #define SEP_MSG_GET_PARAM(msg)	((u8)(((msg) >> 24) & 0xff))
+ #define SEP_MSG_GET_DATA(msg)	((u32)((msg) >> 32))
+ 
++/* The whole 8-bit endpoint namespace; 0xfd..0xff are transport endpoints. */
++#define SEP_EP_COUNT		256
++#define SEP_EP_DISCOVERY	0xfd
++#define SEP_EP_CLIENT_MAX	0xfc
++
++/* Endpoint 0xfd (AppleSEPDiscovery): param = endpoint ID. */
++#define SEP_DISC_NAME		0x00	/* data = 4CC, 0x636e746c = 'cntl' */
++#define SEP_DISC_OOL		0x01	/* data bytes LSB first: in min/max, out min/max */
++
++/* OOL ranges are counted in 4 KiB SEP pages. "in" is AP->SEP (send). */
++#define SEP_OOL_PAGE		0x1000
++
+ /* Control-endpoint opcodes that publish an endpoint OOL buffer. */
+ #define SEP_OP_SET_SEND_ADDR	0x02
+ #define SEP_OP_SET_RECV_ADDR	0x03
+ #define SEP_OP_SET_SEND_SIZE	0x04
+ #define SEP_OP_SET_RECV_SIZE	0x05
+ 
+-/* Endpoint transfer framing (docs/sep/driver-notes.md §7). */
++/* Endpoint transfer framing (docs/sep/sbio-commands.md §1). */
+ #define SEP_TAG_XFER		0xfc	/* request, and final completion */
+ #define SEP_TAG_XFER_CONT	0xfd	/* continuation chunk */
+ #define SEP_TAG_XFER_ACK	0xfe	/* SEP: send the next chunk */
+-#define SEP_TAG_XFER_ERR	0xff	/* SEP: error, status word in buffer+0x10 */
++#define SEP_TAG_XFER_ERR	0xff	/* SEP: error, status word in recv+0x10 */
+ #define SEP_XFER_HDR		7	/* reply payload starts after 7 bytes */
++#define SEP_XFER_ERR_OFF	0x10
++#define SEP_XFER_CHUNK		16356	/* payload bytes per chunk */
++#define SEP_XFER_TIMEOUT_MS	10000
+ 
+-#define SEP_OOL_SIZE		16384
+-#define SEP_OOL_CHUNK		16356	/* payload bytes per chunk */
+-#define SEP_OEP_MAX		16
++#define SEP_CMD_SBIO_INIT	0x73
+ 
+ struct sep_ep {
+-	bool allocated;
++	/* advertisement */
++	u32 name;
++	u8 in_min, in_max, out_min, out_max;	/* 4 KiB pages */
++	bool has_name;
++	bool has_ool;
++	bool name_manual;	/* declared through debugfs advertise, */
++	bool ool_manual;	/* not (yet) seen on the mailbox */
++	bool conflict;		/* a later mailbox advertisement disagreed */
++
++	/* OOL buffers, kept until the driver goes away once published */
++	bool published;
+ 	void *send;
+ 	void *recv;
+-	dma_addr_t send_pa;
+-	dma_addr_t recv_pa;
++	phys_addr_t send_pa;
++	phys_addr_t recv_pa;
+ 	size_t send_len;
+ 	size_t recv_len;
+ };
+@@ -110,36 +145,44 @@ struct sep_a9 {
+ 	void __iomem *base;
+ 	void __iomem *mbox;
+ 
+-	struct mutex lock;		/* serialises send + log access */
++	struct mutex lock;		/* receive side: log, endpoint table */
++	struct mutex tx_lock;		/* AP->SEP FIFO */
++	struct mutex cfg_lock;		/* debugfs configuration and transfers */
+ 	u64 log[SEP_LOG_ENTRIES];
+ 	unsigned int log_head;
+ 	unsigned int log_count;
++	unsigned long last_rx;		/* jiffies */
+ 
+ 	struct delayed_work poll;
+ 	unsigned int poll_us;
+ 	bool running;
+ 
+-	struct sep_ep eps[SEP_OEP_MAX];
+-	struct mutex xfer_lock;
++	struct sep_ep *eps;		/* SEP_EP_COUNT entries */
++
++	/* one transfer at a time, under cfg_lock */
+ 	struct completion xfer_done;
+ 	bool xfer_waiting;
++	u8 xfer_ep;
+ 	u8 xfer_cmd;
+-	int xfer_err;
+-	u8 sbio_ep;		/* SEP endpoint number for sbio, -1 = unset */
+-	bool sbio_ready;
+-	u32 bio_state;		/* SEP_BIO_STATE_* */
+-	u32 bio_stage;
+-	u8 enrol_payload[68];	/* raw override, see debugfs bio_payload */
+-	size_t enrol_len;
+-	u8 verify_payload[68];
+-	size_t verify_len;
+-	size_t xfer_out_len;
++	u8 xfer_tag;			/* tag of the message that ended it */
++	u8 xfer_op;
++	u32 xfer_data;
++
++	int sbio_ep;			/* -1 = unset */
++	bool sbio_ready;		/* 0x73 acknowledged on sbio_ep */
++
++	/* last debugfs xfer, for reading back */
++	int last_ep;
++	u8 last_cmd;
++	int last_ret;
++	u32 last_status;
+ 	size_t last_out_len;
+-	u8 last_out[SEP_OOL_SIZE];
++	u8 last_out[SEP_XFER_CHUNK];
+ 
+ 	struct dentry *dbg;
+ 	u64 tx_count;
+ 	u64 rx_count;
++	u64 tx_busy;
+ 	u64 dropped;
+ };
+ 
+@@ -151,12 +194,6 @@ static inline u64 sep_read_msg(struct sep_a9 *sep)
+ 	return lo | (hi << 32);
+ }
+ 
+-static inline void sep_write_msg(struct sep_a9 *sep, u64 msg)
+-{
+-	writel(lower_32_bits(msg), sep->mbox + SEP_MBOX_SND0);
+-	writel(upper_32_bits(msg), sep->mbox + SEP_MBOX_SND1);
+-}
+-
+ static void sep_log_push(struct sep_a9 *sep, u64 msg)
+ {
+ 	unsigned int slot = (sep->log_head + sep->log_count) % SEP_LOG_ENTRIES;
+@@ -168,6 +205,112 @@ static void sep_log_push(struct sep_a9 *sep, u64 msg)
+ 		sep->log_head = (sep->log_head + 1) % SEP_LOG_ENTRIES;
+ 
+ 	sep->rx_count++;
++	sep->last_rx = jiffies;
++}
++
++/* The 4CC is stored most significant byte first; decode only printable names. */
++static bool sep_fourcc(u32 word, char name[5])
++{
++	int i;
++
++	for (i = 0; i < 4; i++) {
++		name[i] = (char)(word >> (24 - 8 * i));
++		if (name[i] < 0x20 || name[i] > 0x7e)
++			return false;
++	}
++	name[4] = '\0';
++	return true;
++}
++
++static void sep_ool_word(u32 word, u8 *in_min, u8 *in_max, u8 *out_min,
++			 u8 *out_max)
++{
++	*in_min = word & 0xff;
++	*in_max = (word >> 8) & 0xff;
++	*out_min = (word >> 16) & 0xff;
++	*out_max = word >> 24;
++}
++
++static bool sep_ep_complete(const struct sep_ep *e)
++{
++	return e->has_name && e->has_ool;
++}
++
++/* Record one 0xfd message. Called with sep->lock held. */
++static void sep_discovery_rx(struct sep_a9 *sep, u64 msg)
++{
++	u8 id = SEP_MSG_GET_PARAM(msg);
++	u32 data = SEP_MSG_GET_DATA(msg);
++	struct sep_ep *e = &sep->eps[id];
++	u8 a, b, c, d;
++	char name[5];
++
++	switch (SEP_MSG_GET_OP(msg)) {
++	case SEP_DISC_NAME:
++		if (!sep_fourcc(data, name))
++			strscpy(name, "????");
++		if (e->has_name && e->name != data) {
++			e->conflict = true;
++			dev_warn(sep->dev, "ep %#04x: name %08x conflicts with %08x\n",
++				 id, data, e->name);
++			return;
++		}
++		e->name = data;
++		e->has_name = true;
++		e->name_manual = false;
++		dev_info(sep->dev, "ep %#04x: advertised '%s'\n", id, name);
++		break;
++	case SEP_DISC_OOL:
++		sep_ool_word(data, &a, &b, &c, &d);
++		if (e->has_ool && (e->in_min != a || e->in_max != b ||
++				   e->out_min != c || e->out_max != d)) {
++			e->conflict = true;
++			dev_warn(sep->dev, "ep %#04x: OOL advertisement %08x conflicts\n",
++				 id, data);
++			return;
++		}
++		e->in_min = a;
++		e->in_max = b;
++		e->out_min = c;
++		e->out_max = d;
++		e->has_ool = true;
++		e->ool_manual = false;
++		dev_info(sep->dev, "ep %#04x: OOL in [%u,%u] out [%u,%u] pages%s\n",
++			 id, a, b, c, d, e->has_name ? "" : " (no name yet)");
++		break;
++	default:
++		dev_warn(sep->dev, "ep 0xfd: unknown op %#x\n", SEP_MSG_GET_OP(msg));
++		break;
++	}
++}
++
++/* Does this message end the pending transfer? Called with sep->lock held. */
++static void sep_xfer_rx(struct sep_a9 *sep, u64 msg)
++{
++	u8 tag = SEP_MSG_GET_TAG(msg);
++	u8 op = SEP_MSG_GET_OP(msg);
++
++	if (!sep->xfer_waiting || SEP_MSG_GET_EP(msg) != sep->xfer_ep)
++		return;
++
++	switch (tag) {
++	case SEP_TAG_XFER:
++	case SEP_TAG_XFER_CONT:
++	case SEP_TAG_XFER_ACK:
++		if (op != sep->xfer_cmd)
++			return;
++		break;
++	case SEP_TAG_XFER_ERR:
++		break;
++	default:
++		return;
++	}
++
++	sep->xfer_tag = tag;
++	sep->xfer_op = op;
++	sep->xfer_data = SEP_MSG_GET_DATA(msg);
++	sep->xfer_waiting = false;
++	complete(&sep->xfer_done);
+ }
+ 
+ /*
+@@ -179,27 +322,14 @@ static int sep_drain(struct sep_a9 *sep)
+ 	unsigned int drained = 0;
+ 
+ 	mutex_lock(&sep->lock);
+-	while (!(readl(sep->mbox + SEP_MBOX_RECV_STS) & SEP_MBOX_RECV_EMPTY)) {
++	while (!(readl(sep->mbox + SEP_MBOX_RECV_STS) & SEP_MBOX_STS_EMPTY)) {
+ 		u64 msg = sep_read_msg(sep);
+ 
+ 		sep_log_push(sep, msg);
+-
+-		/* Completion for a pending transfer: same tag (0xfc) and the
+-		 * command echoed back (docs/sep/driver-notes.md §7). */
+-		if (sep->xfer_waiting &&
+-		    SEP_MSG_GET_TAG(msg) == SEP_TAG_XFER &&
+-		    SEP_MSG_GET_OP(msg) == sep->xfer_cmd) {
+-			sep->xfer_out_len = SEP_MSG_GET_DATA(msg);
+-			sep->xfer_err = 0;
+-			sep->xfer_waiting = false;
+-			complete(&sep->xfer_done);
+-		} else if (sep->xfer_waiting &&
+-			   SEP_MSG_GET_TAG(msg) == SEP_TAG_XFER_ERR) {
+-			/* error word sits at reply buffer + 0x10 */
+-			sep->xfer_err = -EIO;
+-			sep->xfer_waiting = false;
+-			complete(&sep->xfer_done);
+-		}
++		if (SEP_MSG_GET_EP(msg) == SEP_EP_DISCOVERY)
++			sep_discovery_rx(sep, msg);
++		else
++			sep_xfer_rx(sep, msg);
+ 
+ 		if (++drained > SEP_LOG_ENTRIES) {
+ 			sep->dropped++;
+@@ -223,187 +353,274 @@ static void sep_poll_work(struct work_struct *work)
+ 	schedule_delayed_work(&sep->poll, usecs_to_jiffies(sep->poll_us));
+ }
+ 
++/*
++ * Send one message once the AP->SEP FIFO has room. The mailbox must be armed:
++ * nothing touches the SEP registers before that.
++ */
+ static int sep_send_raw(struct sep_a9 *sep, u8 ep, u8 tag, u8 op, u8 param,
+ 			u32 data)
+ {
+-	mutex_lock(&sep->lock);
+-	sep_write_msg(sep, SEP_MSG(ep, tag, op, param, data));
+-	sep->tx_count++;
+-	mutex_unlock(&sep->lock);
++	u64 msg = SEP_MSG(ep, tag, op, param, data);
++	u32 sts;
++	int ret;
+ 
+-	return 0;
++	if (!sep->running)
++		return -ENXIO;
++
++	mutex_lock(&sep->tx_lock);
++	ret = readl_poll_timeout(sep->mbox + SEP_MBOX_SND_STS, sts,
++				 !(sts & SEP_MBOX_STS_FULL), 100,
++				 SEP_TX_TIMEOUT_US);
++	if (ret) {
++		sep->tx_busy++;
++		dev_warn(sep->dev, "tx FIFO full (snd_sts=%#x), not sent: %016llx\n",
++			 sts, msg);
++	} else {
++		writel(lower_32_bits(msg), sep->mbox + SEP_MBOX_SND0);
++		writel(upper_32_bits(msg), sep->mbox + SEP_MBOX_SND1);
++		sep->tx_count++;
++	}
++	mutex_unlock(&sep->tx_lock);
++
++	return ret ? -EBUSY : 0;
++}
++
++/*
++ * Publish an endpoint's OOL buffers through 'cntl' (endpoint 0, the target
++ * endpoint in param): send size (0x04), send address (0x02), receive size
++ * (0x05), receive address (0x03). Sizes in bytes, addresses as PA >> 12, as
++ * AppleSEPManager::setSendOOLBuffer/setReceiveOOLBuffer do.
++ */
++static int sep_ool_publish(struct sep_a9 *sep, u8 ep, struct sep_ep *e)
++{
++	int ret;
++
++	ret = sep_send_raw(sep, 0, 0, SEP_OP_SET_SEND_SIZE, ep, e->send_len);
++	if (!ret)
++		ret = sep_send_raw(sep, 0, 0, SEP_OP_SET_SEND_ADDR, ep,
++				   e->send_pa >> 12);
++	if (!ret)
++		ret = sep_send_raw(sep, 0, 0, SEP_OP_SET_RECV_SIZE, ep,
++				   e->recv_len);
++	if (!ret)
++		ret = sep_send_raw(sep, 0, 0, SEP_OP_SET_RECV_ADDR, ep,
++				   e->recv_pa >> 12);
++	return ret;
+ }
+ 
+-static int sep_ool_publish(struct sep_a9 *sep, u8 ep, bool send,
+-			   dma_addr_t pa, size_t len);
++static bool sep_ool_size_ok(size_t len, u8 min, u8 max)
++{
++	return len && IS_ALIGNED(len, SEP_OOL_PAGE) &&
++	       len >= (size_t)min * SEP_OOL_PAGE &&
++	       len <= (size_t)max * SEP_OOL_PAGE;
++}
+ 
+ /*
+- * Allocate the two OOL buffers an endpoint needs. 16 KiB each, page aligned,
+- * physically contiguous: the SEP reads AP DRAM directly (no DART), so the
+- * physical address is handed over as-is.
++ * Allocate and publish an endpoint's send and receive buffers, sized within
++ * its advertised ranges. Physically contiguous and page aligned: the SEP
++ * reads AP DRAM directly (no DART), so the physical address is handed over
++ * as-is. Called with cfg_lock held.
+  */
+-static int sep_ep_alloc(struct sep_a9 *sep, u8 ep, size_t size)
++static int sep_ep_alloc(struct sep_a9 *sep, u8 ep, size_t send_len,
++			size_t recv_len)
+ {
+-	struct sep_ep *e;
++	struct sep_ep *e = &sep->eps[ep];
++	struct sep_ep adv;
++	void *send, *recv;
++	int ret;
+ 
+-	if (ep >= SEP_OEP_MAX)
+-		return -EINVAL;
+-	if (size == 0 || size > SEP_OOL_SIZE)
++	if (ep > SEP_EP_CLIENT_MAX)
+ 		return -EINVAL;
+ 
+-	e = &sep->eps[ep];
+-	if (e->allocated)
+-		return -EBUSY;
++	mutex_lock(&sep->lock);
++	adv = *e;
++	mutex_unlock(&sep->lock);
+ 
+-	e->send = alloc_pages_exact(PAGE_ALIGN(size), GFP_KERNEL | __GFP_ZERO);
+-	if (!e->send)
+-		return -ENOMEM;
+-	e->recv = alloc_pages_exact(PAGE_ALIGN(size), GFP_KERNEL | __GFP_ZERO);
+-	if (!e->recv) {
+-		free_pages_exact(e->send, PAGE_ALIGN(size));
+-		e->send = NULL;
+-		return -ENOMEM;
++	if (adv.published)
++		return -EBUSY;	/* sepOS keeps the first binding */
++	if (!sep_ep_complete(&adv))
++		return -ENOENT;	/* no complete advertisement for ep */
++	if (!sep_ool_size_ok(send_len, adv.in_min, adv.in_max) ||
++	    !sep_ool_size_ok(recv_len, adv.out_min, adv.out_max))
++		return -ERANGE;
++
++	send = alloc_pages_exact(PAGE_ALIGN(send_len), GFP_KERNEL | __GFP_ZERO);
++	recv = alloc_pages_exact(PAGE_ALIGN(recv_len), GFP_KERNEL | __GFP_ZERO);
++	if (!send || !recv) {
++		ret = -ENOMEM;
++		goto err_free;
+ 	}
+ 
+-	e->send_pa = virt_to_phys(e->send);
+-	e->recv_pa = virt_to_phys(e->recv);
+-	e->send_len = e->recv_len = size;
++	/*
++	 * Write the zeroes back and drop the lines: the SEP must not read
++	 * stale data, and no dirty line may later overwrite a SEP write.
++	 */
++	dcache_clean_inval_poc((unsigned long)send,
++			       (unsigned long)send + PAGE_ALIGN(send_len));
++	dcache_clean_inval_poc((unsigned long)recv,
++			       (unsigned long)recv + PAGE_ALIGN(recv_len));
+ 
+-	if (sep_ool_publish(sep, ep, true, e->send_pa, size) ||
+-	    sep_ool_publish(sep, ep, false, e->recv_pa, size)) {
+-		free_pages_exact(e->send, PAGE_ALIGN(size));
+-		free_pages_exact(e->recv, PAGE_ALIGN(size));
+-		memset(e, 0, sizeof(*e));
+-		return -EIO;
+-	}
++	mutex_lock(&sep->lock);
++	e->send = send;
++	e->recv = recv;
++	e->send_pa = virt_to_phys(send);
++	e->recv_pa = virt_to_phys(recv);
++	e->send_len = send_len;
++	e->recv_len = recv_len;
++	mutex_unlock(&sep->lock);
+ 
+-	e->allocated = true;
+-	dev_info(sep->dev, "ep %u: send %pad recv %pad len %zu\n", ep,
+-		 &e->send_pa, &e->recv_pa, size);
+-	return 0;
++	ret = sep_ool_publish(sep, ep, e);
++	/*
++	 * Once any control message went out the SEP may hold these addresses,
++	 * so the pages are never freed after a partial publish either.
++	 */
++	mutex_lock(&sep->lock);
++	e->published = true;
++	mutex_unlock(&sep->lock);
++
++	dev_info(sep->dev, "ep %#04x: OOL send %pa len %#zx recv %pa len %#zx%s\n",
++		 ep, &e->send_pa, send_len, &e->recv_pa, recv_len,
++		 ret ? " (publish incomplete)" : "");
++	return ret;
++
++err_free:
++	if (send)
++		free_pages_exact(send, PAGE_ALIGN(send_len));
++	if (recv)
++		free_pages_exact(recv, PAGE_ALIGN(recv_len));
++	return ret;
+ }
+ 
+ /*
+- * Run one endpoint command. Small payloads only for now; the >16 KiB
+- * 0xfc/0xfd/0xfe chunk dance is documented but not implemented yet.
++ * Run one single-chunk endpoint command (docs/sep/sbio-commands.md §1):
++ *
++ *	AP:  ep=E tag=0xfc op=cmd param=0 data=input length
++ *	SEP: ep=E tag=0xfc op=cmd param=0 data=reply payload length
++ *
++ * Input starts at send OOL offset 0, the reply payload at receive OOL offset
++ * 7. A tag 0xff reply is an error with its status word at receive OOL offset
++ * 0x10. The 0xfd/0xfe chunk sequence is not implemented: a transfer that
++ * needs it fails with -EMSGSIZE or -EPROTO. Called with cfg_lock held.
+  */
+ static int sep_transfer(struct sep_a9 *sep, u8 ep, u8 cmd,
+-			const void *in, size_t inlen,
+-			void *out, size_t outlen, unsigned int timeout_ms)
++			const void *in, size_t inlen, void *out, size_t outlen,
++			size_t *replylen, u32 *status)
+ {
+-	struct sep_ep *e = ep < SEP_OEP_MAX ? &sep->eps[ep] : NULL;
++	struct sep_ep *e = &sep->eps[ep];
+ 	unsigned long left;
+-	int ret = 0;
++	size_t len, n;
++	int ret;
++
++	*replylen = 0;
++	*status = 0;
+ 
+-	if (!e || !e->allocated)
++	if (ep > SEP_EP_CLIENT_MAX || !e->published)
+ 		return -ENODEV;
+-	if (inlen > e->send_len || outlen > e->recv_len)
++	if (inlen > e->send_len || inlen > SEP_XFER_CHUNK)
+ 		return -EMSGSIZE;
+-	if (inlen > SEP_OOL_CHUNK)
+-		return -EMSGSIZE;	/* chunking TODO */
+-
+-	mutex_lock(&sep->xfer_lock);
+ 
+ 	if (inlen)
+ 		memcpy(e->send, in, inlen);
+-	dcache_clean_poc((unsigned long)e->send,
+-			 (unsigned long)e->send + inlen);
++	dcache_clean_poc((unsigned long)e->send, (unsigned long)e->send + inlen);
+ 
++	mutex_lock(&sep->lock);
+ 	reinit_completion(&sep->xfer_done);
++	sep->xfer_ep = ep;
+ 	sep->xfer_cmd = cmd;
+-	sep->xfer_out_len = 0;
+-	sep->xfer_err = 0;
++	sep->xfer_tag = 0;
+ 	sep->xfer_waiting = true;
++	mutex_unlock(&sep->lock);
+ 
+-	sep_send_raw(sep, ep, SEP_TAG_XFER, cmd, 0, inlen);
++	ret = sep_send_raw(sep, ep, SEP_TAG_XFER, cmd, 0, inlen);
++	if (ret)
++		goto out_cancel;
+ 
+ 	left = wait_for_completion_timeout(&sep->xfer_done,
+-					   msecs_to_jiffies(timeout_ms));
++					   msecs_to_jiffies(SEP_XFER_TIMEOUT_MS));
+ 	if (!left) {
+-		sep->xfer_waiting = false;
+ 		ret = -ETIMEDOUT;
+-		goto out;
++		goto out_cancel;
+ 	}
+-	if (sep->xfer_err) {
+-		ret = sep->xfer_err;
+-		goto out;
+-	}
+-
+-	if (out && outlen) {
+-		size_t n;
+-
+-		/* The reply carries a 7-byte header before the payload. */
+-		if (sep->xfer_out_len <= SEP_XFER_HDR) {
+-			ret = 0;
+-			goto out;
+-		}
+-		n = min(outlen, sep->xfer_out_len - SEP_XFER_HDR);
+ 
++	switch (sep->xfer_tag) {
++	case SEP_TAG_XFER:
++		break;
++	case SEP_TAG_XFER_ERR:
+ 		dcache_inval_poc((unsigned long)e->recv,
+-				 (unsigned long)e->recv + n);
+-		memcpy(out, e->recv + SEP_XFER_HDR, n);
+-		sep->last_out_len = n;
+-		memcpy(sep->last_out, e->recv + SEP_XFER_HDR, n);
+-		ret = n;
+-	} else {
+-		sep->last_out_len = 0;
++				 (unsigned long)e->recv + SEP_XFER_ERR_OFF + 4);
++		*status = get_unaligned_le32(e->recv + SEP_XFER_ERR_OFF);
++		dev_warn(sep->dev, "ep %#04x cmd %#x: SEP error op=%#x status %#x\n",
++			 ep, cmd, sep->xfer_op, *status);
++		return -EIO;
++	default:
++		dev_warn(sep->dev, "ep %#04x cmd %#x: chunk tag %#x not supported\n",
++			 ep, cmd, sep->xfer_tag);
++		return -EPROTO;
+ 	}
+ 
+-out:
+-	mutex_unlock(&sep->xfer_lock);
+-	return ret;
+-}
+-
+-/*
+- * Publish one endpoint OOL buffer. Length is in bytes, the address is the
+- * AP physical address shifted right by 12 (both as in AppleSEPManager's
+- * cmsgSET_OOL_IN/OUT handling). Endpoint 0 carries the control messages and
+- * the target endpoint travels in the parameter field.
+- */
+-static int sep_ool_publish(struct sep_a9 *sep, u8 ep, bool send,
+-			   dma_addr_t pa, size_t len)
+-{
+-	int ret;
++	/* data counts the payload only; the 7-byte header is extra. */
++	len = sep->xfer_data;
++	*replylen = len;
++	if (len > SEP_XFER_CHUNK || SEP_XFER_HDR + len > e->recv_len)
++		return -EMSGSIZE;	/* multi-chunk reply: not implemented */
+ 
+-	ret = sep_send_raw(sep, 0, 0, send ? SEP_OP_SET_SEND_SIZE
+-					   : SEP_OP_SET_RECV_SIZE, ep, len);
+-	if (ret)
+-		return ret;
++	dcache_inval_poc((unsigned long)e->recv,
++			 (unsigned long)e->recv + SEP_XFER_HDR + len);
++	n = min(len, outlen);
++	if (n)
++		memcpy(out, e->recv + SEP_XFER_HDR, n);
++	return n;
+ 
+-	return sep_send_raw(sep, 0, 0, send ? SEP_OP_SET_SEND_ADDR
+-					    : SEP_OP_SET_RECV_ADDR, ep,
+-			    upper_32_bits(pa) << 20 | (lower_32_bits(pa) >> 12));
++out_cancel:
++	mutex_lock(&sep->lock);
++	sep->xfer_waiting = false;
++	mutex_unlock(&sep->lock);
++	return ret;
+ }
+ 
+ static ssize_t sep_dbg_status_read(struct file *file, char __user *ubuf,
+ 				   size_t count, loff_t *ppos)
+ {
+ 	struct sep_a9 *sep = file->private_data;
++	unsigned int i, complete = 0, published = 0;
+ 	char *buf;
+ 	ssize_t ret;
+ 
+-	buf = kzalloc(512, GFP_KERNEL);
++	buf = kzalloc(1024, GFP_KERNEL);
+ 	if (!buf)
+ 		return -ENOMEM;
+ 
++	mutex_lock(&sep->lock);
++	for (i = 0; i < SEP_EP_COUNT; i++) {
++		complete += sep_ep_complete(&sep->eps[i]);
++		published += sep->eps[i].published;
++	}
++	mutex_unlock(&sep->lock);
++
+ 	if (sep->running) {
+-		ret = scnprintf(buf, 512,
++		u32 rsts = readl(sep->mbox + SEP_MBOX_RECV_STS);
++		u32 ssts = readl(sep->mbox + SEP_MBOX_SND_STS);
++
++		ret = scnprintf(buf, 1024,
+ 				"base=%px mbox=%px running=1\n"
+-				"recv_sts=%#x snd_sts=%#x en_int=%#x\n"
+-				"tx=%llu rx=%llu dropped=%llu log=%u\n",
++				"recv_sts=%#x (%s) snd_sts=%#x (%s) en_int=%#x\n",
+ 				sep->base, sep->mbox,
+-				readl(sep->mbox + SEP_MBOX_RECV_STS),
+-				readl(sep->mbox + SEP_MBOX_SND_STS),
+-				readl(sep->mbox + SEP_MBOX_EN_INT),
+-				sep->tx_count, sep->rx_count, sep->dropped,
+-				sep->log_count);
++				rsts, rsts & SEP_MBOX_STS_EMPTY ? "empty" : "pending",
++				ssts, ssts & SEP_MBOX_STS_FULL ? "full" : "room",
++				readl(sep->mbox + SEP_MBOX_EN_INT));
+ 	} else {
+-		ret = scnprintf(buf, 512,
+-				"base=%px mbox=%px running=0 (mailbox untouched)\n"
+-				"tx=%llu rx=%llu dropped=%llu log=%u\n",
+-				sep->base, sep->mbox, sep->tx_count,
+-				sep->rx_count, sep->dropped, sep->log_count);
++		ret = scnprintf(buf, 1024,
++				"base=%px mbox=%px running=0 (mailbox untouched)\n",
++				sep->base, sep->mbox);
+ 	}
++	ret += scnprintf(buf + ret, 1024 - ret,
++			 "tx=%llu rx=%llu tx_busy=%llu dropped=%llu log=%u\n"
++			 "rx_idle_ms=%u endpoints_complete=%u published=%u\n"
++			 "sbio_ep=%d sbio_ready=%d\n",
++			 sep->tx_count, sep->rx_count, sep->tx_busy, sep->dropped,
++			 sep->log_count,
++			 sep->rx_count ? jiffies_to_msecs(jiffies - sep->last_rx) : 0,
++			 complete, published, sep->sbio_ep, sep->sbio_ready);
+ 
+ 	ret = simple_read_from_buffer(ubuf, count, ppos, buf, ret);
+ 	kfree(buf);
+@@ -420,28 +637,46 @@ static ssize_t sep_dbg_log_read(struct file *file, char __user *ubuf,
+ 				size_t count, loff_t *ppos)
+ {
+ 	struct sep_a9 *sep = file->private_data;
++	size_t size = SEP_LOG_ENTRIES * 112;
+ 	unsigned int i;
+ 	char *buf;
+ 	ssize_t len = 0;
+ 
+-	buf = kzalloc(PAGE_SIZE, GFP_KERNEL);
++	buf = kvzalloc(size, GFP_KERNEL);
+ 	if (!buf)
+ 		return -ENOMEM;
+ 
+ 	mutex_lock(&sep->lock);
+-	for (i = 0; i < sep->log_count && len < PAGE_SIZE - 96; i++) {
++	for (i = 0; i < sep->log_count; i++) {
+ 		u64 msg = sep->log[(sep->log_head + i) % SEP_LOG_ENTRIES];
++		u32 data = SEP_MSG_GET_DATA(msg);
++		u8 a, b, c, d;
++		char name[5];
+ 
+-		len += scnprintf(buf + len, PAGE_SIZE - len,
+-				 "ep=%02x tag=%02x op=%02x param=%02x data=%08x\n",
++		len += scnprintf(buf + len, size - len,
++				 "ep=%02x tag=%02x op=%02x param=%02x data=%08x",
+ 				 SEP_MSG_GET_EP(msg), SEP_MSG_GET_TAG(msg),
+ 				 SEP_MSG_GET_OP(msg), SEP_MSG_GET_PARAM(msg),
+-				 SEP_MSG_GET_DATA(msg));
++				 data);
++		if (SEP_MSG_GET_EP(msg) == SEP_EP_DISCOVERY &&
++		    SEP_MSG_GET_OP(msg) == SEP_DISC_NAME &&
++		    sep_fourcc(data, name)) {
++			len += scnprintf(buf + len, size - len,
++					 "  [ep %#04x '%s']",
++					 SEP_MSG_GET_PARAM(msg), name);
++		} else if (SEP_MSG_GET_EP(msg) == SEP_EP_DISCOVERY &&
++			   SEP_MSG_GET_OP(msg) == SEP_DISC_OOL) {
++			sep_ool_word(data, &a, &b, &c, &d);
++			len += scnprintf(buf + len, size - len,
++					 "  [ep %#04x OOL in %u-%u out %u-%u pages]",
++					 SEP_MSG_GET_PARAM(msg), a, b, c, d);
++		}
++		len += scnprintf(buf + len, size - len, "\n");
+ 	}
+ 	mutex_unlock(&sep->lock);
+ 
+ 	len = simple_read_from_buffer(ubuf, count, ppos, buf, len);
+-	kfree(buf);
++	kvfree(buf);
+ 	return len;
+ }
+ 
+@@ -451,6 +686,178 @@ static const struct file_operations sep_dbg_log_fops = {
+ 	.read = sep_dbg_log_read,
+ };
+ 
++static const char *sep_ep_source(const struct sep_ep *e)
++{
++	if (e->name_manual && e->ool_manual)
++		return "manual";
++	if (e->name_manual || e->ool_manual)
++		return "mixed";
++	return "mailbox";
++}
++
++static const char *sep_ep_state(const struct sep_ep *e)
++{
++	if (!e->has_ool)
++		return "incomplete: no OOL message";
++	if (!e->has_name)
++		return "incomplete: no name message";
++	if (e->published)
++		return "published";
++	if (!e->in_max && !e->out_max)
++		return "complete, no OOL";
++	return "complete";
++}
++
++/* Endpoint table, one line per endpoint the driver knows anything about. */
++static ssize_t sep_dbg_endpoints_read(struct file *file, char __user *ubuf,
++				      size_t count, loff_t *ppos)
++{
++	struct sep_a9 *sep = file->private_data;
++	size_t size = SEP_EP_COUNT * 192;
++	unsigned int i;
++	char *buf;
++	ssize_t len = 0;
++
++	buf = kvzalloc(size, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	len += scnprintf(buf + len, size - len,
++			 "# id   name  src     in_pages out_pages state\n");
++	mutex_lock(&sep->lock);
++	for (i = 0; i < SEP_EP_COUNT; i++) {
++		struct sep_ep *e = &sep->eps[i];
++		char name[5] = "-";
++		char in[8] = "-", out[8] = "-";
++
++		if (!e->has_name && !e->has_ool)
++			continue;
++		if (e->has_name && !sep_fourcc(e->name, name))
++			snprintf(name, sizeof(name), "????");
++		if (e->has_ool) {
++			snprintf(in, sizeof(in), "%u-%u", e->in_min, e->in_max);
++			snprintf(out, sizeof(out), "%u-%u", e->out_min, e->out_max);
++		}
++		len += scnprintf(buf + len, size - len,
++				 "0x%02x %-5s %-7s %-8s %-9s %s",
++				 i, name, sep_ep_source(e), in, out,
++				 sep_ep_state(e));
++		if (e->conflict)
++			len += scnprintf(buf + len, size - len, " CONFLICT");
++		if (sep_ep_complete(e) && !e->published && (e->in_max || e->out_max))
++			len += scnprintf(buf + len, size - len,
++					 " max_send=%#x max_recv=%#x",
++					 e->in_max * SEP_OOL_PAGE,
++					 e->out_max * SEP_OOL_PAGE);
++		if (e->published)
++			len += scnprintf(buf + len, size - len,
++					 " send=%pa/%#zx recv=%pa/%#zx",
++					 &e->send_pa, e->send_len,
++					 &e->recv_pa, e->recv_len);
++		len += scnprintf(buf + len, size - len, "\n");
++	}
++	mutex_unlock(&sep->lock);
++
++	len = simple_read_from_buffer(ubuf, count, ppos, buf, len);
++	kvfree(buf);
++	return len;
++}
++
++static const struct file_operations sep_dbg_endpoints_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.read = sep_dbg_endpoints_read,
++};
++
++/*
++ * Declare an advertisement by hand, from a pongoOS log of the 0xfd messages
++ * (all numbers hex):
++ *
++ *	echo "ID NAME IN_MIN IN_MAX OUT_MIN OUT_MAX" > advertise
++ *	echo "raw ID NAME_WORD OOL_WORD" > advertise
++ *
++ * e.g. "10 xars 8 8 8 8" or, copying the two data words of
++ * "ep=fd op=0 param=10 data=78617273" / "ep=fd op=1 param=10 data=8080808",
++ * "raw 10 78617273 8080808". This only fills the table; nothing is sent.
++ * A value the mailbox already delivered can't be overridden.
++ */
++static ssize_t sep_dbg_advertise_write(struct file *file,
++				       const char __user *ubuf, size_t count,
++				       loff_t *ppos)
++{
++	struct sep_a9 *sep = file->private_data;
++	unsigned int id, word, ool, v[4];
++	u8 a, b, c, d;
++	char buf[96], str[8];
++	struct sep_ep *e;
++	int ret = 0, i;
++
++	if (count >= sizeof(buf))
++		return -EINVAL;
++	if (copy_from_user(buf, ubuf, count))
++		return -EFAULT;
++	buf[count] = '\0';
++
++	if (sscanf(buf, "raw %x %x %x", &id, &word, &ool) == 3) {
++		if (!sep_fourcc(word, str))
++			return -EINVAL;
++	} else if (sscanf(buf, "%x %7s %x %x %x %x", &id, str, &v[0], &v[1],
++			  &v[2], &v[3]) == 6) {
++		if (strlen(str) != 4)
++			return -EINVAL;
++		word = 0;
++		for (i = 0; i < 4; i++) {
++			if (str[i] < 0x20 || str[i] > 0x7e || v[i] > 0xff)
++				return -EINVAL;
++			word = word << 8 | (u8)str[i];
++		}
++		ool = v[0] | v[1] << 8 | v[2] << 16 | v[3] << 24;
++	} else {
++		return -EINVAL;
++	}
++	if (id > SEP_EP_CLIENT_MAX)
++		return -EINVAL;
++	sep_ool_word(ool, &a, &b, &c, &d);
++
++	mutex_lock(&sep->lock);
++	e = &sep->eps[id];
++	if (e->published) {
++		ret = -EBUSY;
++	} else if ((e->has_name && !e->name_manual && e->name != word) ||
++		   (e->has_ool && !e->ool_manual &&
++		    (e->in_min != a || e->in_max != b ||
++		     e->out_min != c || e->out_max != d))) {
++		ret = -EEXIST;	/* disagrees with what the mailbox delivered */
++	} else {
++		if (!e->has_name || e->name_manual) {
++			e->name = word;
++			e->has_name = true;
++			e->name_manual = true;
++		}
++		if (!e->has_ool || e->ool_manual) {
++			e->in_min = a;
++			e->in_max = b;
++			e->out_min = c;
++			e->out_max = d;
++			e->has_ool = true;
++			e->ool_manual = true;
++		}
++	}
++	mutex_unlock(&sep->lock);
++
++	if (ret)
++		return ret;
++	dev_info(sep->dev, "ep %#04x: declared '%s' OOL in [%u,%u] out [%u,%u] pages\n",
++		 id, str, a, b, c, d);
++	return count;
++}
++
++static const struct file_operations sep_dbg_advertise_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = sep_dbg_advertise_write,
++};
++
+ /*
+  * Raw bring-up interface:
+  *	echo "ep tag op param data" > send	(all hex, one message)
+@@ -462,6 +869,7 @@ static ssize_t sep_dbg_send_write(struct file *file, const char __user *ubuf,
+ 	struct sep_a9 *sep = file->private_data;
+ 	unsigned int ep, tag, op, param, data;
+ 	char buf[64];
++	int ret;
+ 
+ 	if (count >= sizeof(buf))
+ 		return -EINVAL;
+@@ -472,8 +880,8 @@ static ssize_t sep_dbg_send_write(struct file *file, const char __user *ubuf,
+ 	if (sscanf(buf, "%x %x %x %x %x", &ep, &tag, &op, &param, &data) != 5)
+ 		return -EINVAL;
+ 
+-	sep_send_raw(sep, ep, tag, op, param, data);
+-	return count;
++	ret = sep_send_raw(sep, ep, tag, op, param, data);
++	return ret ? ret : count;
+ }
+ 
+ static const struct file_operations sep_dbg_send_fops = {
+@@ -484,24 +892,17 @@ static const struct file_operations sep_dbg_send_fops = {
+ 
+ /*
+  * OOL buffer bring-up:
+- *	echo "ep send|recv size" > ool
+- * Allocates a coherent buffer, publishes size+address to the SEP and keeps
+- * the allocation alive for the lifetime of the driver instance.
++ *	echo "EP SEND_SIZE RECV_SIZE" > ool	(all hex, e.g. "10 8000 8000")
++ * The endpoint needs a complete advertisement and each size must be a 4 KiB
++ * multiple inside its advertised range ("in" = send, "out" = receive). The
++ * buffers are published through 'cntl' and kept for the lifetime of the
++ * driver; sepOS accepts one binding per endpoint.
+  */
+-struct sep_ool {
+-	struct sep_a9 *sep;
+-	u8 ep;
+-	bool send;
+-	void *cpu;
+-	dma_addr_t dma;
+-	size_t len;
+-};
+-
+ static ssize_t sep_dbg_ool_write(struct file *file, const char __user *ubuf,
+ 				 size_t count, loff_t *ppos)
+ {
+ 	struct sep_a9 *sep = file->private_data;
+-	unsigned int ep, len;
++	unsigned int ep, send_len, recv_len;
+ 	char buf[64];
+ 	int ret;
+ 
+@@ -511,11 +912,15 @@ static ssize_t sep_dbg_ool_write(struct file *file, const char __user *ubuf,
+ 		return -EFAULT;
+ 	buf[count] = '\0';
+ 
+-	/* echo "ep size" > ool   -- size is the same for send and receive */
+-	if (sscanf(buf, "%x %x", &ep, &len) != 2)
++	if (sscanf(buf, "%x %x %x", &ep, &send_len, &recv_len) != 3 ||
++	    ep > SEP_EP_CLIENT_MAX)
+ 		return -EINVAL;
++	if (!sep->running)
++		return -ENXIO;
+ 
+-	ret = sep_ep_alloc(sep, ep, len);
++	mutex_lock(&sep->cfg_lock);
++	ret = sep_ep_alloc(sep, ep, send_len, recv_len);
++	mutex_unlock(&sep->cfg_lock);
+ 	return ret ? ret : count;
+ }
+ 
+@@ -530,40 +935,12 @@ static const struct file_operations sep_dbg_ool_fops = {
+  * /dev/sep-bio: the ABI the Aurora Silicon libfprint driver speaks
+  * (include/uapi/linux/apple-sep.h, interface version 4). Keeping the same
+  * interface means their libfprint `aurora` driver, fprintd and Omarchy's
+- * fingerprint UI work unchanged; only the operations this driver has not
+- * implemented yet return -ENOSYS.
++ * fingerprint UI work unchanged later. Until the SBIO state machine and the
++ * real EnrollMode/MatchMode payloads exist, this interface never sends a
++ * message: every SEP command goes through debugfs.
+  */
+ static struct sep_a9 *sep_a9_instance;
+ 
+-static int sbio_ep = -1;
+-module_param(sbio_ep, int, 0444);
+-MODULE_PARM_DESC(sbio_ep, "SEP endpoint number for sbio (-1 = unset)");
+-
+-/*
+- * SBIO handshake: command 0x73 with a u32 of 1 (IOSEPBiometricService::
+- * initSbioCommunication). Everything else on the endpoint depends on it.
+- */
+-static int sep_sbio_init(struct sep_a9 *sep)
+-{
+-	u32 one = 1;
+-	int ret;
+-
+-	if (sep->sbio_ready)
+-		return 0;
+-	if (!sep->running || sep->sbio_ep >= SEP_OEP_MAX ||
+-	    !sep->eps[sep->sbio_ep].allocated)
+-		return -EAGAIN;
+-
+-	ret = sep_transfer(sep, sep->sbio_ep, 0x73, &one, sizeof(one), NULL, 0,
+-			   10000);
+-	if (ret < 0)
+-		return ret;
+-
+-	sep->sbio_ready = true;
+-	dev_info(sep->dev, "sbio endpoint %u ready\n", sep->sbio_ep);
+-	return 0;
+-}
+-
+ static int sep_bio_open(struct inode *inode, struct file *file)
+ {
+ 	file->private_data = sep_a9_instance;
+@@ -589,7 +966,7 @@ static long sep_bio_ioctl(struct file *file, unsigned int cmd,
+ 	switch (cmd) {
+ 	case SEP_BIO_GET_INFO:
+ 		/*
+-		 * sensor_present stays 0 until the SBIO endpoint is up: the
++		 * sensor_present stays 0 until SBIO has acknowledged 0x73: the
+ 		 * sensor only exists once sepOS has brought it up, and libfprint
+ 		 * correctly declines to expose a reader without one.
+ 		 */
+@@ -608,86 +985,36 @@ static long sep_bio_ioctl(struct file *file, unsigned int cmd,
+ 		}
+ 		kfree(list);
+ 		return 0;
+-	case SEP_BIO_ENROL_START: {
+-		/*
+-		 * Provisional: the 68-byte EnrollMode payload is produced by
+-		 * biometrickitd in userspace, so its layout is not yet known.
+-		 * Send a zeroed buffer with the caller's flags so the transport
+-		 * can be exercised; refine once the struct is recovered.
+-		 */
+-		struct sep_bio_enrol_start start;
+-		u8 payload[68] = { };
+-		int ret;
+-
+-		if (copy_from_user(&start, (void __user *)arg, sizeof(start)))
+-			return -EFAULT;
+-		if (sep_sbio_init(sep))
+-			return -EAGAIN;
+-		if (sep->enrol_len) {
+-			memcpy(payload, sep->enrol_payload, sep->enrol_len);
+-		} else {
+-			memcpy(payload, &start.flags, sizeof(start.flags));
+-		}
+-		ret = sep_transfer(sep, sep->sbio_ep, 0x03, payload,
+-				   sep->enrol_len ? sep->enrol_len : sizeof(payload),
+-				   NULL, 0, 10000);
+-		if (ret < 0)
+-			return ret;
+-		sep->bio_state = SEP_BIO_STATE_PENDING;
+-		sep->bio_stage = 0;
+-		return 0;
+-	}
+ 	case SEP_BIO_ENROL_POLL: {
+ 		struct sep_bio_enrol_poll poll = {
+-			.state = sep->bio_state,
+-			.stage = sep->bio_stage,
+-			.stages_total = 0,	/* unknown until the struct lands */
+-			.status = 0,
++			.state = SEP_BIO_STATE_IDLE,
+ 		};
+ 
+ 		if (copy_to_user((void __user *)arg, &poll, sizeof(poll)))
+ 			return -EFAULT;
+ 		return 0;
+ 	}
+-	case SEP_BIO_VERIFY_START: {
+-		/* Provisional 68-byte MatchMode payload, same caveat as enrol. */
+-		struct sep_bio_verify_start start;
+-		u8 payload[68] = { };
+-		int ret;
+-
+-		if (copy_from_user(&start, (void __user *)arg, sizeof(start)))
+-			return -EFAULT;
+-		if (sep_sbio_init(sep))
+-			return -EAGAIN;
+-		if (sep->verify_len) {
+-			memcpy(payload, sep->verify_payload, sep->verify_len);
+-		} else {
+-			memcpy(payload, &start.flags, sizeof(start.flags));
+-		}
+-		ret = sep_transfer(sep, sep->sbio_ep, 0x25, payload,
+-				   sep->verify_len ? sep->verify_len : sizeof(payload),
+-				   NULL, 0, 10000);
+-		if (ret < 0)
+-			return ret;
+-		sep->bio_state = SEP_BIO_STATE_PENDING;
+-		return 0;
+-	}
+ 	case SEP_BIO_VERIFY_POLL: {
+ 		struct sep_bio_verify_poll poll = {
+-			.state = sep->bio_state,
++			.state = SEP_BIO_STATE_IDLE,
+ 			.result = SEP_BIO_NOT_COMPARED,
+-			.status = 0,
+ 		};
+ 
+ 		if (copy_to_user((void __user *)arg, &poll, sizeof(poll)))
+ 			return -EFAULT;
+ 		return 0;
+ 	}
++	case SEP_BIO_ENROL_START:
++	case SEP_BIO_VERIFY_START:
++		/*
++		 * EnrollMode (0x03) and MatchMode (0x25) need the real 68-byte
++		 * payloads built by biometrickitd, plus sensor frames; zeroed
++		 * payloads prove nothing (docs/sep/linux-bringup-next.md §4).
++		 */
+ 	case SEP_BIO_CANCEL:
+ 	case SEP_BIO_DELETE:
+ 	case SEP_BIO_DELETE_ALL:
+ 	case SEP_BIO_ATTEST:
+-		/* SBIO framing is not implemented yet (docs/sep/driver-notes.md). */
+ 		return -ENOSYS;
+ 	default:
+ 		return -ENOTTY;
+@@ -713,7 +1040,8 @@ static struct miscdevice sep_bio_dev = {
+  * Arming control. Nothing touches the SEP registers until the user writes 1
+  * here: the first read of a powered-down SEP block can stall the AP, and on a
+  * checkm8 boot sepOS is usually not running. Arm only after the pongoOS/m1n1
+- * side has confirmed the SEP is up.
++ * side has confirmed the SEP is up. Arming only drains and records; it sends
++ * nothing.
+  */
+ static ssize_t sep_dbg_start_write(struct file *file, const char __user *ubuf,
+ 				   size_t count, loff_t *ppos)
+@@ -734,12 +1062,11 @@ static ssize_t sep_dbg_start_write(struct file *file, const char __user *ubuf,
+ 		writel(0, sep->mbox + SEP_MBOX_DIS_INT);
+ 		writel(SEP_MBOX_INT_ENABLE, sep->mbox + SEP_MBOX_EN_INT);
+ 		sep->running = true;
+-		schedule_delayed_work(&sep->poll,
+-				      usecs_to_jiffies(sep->poll_us));
++		schedule_delayed_work(&sep->poll, 0);
+ 	} else if (!on && sep->running) {
++		sep->running = false;
+ 		cancel_delayed_work_sync(&sep->poll);
+ 		writel(SEP_MBOX_INT_ENABLE, sep->mbox + SEP_MBOX_DIS_INT);
+-		sep->running = false;
+ 	}
+ 
+ 	return count;
+@@ -776,32 +1103,34 @@ static int sep_hex2bin(u8 *dst, const char *src, size_t max)
+ }
+ 
+ /*
+- * echo "ep cmd hexpayload" > xfer
+- * Runs one endpoint command and keeps the reply for read().
++ * echo "EP CMD [HEXPAYLOAD]" > xfer	(hex; payload as bytes, "01000000")
++ * Runs one single-chunk endpoint command and keeps the result for read().
+  */
+ static ssize_t sep_dbg_xfer_write(struct file *file, const char __user *ubuf,
+ 				  size_t count, loff_t *ppos)
+ {
+ 	struct sep_a9 *sep = file->private_data;
+ 	unsigned int ep, cmd;
++	size_t n, replylen;
++	u32 status;
+ 	u8 *payload;
+ 	char *buf, *hex;
+-	size_t n;
+ 	int ret;
+ 
+-	if (count > SEP_OOL_CHUNK * 2 + 32)
++	if (count > SEP_XFER_CHUNK * 2 + 32)
+ 		return -EINVAL;
+ 
+ 	buf = memdup_user_nul(ubuf, count);
+ 	if (IS_ERR(buf))
+ 		return PTR_ERR(buf);
+ 
+-	if (sscanf(buf, "%x %x", &ep, &cmd) != 2) {
++	if (sscanf(buf, "%x %x", &ep, &cmd) != 2 || ep > SEP_EP_CLIENT_MAX ||
++	    cmd > 0xff) {
+ 		kfree(buf);
+ 		return -EINVAL;
+ 	}
+ 
+-	payload = kmalloc(SEP_OOL_CHUNK, GFP_KERNEL);
++	payload = kmalloc(SEP_XFER_CHUNK, GFP_KERNEL);
+ 	if (!payload) {
+ 		kfree(buf);
+ 		return -ENOMEM;
+@@ -809,10 +1138,25 @@ static ssize_t sep_dbg_xfer_write(struct file *file, const char __user *ubuf,
+ 
+ 	hex = strchr(buf, ' ');
+ 	hex = hex ? strchr(hex + 1, ' ') : NULL;
+-	n = hex ? sep_hex2bin(payload, hex + 1, SEP_OOL_CHUNK) : 0;
++	n = hex ? sep_hex2bin(payload, hex + 1, SEP_XFER_CHUNK) : 0;
+ 
++	mutex_lock(&sep->cfg_lock);
+ 	ret = sep_transfer(sep, ep, cmd, payload, n, sep->last_out,
+-			   sizeof(sep->last_out), 10000);
++			   sizeof(sep->last_out), &replylen, &status);
++	sep->last_ep = ep;
++	sep->last_cmd = cmd;
++	sep->last_ret = ret < 0 ? ret : 0;
++	sep->last_status = status;
++	sep->last_out_len = ret < 0 ? 0 : ret;
++	if (ret >= 0 && cmd == SEP_CMD_SBIO_INIT && (int)ep == sep->sbio_ep) {
++		sep->sbio_ready = true;
++		dev_info(sep->dev, "sbio ep %#04x: init (0x73) acknowledged\n", ep);
++	}
++	mutex_unlock(&sep->cfg_lock);
++
++	if (ret >= 0 && replylen > sizeof(sep->last_out))
++		dev_warn(sep->dev, "ep %#04x cmd %#x: reply %zu bytes truncated\n",
++			 ep, cmd, replylen);
+ 	kfree(payload);
+ 	kfree(buf);
+ 
+@@ -823,23 +1167,29 @@ static ssize_t sep_dbg_xfer_read(struct file *file, char __user *ubuf,
+ 				 size_t count, loff_t *ppos)
+ {
+ 	struct sep_a9 *sep = file->private_data;
++	size_t size = SEP_XFER_CHUNK * 2 + 128;
+ 	char *buf;
+ 	ssize_t len = 0;
+ 	size_t i;
+ 
+-	buf = kzalloc(PAGE_SIZE, GFP_KERNEL);
++	buf = kvzalloc(size, GFP_KERNEL);
+ 	if (!buf)
+ 		return -ENOMEM;
+ 
+-	len += scnprintf(buf + len, PAGE_SIZE - len, "out_len=%zu\n",
+-			 sep->last_out_len);
+-	for (i = 0; i < sep->last_out_len && len < PAGE_SIZE - 8; i++)
+-		len += scnprintf(buf + len, PAGE_SIZE - len, "%02x",
++	mutex_lock(&sep->cfg_lock);
++	len += scnprintf(buf + len, size - len,
++			 "out_len=%zu\n", sep->last_out_len);
++	for (i = 0; i < sep->last_out_len; i++)
++		len += scnprintf(buf + len, size - len, "%02x",
+ 				 sep->last_out[i]);
+-	len += scnprintf(buf + len, PAGE_SIZE - len, "\n");
++	len += scnprintf(buf + len, size - len,
++			 "\nep=%#04x cmd=%#04x ret=%d sep_status=%#x\n",
++			 sep->last_ep, sep->last_cmd, sep->last_ret,
++			 sep->last_status);
++	mutex_unlock(&sep->cfg_lock);
+ 
+ 	len = simple_read_from_buffer(ubuf, count, ppos, buf, len);
+-	kfree(buf);
++	kvfree(buf);
+ 	return len;
+ }
+ 
+@@ -851,24 +1201,37 @@ static const struct file_operations sep_dbg_xfer_fops = {
+ };
+ 
+ 
+-/* echo <n> > sbio : select the SEP endpoint number for sbio at runtime */
++/*
++ * echo EP > sbio : select the sbio endpoint (hex). Accepted only for an
++ * endpoint whose complete advertisement names it 'sbio'.
++ */
+ static ssize_t sep_dbg_sbio_write(struct file *file, const char __user *ubuf,
+ 				  size_t count, loff_t *ppos)
+ {
+ 	struct sep_a9 *sep = file->private_data;
+ 	unsigned int ep;
+ 	char buf[8];
++	bool ok;
+ 
+ 	if (count >= sizeof(buf))
+ 		return -EINVAL;
+ 	if (copy_from_user(buf, ubuf, count))
+ 		return -EFAULT;
+ 	buf[count] = '\0';
+-	if (kstrtouint(buf, 0, &ep) || ep >= SEP_OEP_MAX)
++	if (kstrtouint(strim(buf), 16, &ep) || ep > SEP_EP_CLIENT_MAX)
+ 		return -EINVAL;
+ 
++	mutex_lock(&sep->lock);
++	ok = sep_ep_complete(&sep->eps[ep]) &&
++	     sep->eps[ep].name == 0x7362696f;	/* 'sbio' */
++	mutex_unlock(&sep->lock);
++	if (!ok)
++		return -ENOENT;
++
++	mutex_lock(&sep->cfg_lock);
+ 	sep->sbio_ep = ep;
+ 	sep->sbio_ready = false;
++	mutex_unlock(&sep->cfg_lock);
+ 	return count;
+ }
+ 
+@@ -878,52 +1241,6 @@ static const struct file_operations sep_dbg_sbio_fops = {
+ 	.write = sep_dbg_sbio_write,
+ };
+ 
+-
+-/*
+- * echo "enrol <hex>"  > bio_payload
+- * echo "verify <hex>" > bio_payload
+- *
+- * The EnrollMode (0x03) and MatchMode (0x25) payloads are serialized by
+- * biometrickitd in userspace; until that layout is recovered this lets a raw
+- * payload be tested against a live SEP without rebuilding the kernel.
+- */
+-static ssize_t sep_dbg_bio_payload_write(struct file *file,
+-					 const char __user *ubuf, size_t count,
+-					 loff_t *ppos)
+-{
+-	struct sep_a9 *sep = file->private_data;
+-	char *buf, *hex;
+-	size_t n;
+-	int ret = count;
+-
+-	if (count > 512)
+-		return -EINVAL;
+-	buf = memdup_user_nul(ubuf, count);
+-	if (IS_ERR(buf))
+-		return PTR_ERR(buf);
+-
+-	if (!strncmp(buf, "enrol ", 6)) {
+-		hex = buf + 6;
+-		n = sep_hex2bin(sep->enrol_payload, hex, sizeof(sep->enrol_payload));
+-		sep->enrol_len = n;
+-	} else if (!strncmp(buf, "verify ", 7)) {
+-		hex = buf + 7;
+-		n = sep_hex2bin(sep->verify_payload, hex, sizeof(sep->verify_payload));
+-		sep->verify_len = n;
+-	} else {
+-		ret = -EINVAL;
+-	}
+-
+-	kfree(buf);
+-	return ret;
+-}
+-
+-static const struct file_operations sep_dbg_bio_payload_fops = {
+-	.owner = THIS_MODULE,
+-	.open = simple_open,
+-	.write = sep_dbg_bio_payload_write,
+-};
+-
+ static void sep_debugfs_init(struct sep_a9 *sep)
+ {
+ 	sep->dbg = debugfs_create_dir("sep-a9", NULL);
+@@ -934,13 +1251,15 @@ static void sep_debugfs_init(struct sep_a9 *sep)
+ 
+ 	debugfs_create_file("status", 0444, sep->dbg, sep, &sep_dbg_status_fops);
+ 	debugfs_create_file("log", 0444, sep->dbg, sep, &sep_dbg_log_fops);
++	debugfs_create_file("endpoints", 0444, sep->dbg, sep,
++			    &sep_dbg_endpoints_fops);
++	debugfs_create_file("advertise", 0200, sep->dbg, sep,
++			    &sep_dbg_advertise_fops);
+ 	debugfs_create_file("send", 0200, sep->dbg, sep, &sep_dbg_send_fops);
+ 	debugfs_create_file("ool", 0200, sep->dbg, sep, &sep_dbg_ool_fops);
+ 	debugfs_create_file("start", 0200, sep->dbg, sep, &sep_dbg_start_fops);
+ 	debugfs_create_file("xfer", 0600, sep->dbg, sep, &sep_dbg_xfer_fops);
+ 	debugfs_create_file("sbio", 0200, sep->dbg, sep, &sep_dbg_sbio_fops);
+-	debugfs_create_file("bio_payload", 0200, sep->dbg, sep,
+-			    &sep_dbg_bio_payload_fops);
+ }
+ 
+ static int sep_probe(struct platform_device *pdev)
+@@ -951,14 +1270,20 @@ static int sep_probe(struct platform_device *pdev)
+ 	sep = devm_kzalloc(&pdev->dev, sizeof(*sep), GFP_KERNEL);
+ 	if (!sep)
+ 		return -ENOMEM;
++	sep->eps = devm_kcalloc(&pdev->dev, SEP_EP_COUNT, sizeof(*sep->eps),
++				GFP_KERNEL);
++	if (!sep->eps)
++		return -ENOMEM;
+ 
+ 	sep->dev = &pdev->dev;
+ 	mutex_init(&sep->lock);
+-	mutex_init(&sep->xfer_lock);
++	mutex_init(&sep->tx_lock);
++	mutex_init(&sep->cfg_lock);
+ 	init_completion(&sep->xfer_done);
+ 	INIT_DELAYED_WORK(&sep->poll, sep_poll_work);
+ 	sep->poll_us = 10000;
+-	sep->sbio_ep = sbio_ep < 0 ? 0xff : sbio_ep;
++	sep->sbio_ep = -1;
++	sep->last_ep = -1;
+ 
+ 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+ 	if (!res)
+@@ -991,12 +1316,13 @@ static void sep_remove(struct platform_device *pdev)
+ {
+ 	struct sep_a9 *sep = platform_get_drvdata(pdev);
+ 
++	sep->running = false;
+ 	cancel_delayed_work_sync(&sep->poll);
+ 	misc_deregister(&sep_bio_dev);
+ 	sep_a9_instance = NULL;
+-	if (sep->running)
+-		writel(SEP_MBOX_INT_ENABLE, sep->mbox + SEP_MBOX_DIS_INT);
++	writel(SEP_MBOX_INT_ENABLE, sep->mbox + SEP_MBOX_DIS_INT);
+ 	debugfs_remove_recursive(sep->dbg);
++	/* Published OOL buffers stay allocated: the SEP may still use them. */
+ }
+ 
+ static const struct of_device_id sep_of_match[] = {
+@@ -1016,9 +1342,9 @@ static struct platform_driver sep_driver = {
+ };
+ 
+ /*
+- * There is no SEP node in the device tree yet, so instantiate the device
+- * ourselves with the j71t addresses from the ADT. Interrupts are not wired
+- * up in this stage (see docs/sep/driver-notes.md); the mailbox is polled.
++ * Without a SEP node in the device tree, instantiate the device ourselves
++ * with the j71t addresses from the ADT. Interrupts are not wired up in this
++ * stage (see docs/sep/driver-notes.md); the mailbox is polled.
+  */
+ #define SEP_A9_BASE	0x20da00000ULL
+ #define SEP_A9_SIZE	0x10000
+-- 
+2.56.0
+

@@ -1,0 +1,301 @@
+From 9f0ddbb8943fc12cae5e052f0f4b9188de6e4af9 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 11:41:40 +0000
+Subject: [PATCH 4/6] soc: apple: opt into reserved DRAM AOP ring discovery
+
+The early capture skipped 525762560 reserved bytes. An inherited
+AFK ring can be hidden by Linux's crash-kernel, CMA or other DRAM
+reservations, even when their original contents survived boot.
+
+Add immutable ring_scan_reserved=1 for E1. Relax only the memblock
+and PageReserved exclusion; require valid linear-mapped, full-page
+memblock RAM backed by System RAM resources. Keep no-map, MMIO,
+self/stack and fault quarantine exclusions unconditional. The flag
+is captured before the postcore scan and defaults off. No mapping,
+permission, reservation, shared-memory write or AOP traffic is added.
+
+Label each hit with PA and its captured range class: system-ram,
+crash-kernel, cma, reserved-dram or mixed. Use kernel crash-resource
+descriptors and CMA membership, including discontiguous CMA areas;
+never infer addresses from a boot log. Labels do not prove untouched
+contents. Keep coverage/skipped-reason reporting and E2 unchanged.
+
+Host ASan/UBSan tests compile the production policy, classifier and
+scan loop: default/opt-in reserved behavior, mixed hits, no-map crash
+ranges, invalid PFNs/maps, non-RAM resources, self exclusion, AOP
+firmware-window refusal and fault quarantine. No device access.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ Documentation/driver-api/apple-a9-aop.rst | 31 ++++++++++--
+ drivers/soc/apple/Kconfig                 |  2 +
+ drivers/soc/apple/a9-aop-ring-reader.c    | 61 ++++++++++++++++++++---
+ drivers/soc/apple/a9-aop-ring.h           |  8 +++
+ drivers/soc/apple/a9-aop.h                |  2 +
+ drivers/soc/apple/apple-a9-aop.c          |  8 +++
+ 6 files changed, 103 insertions(+), 9 deletions(-)
+
+diff --git a/Documentation/driver-api/apple-a9-aop.rst b/Documentation/driver-api/apple-a9-aop.rst
+index 6c99f6054b..2bffdda986 100644
+--- a/Documentation/driver-api/apple-a9-aop.rst
++++ b/Documentation/driver-api/apple-a9-aop.rst
+@@ -362,8 +362,9 @@ E1: reading the root-only ``/sys/kernel/debug/apple-a9-aop/ring_scan`` performs
+ one scan per boot and freezes the result. Subsequent reads and seq_file buffer
+ retries only format the saved result. It inventories full pages in memblock
+ RAM, including no-map ranges for coverage, but only reads pages proven to be
+-System RAM by the resource tree. It explicitly skips memblock reservations,
+-PageReserved, no-map and invalid linear-map pages. Readable pages require
++System RAM by the resource tree. By default it skips memblock reservations
++and PageReserved pages; no-map and invalid linear-map pages are always skipped.
++Readable pages require
+ pfn_valid, pfn_is_map_memory and virt_addr_valid before page-confined
+ copy_from_kernel_nofault through phys_to_virt. No /dev/mem, guessed MMIO,
+ ioremap, page reference, allocator lock or cache clean/invalidate is used.
+@@ -400,6 +401,29 @@ same-reason pages, and explicitly counts omitted bytes if that storage fills.
+ Coverage counters and PFN quarantine remain exact even then. Tracking is
+ bounded to a 4 GiB DRAM address span; a larger span refuses allocation.
+ 
++Optional ``apple_a9_aop.ring_scan_reserved=1`` requires debug=1 and ring_scan=1.
++It also admits reserved linear-mapped DRAM, including crash-kernel, CMA and
++other memblock/PageReserved reservations, after the same full-page memblock
++RAM, System RAM resource, pfn_valid, pfn_is_map_memory and virt_addr_valid
++checks. No-map, MMIO, reader/stack exclusions and fault quarantine remain
++unconditional. No mapping, reservation or permission is changed. In particular,
++the AOP firmware window at 0x210e00000 is not DRAM and is never added to E1.
++This modifier works with either lazy or postcore capture, and its effective
++value is frozen into ``ring_scan_reserved`` in the report. Coverage counters
++and skipped-reason/range reporting retain their existing meanings.
++
++Every hit reports its PA and ``range_class``: system-ram, crash-kernel, cma,
++reserved-dram or mixed. Crash-kernel membership uses IORES_DESC_CRASH_KERNEL;
++CMA membership uses the kernel CMA-area iterator and cma_intersects, including
++discontiguous areas. Other reserved membership uses memblock/PageReserved.
++These are metadata labels, not guessed address windows. A ring covering
++different page classes is mixed. Labels are captured at discovery and do not
++establish that Linux never wrote the bytes: CMA can have consumers and the
++kernel/boot-payload reservation has already been overwritten. An advancing
++pointer and valid 0xc2 payload remain required to identify a live accel ring.
++E2's separate plain no-map reservation contract is unchanged; a hit in a
++crash-kernel or CMA region does not authorize its automatic reuse by E2.
++
+ Optional ``apple_a9_aop.ring_scan_early=1`` requires debug=1 and ring_scan=1.
+ It runs the same one-shot scan/watch at postcore_initcall_sync, after memory
+ management/scheduling and the arm64 RAM resource map exist, before platform
+@@ -409,7 +433,8 @@ scan, even on early failure. The phase is ``postcore-initcall`` (or
+ ``early-unavailable`` on failure); the default is ``debugfs``. An early scan
+ can delay boot by up to about 47 seconds. It still occurs after Linux's initial
+ allocations, and on a warm kexec the previous kernel already reused RAM.
+-For the best cold-boot evidence, put all three flags in the FIRST Linux boot
++For the best cold-boot evidence, put debug=1, ring_scan=1, ring_scan_early=1
++and, when requested, ring_scan_reserved=1 in the FIRST Linux boot
+ after iOS -> DFU -> Linux, without an intervening Linux or AON power cycle.
+ 
+ A late debugfs scan cannot establish that pages were never allocated. Output
+diff --git a/drivers/soc/apple/Kconfig b/drivers/soc/apple/Kconfig
+index edd4256168..1dc169f2bd 100644
+--- a/drivers/soc/apple/Kconfig
++++ b/drivers/soc/apple/Kconfig
+@@ -20,6 +20,8 @@ config APPLE_A9_AOP
+ 	  With debug=1 ring_scan=1, ring_scan_early=1 captures at postcore initcall
+ 	  before device probing. E1 skips protected/unreadable pages and reports
+ 	  bounded coverage; it never reserves or writes the inherited rings.
++	  ring_scan_reserved=1 also reads reserved linear-mapped System RAM;
++	  no-map pages and MMIO remain excluded.
+ 
+ config APPLE_A9_AOP_IIO
+ 	bool "J71t AOP accelerometer IIO consumer"
+diff --git a/drivers/soc/apple/a9-aop-ring-reader.c b/drivers/soc/apple/a9-aop-ring-reader.c
+index f6971f140b..3dbfb9ed86 100644
+--- a/drivers/soc/apple/a9-aop-ring-reader.c
++++ b/drivers/soc/apple/a9-aop-ring-reader.c
+@@ -6,6 +6,7 @@
+  * IIO only uses an early DT no-map RAM reservation with a RO WB mapping.
+  */
+ #include <linux/bitmap.h>
++#include <linux/cma.h>
+ #include <linux/debugfs.h>
+ #include <linux/delay.h>
+ #include <linux/iio/iio.h>
+@@ -40,6 +41,7 @@
+ 
+ struct rr_hit {
+ 	phys_addr_t pa;
++	enum a9_rr_range_class range_class;
+ 	struct a9_rr_header first;
+ 	struct a9_rr_header last;
+ 	struct a9_rr_report report;
+@@ -75,6 +77,7 @@ struct a9_ring_reader {
+ 	unsigned int nr_hits;
+ 	int scan_errno;
+ 	bool scan_done;
++	bool scan_reserved;
+ 	const char *scan_stop;
+ 	phys_addr_t fault_pa;
+ 	phys_addr_t scan_fault_pa;
+@@ -127,13 +130,14 @@ static int rr_scan_page_reason(struct a9_ring_reader *rr, phys_addr_t pa)
+ 		return A9_RR_SKIP_INVALID; /* Already accounted; never retry. */
+ 	if (!pfn_is_map_memory(PHYS_PFN(pa)))
+ 		return A9_RR_SKIP_NOMAP;
+-	if (memblock_is_region_reserved(pa, PAGE_SIZE))
++	if (!rr->scan_reserved && memblock_is_region_reserved(pa, PAGE_SIZE))
+ 		return A9_RR_SKIP_RESERVED;
+ 	if (!rr_linear_page(pa))
+ 		return A9_RR_SKIP_INVALID;
+-	if (PageReserved(pfn_to_page(PHYS_PFN(pa))))
++	if (!rr->scan_reserved && PageReserved(pfn_to_page(PHYS_PFN(pa))))
+ 		return A9_RR_SKIP_RESERVED;
+-	if (region_intersects(pa, PAGE_SIZE, IORESOURCE_SYSTEM_RAM | IORESOURCE_BUSY,
++	if (!memblock_is_region_memory(pa, PAGE_SIZE) ||
++	    region_intersects(pa, PAGE_SIZE, IORESOURCE_SYSTEM_RAM | IORESOURCE_BUSY,
+ 			      IORES_DESC_NONE) != REGION_INTERSECTS)
+ 		return A9_RR_SKIP_RESOURCE;
+ 	/* Never rediscover our own copied headers as apparent live DMA rings. */
+@@ -152,6 +156,43 @@ static int rr_scan_page_reason(struct a9_ring_reader *rr, phys_addr_t pa)
+ 	return -1;
+ }
+ 
++#if IS_ENABLED(CONFIG_CMA)
++static int rr_cma_page(struct cma *cma, void *data)
++{
++	phys_addr_t pa = *(phys_addr_t *)data;
++
++	/* This also handles discontiguous CMA areas, without cma_get_base(). */
++	return cma_intersects(cma, pa, pa + PAGE_SIZE - 1);
++}
++#endif
++
++/* Informational membership, not a claim that the bytes were never written. */
++static enum a9_rr_range_class rr_page_class(phys_addr_t pa)
++{
++	if (region_intersects(pa, PAGE_SIZE, IORESOURCE_MEM,
++			      IORES_DESC_CRASH_KERNEL) == REGION_INTERSECTS)
++		return A9_RR_CLASS_CRASH;
++#if IS_ENABLED(CONFIG_CMA)
++	if (cma_for_each_area(rr_cma_page, &pa))
++		return A9_RR_CLASS_CMA;
++#endif
++	if (memblock_is_region_reserved(pa, PAGE_SIZE) ||
++	    PageReserved(pfn_to_page(PHYS_PFN(pa))))
++		return A9_RR_CLASS_RESERVED;
++	return A9_RR_CLASS_RAM;
++}
++
++static enum a9_rr_range_class rr_hit_class(phys_addr_t pa)
++{
++	phys_addr_t page = round_down(pa, PAGE_SIZE);
++	enum a9_rr_range_class class = rr_page_class(page);
++
++	for (page += PAGE_SIZE; page < pa + A9_RR_SIZE; page += PAGE_SIZE)
++		if (rr_page_class(page) != class)
++			return A9_RR_CLASS_MIXED;
++	return class;
++}
++
+ static void rr_skip_page(struct a9_ring_reader *rr, phys_addr_t pa,
+ 			 enum a9_rr_skip_reason reason)
+ {
+@@ -317,6 +358,7 @@ static int rr_scan_range(struct resource *res, void *data)
+ 				continue;
+ 			hit = &rr->hits[rr->nr_hits++];
+ 			hit->pa = pa + offset;
++			hit->range_class = rr_hit_class(hit->pa);
+ 			hit->first = header;
+ 			hit->last = header;
+ 			memcpy(hit->prefix, rr->snapshot, sizeof(hit->prefix));
+@@ -430,6 +472,9 @@ static int rr_scan_show(struct seq_file *s, void *unused)
+ 		"no-map", "reserved", "not-system-ram", "invalid-linear-map",
+ 		"reader-or-stack", "read-fault",
+ 	};
++	static const char * const classes[] = {
++		"system-ram", "crash-kernel", "cma", "reserved-dram", "mixed",
++	};
+ 	u64 unvisited;
+ 
+ 	if (mutex_lock_interruptible(&rr->lock))
+@@ -440,6 +485,8 @@ static int rr_scan_show(struct seq_file *s, void *unused)
+ 	seq_puts(s, "format=2 hardware_writes=none mailbox=none rptr_writes=none frozen=1\n");
+ 	seq_puts(s, "ownership=lockless-current-state historical_allocation=unknown cache_coherency=unverified\n");
+ 	seq_puts(s, "excluded=reader-allocations-and-current-kernel-stack\n");
++	seq_printf(s, "ring_scan_reserved=%u class_source=kernel-resource-and-cma-metadata\n",
++		   rr->scan_reserved);
+ 	seq_printf(s, "scan_stop=%s errno=%d bytes=%llu skipped=%llu hits=%u elapsed_ms=%llu fault_pa=%pa\n",
+ 		   rr->scan_stop, rr->scan_errno, c->scanned, c->skipped, rr->nr_hits,
+ 		   div_u64(rr->scan_end_ns - rr->scan_start_ns, NSEC_PER_MSEC), &rr->scan_fault_pa);
+@@ -457,9 +504,10 @@ static int rr_scan_show(struct seq_file *s, void *unused)
+ 			   c->ranges[i].end - c->ranges[i].start);
+ 	for (i = 0; i < rr->nr_hits; i++) {
+ 		hit = &rr->hits[i];
+-		seq_printf(s, "hit=%u pa=%pa bufsize=0x%x marker=0x%x rptr=0x%x wptr_discovery=0x%x wptr_watch_first=0x%x wptr_last=0x%x changes=%u advanced=%s watch_ms=%llu\n",
+-			   i, &hit->pa, hit->first.bufsize, hit->first.marker,
+-			   hit->last.rptr, hit->first.wptr, hit->watch_wptr,
++		seq_printf(s, "hit=%u pa=%pa range_class=%s bufsize=0x%x marker=0x%x rptr=0x%x wptr_discovery=0x%x wptr_watch_first=0x%x wptr_last=0x%x changes=%u advanced=%s watch_ms=%llu\n",
++			   i, &hit->pa, classes[hit->range_class],
++			   hit->first.bufsize, hit->first.marker, hit->last.rptr,
++			   hit->first.wptr, hit->watch_wptr,
+ 			   hit->last.wptr, hit->changes,
+ 			   hit->changes ? "yes" : "no",
+ 			   hit->last_ns ? div_u64(hit->last_ns - hit->watch_ns,
+@@ -808,6 +856,7 @@ static struct a9_ring_reader *rr_alloc(void)
+ 		return ERR_PTR(-ENOMEM);
+ 	mutex_init(&rr->lock);
+ 	rr->scan_phase = "debugfs";
++	rr->scan_reserved = apple_a9_aop_ring_scan_reserved();
+ 	if (end <= start || end - start > RR_MAX_SPAN) {
+ 		ret = -ERANGE;
+ 		goto fail;
+diff --git a/drivers/soc/apple/a9-aop-ring.h b/drivers/soc/apple/a9-aop-ring.h
+index e83bcfb46f..5ced66c194 100644
+--- a/drivers/soc/apple/a9-aop-ring.h
++++ b/drivers/soc/apple/a9-aop-ring.h
+@@ -14,6 +14,14 @@
+ #define A9_RR_AOP	0x20504f41
+ #define A9_RR_SKIP_RANGES 256
+ 
++enum a9_rr_range_class {
++	A9_RR_CLASS_RAM,
++	A9_RR_CLASS_CRASH,
++	A9_RR_CLASS_CMA,
++	A9_RR_CLASS_RESERVED,
++	A9_RR_CLASS_MIXED,
++};
++
+ enum a9_rr_skip_reason {
+ 	A9_RR_SKIP_NOMAP,
+ 	A9_RR_SKIP_RESERVED,
+diff --git a/drivers/soc/apple/a9-aop.h b/drivers/soc/apple/a9-aop.h
+index 7f829dd3dd..4a0b8c96c5 100644
+--- a/drivers/soc/apple/a9-aop.h
++++ b/drivers/soc/apple/a9-aop.h
+@@ -15,4 +15,6 @@ bool apple_a9_aop_ring_mode(void);
+ 
+ bool apple_a9_aop_ring_scan_early(void);
+ 
++bool apple_a9_aop_ring_scan_reserved(void);
++
+ #endif
+diff --git a/drivers/soc/apple/apple-a9-aop.c b/drivers/soc/apple/apple-a9-aop.c
+index eb9015fb2e..29b69d428d 100644
+--- a/drivers/soc/apple/apple-a9-aop.c
++++ b/drivers/soc/apple/apple-a9-aop.c
+@@ -30,6 +30,9 @@ MODULE_PARM_DESC(ring_scan, "Enable one-shot bounded read-only RAM ring_scan (de
+ static bool ring_scan_early;
+ module_param(ring_scan_early, bool, 0400);
+ MODULE_PARM_DESC(ring_scan_early, "Capture ring_scan at postcore initcall, before device probing (requires debug=1 ring_scan=1)");
++static bool ring_scan_reserved;
++module_param(ring_scan_reserved, bool, 0400);
++MODULE_PARM_DESC(ring_scan_reserved, "Also read reserved linear-mapped System RAM in E1 (requires debug=1 ring_scan=1)");
+ static bool ring_iio;
+ module_param(ring_iio, bool, 0400);
+ MODULE_PARM_DESC(ring_iio, "Read accel from early DT-reserved inherited ring, no traffic (default off)");
+@@ -44,6 +47,11 @@ bool apple_a9_aop_ring_scan_early(void)
+ 	return debug && ring_scan && ring_scan_early;
+ }
+ 
++bool apple_a9_aop_ring_scan_reserved(void)
++{
++	return debug && ring_scan && ring_scan_reserved;
++}
++
+ /* Lets the active driver gate its debugfs on the same immutable parameter. */
+ bool apple_a9_aop_debug(void)
+ {

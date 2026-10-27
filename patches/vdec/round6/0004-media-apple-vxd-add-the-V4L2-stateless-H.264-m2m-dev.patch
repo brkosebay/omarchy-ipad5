@@ -1,0 +1,1068 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 17:17:08 +0000
+Subject: [PATCH 04/20] media: apple: vxd: add the V4L2 stateless H.264 m2m device
+
+R3/R4 scaffolding on the rkvdec stateless template: /dev/video node
+with media controller entity, mplane m2m queues, the request API
+mandatory on the output queue, and the full V4L2_CID_STATELESS_H264_*
+control set (SPS/PPS/DECODE_PARAMS/SCALING_MATRIX/PRED_WEIGHTS/
+SLICE_PARAMS dynamic array/DECODE_MODE/START_CODE/PROFILE/LEVEL).
+Userspace does the parsing; the kernel only validates against this
+silicon (level 4.2 = 1920x1088, 4:2:0 8-bit, <=16 refs) and translates
+into the firmware message format, which is intentionally not attempted
+until R2 pins the mailbox ABI: apple_vxd_submit() refuses jobs with
+-EAGAIN and states so once in the log.
+
+NV12 is the only capture format for now; P010/NV16 follow the
+HEVC/4:2:2 verification.  v4l2-compliance is expected to still fail on
+request-API paths until submission is real.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ drivers/media/platform/apple/vxd/Makefile         |   2 +-
+ drivers/media/platform/apple/vxd/apple-vxd-h264.c | 204 ++++++
+ drivers/media/platform/apple/vxd/apple-vxd-v4l2.c | 814 ++++++++++++++++++++++
+ 3 files changed, 1019 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/platform/apple/vxd/Makefile b/drivers/media/platform/apple/vxd/Makefile
+index 7f08b6702d0efa9696170f9bc51b52381ab07f11..448db936729452cbe2d97fc4d9ca511a40e60399 100644
+--- a/drivers/media/platform/apple/vxd/Makefile
++++ b/drivers/media/platform/apple/vxd/Makefile
+@@ -1,5 +1,5 @@
+ # SPDX-License-Identifier: GPL-2.0
+ apple-vxd-objs := apple-vxd-core.o apple-vxd-gart.o apple-vxd-fw.o \
+-		  apple-vxd-mbox.o
++		  apple-vxd-mbox.o apple-vxd-v4l2.o apple-vxd-h264.o
+ 
+ obj-$(CONFIG_VIDEO_APPLE_VXD) += apple-vxd.o
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-h264.c b/drivers/media/platform/apple/vxd/apple-vxd-h264.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..eacde4be6ef0af78a4cce1cf0cf401ab62afb581
+--- /dev/null
++++ b/drivers/media/platform/apple/vxd/apple-vxd-h264.c
+@@ -0,0 +1,204 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Apple VXD - H.264 backend (V4L2 stateless)
++ *
++ * Userspace does the bitstream parsing (V4L2 stateless contract); this
++ * layer validates the parameters against what the silicon accepts and
++ * translates them into the firmware/hardware submission.  The translation
++ * structures mirror the kext's PicParams_H264 / VA_SliceInfo /
++ * H264CommandBufferParams naming; their exact binary ABI against the DEVA
++ * firmware is the open question the doc marks "decides everything"
++ * (section 6.1) and is only settled by the R2 ring dump.  Everything fed
++ * into apple_vxd_submit() carries that gate.
++ */
++#include <media/v4l2-h264.h>
++
++#include "apple-vxd.h"
++
++static int apple_vxd_h264_validate_sps(struct apple_vxd_ctx *ctx,
++				       const struct v4l2_ctrl_h264_sps *sps)
++{
++	const struct apple_vxd_dev *vxd = ctx->vxd;
++
++	switch (sps->profile_idc) {
++	case 66: /* constrained baseline / baseline */
++	case 77: /* main */
++	case 100: /* high */
++		break;
++	default:
++		dev_dbg(vxd->dev, "sps: unsupported profile %u\n",
++			sps->profile_idc);
++		return -EINVAL;
++	}
++
++	if (sps->chroma_format_idc > 1) {
++		dev_dbg(vxd->dev, "sps: chroma format 4:2:2/4:4:4 not supported\n");
++		return -EINVAL;
++	}
++
++	if (sps->bit_depth_luma_minus8 > 0 || sps->bit_depth_chroma_minus8 > 0) {
++		dev_dbg(vxd->dev, "sps: 10-bit not supported\n");
++		return -EINVAL;
++	}
++
++	/*
++	 * DT advertises h264-playback-level = 42: 1920x1088 [E].  Tile
++	 * decode could lift this, but is not explored yet.
++	 */
++	if (sps->pic_width_in_mbs_minus1 > (APPLE_VXD_MAX_PIC_W / 16 - 1) ||
++	    sps->pic_height_in_map_units_minus1 > (APPLE_VXD_MAX_PIC_H / 16 - 1)) {
++		dev_dbg(vxd->dev, "sps: %ux%u exceeds level 4.2\n",
++			(sps->pic_width_in_mbs_minus1 + 1) * 16,
++			(sps->pic_height_in_map_units_minus1 + 1) * 16);
++		return -EINVAL;
++	}
++
++	if (sps->max_num_ref_frames > V4L2_H264_NUM_DPB_ENTRIES) {
++		dev_dbg(vxd->dev, "sps: max_num_ref_frames %u too many\n",
++			sps->max_num_ref_frames);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int apple_vxd_h264_try_ctrl(struct apple_vxd_ctx *ctx,
++				   struct v4l2_ctrl *ctrl)
++{
++	if (ctrl->id == V4L2_CID_STATELESS_H264_SPS)
++		return apple_vxd_h264_validate_sps(ctx, ctrl->p_new.p_h264_sps);
++
++	return 0;
++}
++
++static int apple_vxd_h264_start(struct apple_vxd_ctx *ctx)
++{
++	/* R3 allocates the per-context parameter/command buffers here once
++	 * the message ABI is pinned down.
++	 */
++	return 0;
++}
++
++static void apple_vxd_h264_stop(struct apple_vxd_ctx *ctx)
++{
++}
++
++static enum apple_vxd_image_fmt
++apple_vxd_h264_get_image_fmt(struct apple_vxd_ctx *ctx, struct v4l2_ctrl *ctrl)
++{
++	if (ctrl->id != V4L2_CID_STATELESS_H264_SPS)
++		return APPLE_VXD_IMG_FMT_ANY;
++
++	return APPLE_VXD_IMG_FMT_420_8BIT;
++}
++
++static int apple_vxd_h264_run(struct apple_vxd_ctx *ctx)
++{
++	struct apple_vxd_dev *vxd = ctx->vxd;
++	struct apple_vxd_run run;
++	int ret;
++
++	apple_vxd_run_preamble(ctx, &run);
++
++	if (!vxd->hw_ready) {
++		dev_dbg(vxd->dev,
++			"decode job with no firmware running (boot_firmware disabled or R1 failed)\n");
++		apple_vxd_run_postamble(ctx, &run);
++		return -EAGAIN;
++	}
++
++	ret = apple_vxd_submit(ctx, &run);
++	apple_vxd_run_postamble(ctx, &run);
++
++	return ret;
++}
++
++static const struct apple_vxd_ctrl_desc apple_vxd_h264_ctrl_descs[] = {
++	{
++		.cfg.id = V4L2_CID_STATELESS_H264_DECODE_PARAMS,
++	},
++	{
++		.cfg.id = V4L2_CID_STATELESS_H264_SPS,
++		.cfg.ops = &apple_vxd_ctrl_ops,
++	},
++	{
++		.cfg.id = V4L2_CID_STATELESS_H264_PPS,
++	},
++	{
++		.cfg.id = V4L2_CID_STATELESS_H264_SCALING_MATRIX,
++	},
++	{
++		.cfg.id = V4L2_CID_STATELESS_H264_PRED_WEIGHTS,
++	},
++	{
++		.cfg.id = V4L2_CID_STATELESS_H264_SLICE_PARAMS,
++		.cfg.flags = V4L2_CTRL_FLAG_DYNAMIC_ARRAY,
++	},
++	{
++		.cfg.id = V4L2_CID_STATELESS_H264_DECODE_MODE,
++		.cfg.min = V4L2_STATELESS_H264_DECODE_MODE_FRAME_BASED,
++		.cfg.max = V4L2_STATELESS_H264_DECODE_MODE_FRAME_BASED,
++		.cfg.def = V4L2_STATELESS_H264_DECODE_MODE_FRAME_BASED,
++	},
++	{
++		.cfg.id = V4L2_CID_STATELESS_H264_START_CODE,
++		.cfg.min = V4L2_STATELESS_H264_START_CODE_ANNEX_B,
++		.cfg.def = V4L2_STATELESS_H264_START_CODE_ANNEX_B,
++		.cfg.max = V4L2_STATELESS_H264_START_CODE_ANNEX_B,
++	},
++	{
++		.cfg.id = V4L2_CID_MPEG_VIDEO_H264_PROFILE,
++		.cfg.min = V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE,
++		.cfg.max = V4L2_MPEG_VIDEO_H264_PROFILE_HIGH_422_INTRA,
++		.cfg.menu_skip_mask =
++			BIT(V4L2_MPEG_VIDEO_H264_PROFILE_EXTENDED) |
++			BIT(V4L2_MPEG_VIDEO_H264_PROFILE_HIGH_444_PREDICTIVE),
++		.cfg.def = V4L2_MPEG_VIDEO_H264_PROFILE_MAIN,
++	},
++	{
++		.cfg.id = V4L2_CID_MPEG_VIDEO_H264_LEVEL,
++		.cfg.min = V4L2_MPEG_VIDEO_H264_LEVEL_1_0,
++		.cfg.max = V4L2_MPEG_VIDEO_H264_LEVEL_4_2,
++		.cfg.def = V4L2_MPEG_VIDEO_H264_LEVEL_4_2,
++	},
++};
++
++static const struct apple_vxd_ctrls apple_vxd_h264_ctrls = {
++	.ctrls = apple_vxd_h264_ctrl_descs,
++	.num_ctrls = ARRAY_SIZE(apple_vxd_h264_ctrl_descs),
++};
++
++static const struct apple_vxd_decoded_fmt_desc
++apple_vxd_h264_decoded_fmts[] = {
++	{
++		.fourcc = V4L2_PIX_FMT_NV12,
++		.image_fmt = APPLE_VXD_IMG_FMT_420_8BIT,
++	},
++};
++
++static const struct apple_vxd_coded_fmt_desc apple_vxd_h264_fmt = {
++	.fourcc = V4L2_PIX_FMT_H264_SLICE,
++	.frmsize = {
++		.min_width = APPLE_VXD_MIN_PIC_W,
++		.max_width = APPLE_VXD_MAX_PIC_W,
++		.step_width = 16,
++		.min_height = APPLE_VXD_MIN_PIC_H,
++		.max_height = APPLE_VXD_MAX_PIC_H,
++		.step_height = 16,
++	},
++	.ctrls = &apple_vxd_h264_ctrls,
++	.ops = &(const struct apple_vxd_coded_fmt_ops){
++		.adjust_fmt = NULL,
++		.start = apple_vxd_h264_start,
++		.stop = apple_vxd_h264_stop,
++		.run = apple_vxd_h264_run,
++		.try_ctrl = apple_vxd_h264_try_ctrl,
++		.get_image_fmt = apple_vxd_h264_get_image_fmt,
++	},
++	.num_decoded_fmts = ARRAY_SIZE(apple_vxd_h264_decoded_fmts),
++	.decoded_fmts = apple_vxd_h264_decoded_fmts,
++};
++
++const struct apple_vxd_coded_fmt_desc apple_vxd_coded_fmts[] = {
++	apple_vxd_h264_fmt,
++};
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-v4l2.c b/drivers/media/platform/apple/vxd/apple-vxd-v4l2.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..910be026c5237eaa7053850b823ae8c43467a9ed
+--- /dev/null
++++ b/drivers/media/platform/apple/vxd/apple-vxd-v4l2.c
+@@ -0,0 +1,814 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Apple VXD - V4L2 stateless m2m device (R3/R4 skeleton)
++ *
++ * Structure follows the rkvdec stateless template: one /dev/video node,
++ * media controller entity, mplane m2m queues with the request API
++ * mandatory on the output queue, and the stateless H.264 control set.
++ * The hardware submission layer behind the H.264 backend refuses jobs
++ * until R2 wires the firmware mailbox; that failure path is part of the
++ * bring-up contract (test plan T6).
++ */
++#include <media/v4l2-event.h>
++#include <media/v4l2-ioctl.h>
++#include <media/videobuf2-dma-contig.h>
++
++#include <linux/pm_runtime.h>
++
++#include "apple-vxd.h"
++
++static void apple_vxd_reset_fmt(struct apple_vxd_ctx *ctx,
++				struct v4l2_format *f, u32 fourcc)
++{
++	memset(f, 0, sizeof(*f));
++	f->fmt.pix_mp.pixelformat = fourcc;
++	f->fmt.pix_mp.field = V4L2_FIELD_NONE;
++	f->fmt.pix_mp.colorspace = V4L2_COLORSPACE_REC709;
++	f->fmt.pix_mp.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
++	f->fmt.pix_mp.quantization = V4L2_QUANTIZATION_DEFAULT;
++	f->fmt.pix_mp.xfer_func = V4L2_XFER_FUNC_DEFAULT;
++}
++
++static void apple_vxd_fill_decoded_pixfmt(struct apple_vxd_ctx *ctx,
++					  struct v4l2_pix_format_mplane *pix_mp)
++{
++	v4l2_fill_pixfmt_mp(pix_mp, pix_mp->pixelformat,
++			    pix_mp->width, pix_mp->height);
++}
++
++static const struct apple_vxd_decoded_fmt_desc *
++apple_vxd_find_decoded_fmt(const struct apple_vxd_coded_fmt_desc *desc,
++			   enum apple_vxd_image_fmt image_fmt)
++{
++	unsigned int i;
++
++	for (i = 0; i < desc->num_decoded_fmts; i++)
++		if (desc->decoded_fmts[i].image_fmt == image_fmt)
++			return &desc->decoded_fmts[i];
++
++	return NULL;
++}
++
++static u32 apple_vxd_enum_decoded_fmt(struct apple_vxd_ctx *ctx, int index,
++				      enum apple_vxd_image_fmt image_fmt)
++{
++	const struct apple_vxd_decoded_fmt_desc *dfmt;
++
++	if (image_fmt == APPLE_VXD_IMG_FMT_ANY)
++		image_fmt = APPLE_VXD_IMG_FMT_420_8BIT;
++	dfmt = apple_vxd_find_decoded_fmt(ctx->coded_fmt_desc, image_fmt);
++	if (dfmt && !index)
++		return dfmt->fourcc;
++	return 0;
++}
++
++static bool apple_vxd_is_valid_fmt(struct apple_vxd_ctx *ctx, u32 fourcc,
++				   enum apple_vxd_image_fmt image_fmt)
++{
++	return apple_vxd_enum_decoded_fmt(ctx, 0, image_fmt) == fourcc;
++}
++
++static const struct apple_vxd_coded_fmt_desc *
++apple_vxd_find_coded_fmt_desc(struct apple_vxd_ctx *ctx, u32 fourcc)
++{
++	unsigned int i;
++
++	for (i = 0; i < ctx->vxd->variant->num_coded_fmts; i++)
++		if (ctx->vxd->variant->coded_fmts[i].fourcc == fourcc)
++			return &ctx->vxd->variant->coded_fmts[i];
++	return NULL;
++}
++
++static void apple_vxd_reset_coded_fmt(struct apple_vxd_ctx *ctx)
++{
++	struct v4l2_format *f = &ctx->coded_fmt;
++
++	ctx->coded_fmt_desc = &ctx->vxd->variant->coded_fmts[0];
++	apple_vxd_reset_fmt(ctx, f, ctx->coded_fmt_desc->fourcc);
++	f->type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++	f->fmt.pix_mp.width = ctx->coded_fmt_desc->frmsize.min_width;
++	f->fmt.pix_mp.height = ctx->coded_fmt_desc->frmsize.min_height;
++
++	if (ctx->coded_fmt_desc->ops->adjust_fmt)
++		ctx->coded_fmt_desc->ops->adjust_fmt(ctx, f);
++}
++
++static void apple_vxd_reset_decoded_fmt(struct apple_vxd_ctx *ctx)
++{
++	struct v4l2_format *f = &ctx->decoded_fmt;
++	u32 fourcc = apple_vxd_enum_decoded_fmt(ctx, 0, ctx->image_fmt);
++
++	apple_vxd_reset_fmt(ctx, f, fourcc);
++	f->type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++	f->fmt.pix_mp.width = ctx->coded_fmt.fmt.pix_mp.width;
++	f->fmt.pix_mp.height = ctx->coded_fmt.fmt.pix_mp.height;
++	apple_vxd_fill_decoded_pixfmt(ctx, &f->fmt.pix_mp);
++}
++
++static int apple_vxd_image_fmt_changed(struct apple_vxd_ctx *ctx,
++				       enum apple_vxd_image_fmt image_fmt)
++{
++	if (image_fmt == APPLE_VXD_IMG_FMT_ANY)
++		return ctx->image_fmt != image_fmt;
++
++	return apple_vxd_find_decoded_fmt(ctx->coded_fmt_desc, image_fmt) !=
++	       apple_vxd_find_decoded_fmt(ctx->coded_fmt_desc, ctx->image_fmt);
++}
++
++static int apple_vxd_try_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct apple_vxd_ctx *ctx =
++		container_of(ctrl->handler, struct apple_vxd_ctx, ctrl_hdl);
++	const struct apple_vxd_coded_fmt_desc *desc = ctx->coded_fmt_desc;
++
++	if (desc->ops->try_ctrl)
++		return desc->ops->try_ctrl(ctx, ctrl);
++	return 0;
++}
++
++static int apple_vxd_s_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct apple_vxd_ctx *ctx =
++		container_of(ctrl->handler, struct apple_vxd_ctx, ctrl_hdl);
++	const struct apple_vxd_coded_fmt_desc *desc = ctx->coded_fmt_desc;
++	enum apple_vxd_image_fmt image_fmt;
++	struct vb2_queue *vq;
++
++	if (!desc->ops->get_image_fmt)
++		return 0;
++
++	image_fmt = desc->ops->get_image_fmt(ctx, ctrl);
++	if (apple_vxd_image_fmt_changed(ctx, image_fmt)) {
++		vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx,
++				     V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
++		if (vb2_is_busy(vq))
++			return -EBUSY;
++
++		ctx->image_fmt = image_fmt;
++		apple_vxd_reset_decoded_fmt(ctx);
++	}
++
++	return 0;
++}
++
++const struct v4l2_ctrl_ops apple_vxd_ctrl_ops = {
++	.try_ctrl = apple_vxd_try_ctrl,
++	.s_ctrl = apple_vxd_s_ctrl,
++};
++
++static int apple_vxd_add_ctrls(struct apple_vxd_ctx *ctx,
++			       const struct apple_vxd_ctrls *ctrls)
++{
++	unsigned int i;
++
++	for (i = 0; i < ctrls->num_ctrls; i++) {
++		v4l2_ctrl_new_custom(&ctx->ctrl_hdl, &ctrls->ctrls[i].cfg, ctx);
++		if (ctx->ctrl_hdl.error)
++			return ctx->ctrl_hdl.error;
++	}
++
++	return 0;
++}
++
++static int apple_vxd_init_ctrls(struct apple_vxd_ctx *ctx)
++{
++	unsigned int i, nctrls = 0;
++	int ret;
++
++	for (i = 0; i < ctx->vxd->variant->num_coded_fmts; i++)
++		nctrls += ctx->vxd->variant->coded_fmts[i].ctrls->num_ctrls;
++
++	v4l2_ctrl_handler_init(&ctx->ctrl_hdl, nctrls);
++
++	for (i = 0; i < ctx->vxd->variant->num_coded_fmts; i++) {
++		ret = apple_vxd_add_ctrls(ctx,
++					  ctx->vxd->variant->coded_fmts[i].ctrls);
++		if (ret)
++			goto err_free_handler;
++	}
++
++	ret = v4l2_ctrl_handler_setup(&ctx->ctrl_hdl);
++	if (ret)
++		goto err_free_handler;
++
++	ctx->fh.ctrl_handler = &ctx->ctrl_hdl;
++	return 0;
++
++err_free_handler:
++	v4l2_ctrl_handler_free(&ctx->ctrl_hdl);
++	return ret;
++}
++
++static int apple_vxd_enum_framesizes(struct file *file, void *priv,
++				     struct v4l2_frmsizeenum *fsize)
++{
++	struct apple_vxd_ctx *ctx = container_of(file_to_v4l2_fh(file),
++						 struct apple_vxd_ctx, fh);
++	const struct apple_vxd_coded_fmt_desc *desc;
++
++	if (fsize->index != 0)
++		return -EINVAL;
++
++	desc = apple_vxd_find_coded_fmt_desc(ctx, fsize->pixel_format);
++	if (!desc)
++		return -EINVAL;
++
++	fsize->type = V4L2_FRMSIZE_TYPE_CONTINUOUS;
++	fsize->stepwise.min_width = 1;
++	fsize->stepwise.max_width = desc->frmsize.max_width;
++	fsize->stepwise.step_width = 1;
++	fsize->stepwise.min_height = 1;
++	fsize->stepwise.max_height = desc->frmsize.max_height;
++	fsize->stepwise.step_height = 1;
++
++	return 0;
++}
++
++static int apple_vxd_querycap(struct file *file, void *priv,
++			      struct v4l2_capability *cap)
++{
++	struct apple_vxd_dev *vxd = video_drvdata(file);
++	struct video_device *vdev = video_devdata(file);
++
++	strscpy(cap->driver, vxd->dev->driver->name, sizeof(cap->driver));
++	strscpy(cap->card, vdev->name, sizeof(cap->card));
++	snprintf(cap->bus_info, sizeof(cap->bus_info), "platform:%s",
++		 vxd->dev->driver->name);
++	return 0;
++}
++
++static int apple_vxd_try_capture_fmt(struct file *file, void *priv,
++				     struct v4l2_format *f)
++{
++	struct v4l2_pix_format_mplane *pix_mp = &f->fmt.pix_mp;
++	struct apple_vxd_ctx *ctx = container_of(file_to_v4l2_fh(file),
++						 struct apple_vxd_ctx, fh);
++	const struct apple_vxd_coded_fmt_desc *coded_desc = ctx->coded_fmt_desc;
++
++	if (!apple_vxd_is_valid_fmt(ctx, pix_mp->pixelformat, ctx->image_fmt))
++		pix_mp->pixelformat =
++			apple_vxd_enum_decoded_fmt(ctx, 0, ctx->image_fmt);
++
++	/* Always apply the frmsize constraint of the coded end. */
++	pix_mp->width = max(pix_mp->width, ctx->coded_fmt.fmt.pix_mp.width);
++	pix_mp->height = max(pix_mp->height, ctx->coded_fmt.fmt.pix_mp.height);
++	v4l2_apply_frmsize_constraints(&pix_mp->width, &pix_mp->height,
++				       &coded_desc->frmsize);
++
++	apple_vxd_fill_decoded_pixfmt(ctx, pix_mp);
++	pix_mp->field = V4L2_FIELD_NONE;
++
++	return 0;
++}
++
++static int apple_vxd_try_output_fmt(struct file *file, void *priv,
++				    struct v4l2_format *f)
++{
++	struct v4l2_pix_format_mplane *pix_mp = &f->fmt.pix_mp;
++	struct apple_vxd_ctx *ctx = container_of(file_to_v4l2_fh(file),
++						 struct apple_vxd_ctx, fh);
++	const struct apple_vxd_coded_fmt_desc *desc;
++
++	desc = apple_vxd_find_coded_fmt_desc(ctx, pix_mp->pixelformat);
++	if (!desc) {
++		desc = &ctx->vxd->variant->coded_fmts[0];
++		pix_mp->pixelformat = desc->fourcc;
++	}
++
++	v4l2_apply_frmsize_constraints(&pix_mp->width, &pix_mp->height,
++				       &desc->frmsize);
++
++	pix_mp->field = V4L2_FIELD_NONE;
++	/* All coded formats are considered single planar for now. */
++	pix_mp->num_planes = 1;
++
++	if (desc->ops->adjust_fmt) {
++		int ret;
++
++		ret = desc->ops->adjust_fmt(ctx, f);
++		if (ret)
++			return ret;
++	}
++
++	pix_mp->plane_fmt[0].sizeimage =
++		max(pix_mp->plane_fmt[0].sizeimage, SZ_1M);
++	return 0;
++}
++
++static int apple_vxd_s_capture_fmt(struct file *file, void *priv,
++				   struct v4l2_format *f)
++{
++	struct apple_vxd_ctx *ctx = container_of(file_to_v4l2_fh(file),
++						 struct apple_vxd_ctx, fh);
++	struct vb2_queue *vq;
++	int ret;
++
++	/* Change not allowed if queue is busy */
++	vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx,
++			     V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
++	if (vb2_is_busy(vq))
++		return -EBUSY;
++
++	ret = apple_vxd_try_capture_fmt(file, priv, f);
++	if (ret)
++		return ret;
++
++	ctx->decoded_fmt = *f;
++	return 0;
++}
++
++static int apple_vxd_s_output_fmt(struct file *file, void *priv,
++				  struct v4l2_format *f)
++{
++	struct apple_vxd_ctx *ctx = container_of(file_to_v4l2_fh(file),
++						 struct apple_vxd_ctx, fh);
++	struct v4l2_m2m_ctx *m2m_ctx = ctx->fh.m2m_ctx;
++	const struct apple_vxd_coded_fmt_desc *desc;
++	struct v4l2_format *cap_fmt;
++	struct vb2_queue *peer_vq, *vq;
++	int ret;
++
++	/*
++	 * The iOS parser is one-stream-configuration-per-instance ("SPS
++	 * changes not supported!"); resolution changes only within the
++	 * same pixelformat.  Never while streaming.
++	 */
++	vq = v4l2_m2m_get_vq(m2m_ctx, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
++	if (vb2_is_streaming(vq) ||
++	    (vb2_is_busy(vq) &&
++	     f->fmt.pix_mp.pixelformat != ctx->coded_fmt.fmt.pix_mp.pixelformat))
++		return -EBUSY;
++
++	peer_vq = v4l2_m2m_get_vq(m2m_ctx, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
++	if (vb2_is_busy(peer_vq))
++		return -EBUSY;
++
++	ret = apple_vxd_try_output_fmt(file, priv, f);
++	if (ret)
++		return ret;
++
++	desc = apple_vxd_find_coded_fmt_desc(ctx, f->fmt.pix_mp.pixelformat);
++	if (!desc)
++		return -EINVAL;
++	ctx->coded_fmt_desc = desc;
++	ctx->coded_fmt = *f;
++
++	/*
++	 * Reset the decoded format; the user is mandated to set it again
++	 * after we return.
++	 */
++	ctx->image_fmt = APPLE_VXD_IMG_FMT_ANY;
++	apple_vxd_reset_decoded_fmt(ctx);
++
++	/* Propagate colorspace information to capture. */
++	cap_fmt = &ctx->decoded_fmt;
++	cap_fmt->fmt.pix_mp.colorspace = f->fmt.pix_mp.colorspace;
++	cap_fmt->fmt.pix_mp.xfer_func = f->fmt.pix_mp.xfer_func;
++	cap_fmt->fmt.pix_mp.ycbcr_enc = f->fmt.pix_mp.ycbcr_enc;
++	cap_fmt->fmt.pix_mp.quantization = f->fmt.pix_mp.quantization;
++
++	return 0;
++}
++
++static int apple_vxd_g_output_fmt(struct file *file, void *priv,
++				  struct v4l2_format *f)
++{
++	struct apple_vxd_ctx *ctx = container_of(file_to_v4l2_fh(file),
++						 struct apple_vxd_ctx, fh);
++
++	*f = ctx->coded_fmt;
++	return 0;
++}
++
++static int apple_vxd_g_capture_fmt(struct file *file, void *priv,
++				   struct v4l2_format *f)
++{
++	struct apple_vxd_ctx *ctx = container_of(file_to_v4l2_fh(file),
++						 struct apple_vxd_ctx, fh);
++
++	*f = ctx->decoded_fmt;
++	return 0;
++}
++
++static int apple_vxd_enum_output_fmt(struct file *file, void *priv,
++				     struct v4l2_fmtdesc *f)
++{
++	struct apple_vxd_ctx *ctx = container_of(file_to_v4l2_fh(file),
++						 struct apple_vxd_ctx, fh);
++	const struct apple_vxd_coded_fmt_desc *desc;
++
++	if (f->index >= ctx->vxd->variant->num_coded_fmts)
++		return -EINVAL;
++	desc = &ctx->vxd->variant->coded_fmts[f->index];
++	f->pixelformat = desc->fourcc;
++	return 0;
++}
++
++static int apple_vxd_enum_capture_fmt(struct file *file, void *priv,
++				      struct v4l2_fmtdesc *f)
++{
++	struct apple_vxd_ctx *ctx = container_of(file_to_v4l2_fh(file),
++						 struct apple_vxd_ctx, fh);
++	u32 fourcc;
++
++	fourcc = apple_vxd_enum_decoded_fmt(ctx, f->index, ctx->image_fmt);
++	if (!fourcc)
++		return -EINVAL;
++	f->pixelformat = fourcc;
++	return 0;
++}
++
++static const struct v4l2_ioctl_ops apple_vxd_ioctl_ops = {
++	.vidioc_querycap = apple_vxd_querycap,
++	.vidioc_enum_framesizes = apple_vxd_enum_framesizes,
++
++	.vidioc_try_fmt_vid_cap_mplane = apple_vxd_try_capture_fmt,
++	.vidioc_try_fmt_vid_out_mplane = apple_vxd_try_output_fmt,
++	.vidioc_s_fmt_vid_cap_mplane = apple_vxd_s_capture_fmt,
++	.vidioc_s_fmt_vid_out_mplane = apple_vxd_s_output_fmt,
++	.vidioc_g_fmt_vid_out_mplane = apple_vxd_g_output_fmt,
++	.vidioc_g_fmt_vid_cap_mplane = apple_vxd_g_capture_fmt,
++	.vidioc_enum_fmt_vid_out = apple_vxd_enum_output_fmt,
++	.vidioc_enum_fmt_vid_cap = apple_vxd_enum_capture_fmt,
++
++	.vidioc_reqbufs = v4l2_m2m_ioctl_reqbufs,
++	.vidioc_querybuf = v4l2_m2m_ioctl_querybuf,
++	.vidioc_qbuf = v4l2_m2m_ioctl_qbuf,
++	.vidioc_dqbuf = v4l2_m2m_ioctl_dqbuf,
++	.vidioc_prepare_buf = v4l2_m2m_ioctl_prepare_buf,
++	.vidioc_create_bufs = v4l2_m2m_ioctl_create_bufs,
++	.vidioc_expbuf = v4l2_m2m_ioctl_expbuf,
++
++	.vidioc_subscribe_event = v4l2_ctrl_subscribe_event,
++	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
++
++	.vidioc_streamon = v4l2_m2m_ioctl_streamon,
++	.vidioc_streamoff = v4l2_m2m_ioctl_streamoff,
++
++	.vidioc_decoder_cmd = v4l2_m2m_ioctl_stateless_decoder_cmd,
++	.vidioc_try_decoder_cmd = v4l2_m2m_ioctl_stateless_try_decoder_cmd,
++};
++
++static int apple_vxd_queue_setup(struct vb2_queue *vq, unsigned int *num_buffers,
++				 unsigned int *num_planes, unsigned int sizes[],
++				 struct device *alloc_devs[])
++{
++	struct apple_vxd_ctx *ctx = vb2_get_drv_priv(vq);
++	struct v4l2_format *f;
++	unsigned int i;
++
++	f = V4L2_TYPE_IS_OUTPUT(vq->type) ? &ctx->coded_fmt : &ctx->decoded_fmt;
++
++	if (*num_planes) {
++		if (*num_planes != f->fmt.pix_mp.num_planes)
++			return -EINVAL;
++
++		for (i = 0; i < f->fmt.pix_mp.num_planes; i++) {
++			if (sizes[i] < f->fmt.pix_mp.plane_fmt[i].sizeimage)
++				return -EINVAL;
++		}
++	} else {
++		*num_planes = f->fmt.pix_mp.num_planes;
++		for (i = 0; i < f->fmt.pix_mp.num_planes; i++)
++			sizes[i] = f->fmt.pix_mp.plane_fmt[i].sizeimage;
++	}
++
++	return 0;
++}
++
++static int apple_vxd_buf_prepare(struct vb2_buffer *vb)
++{
++	struct apple_vxd_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++	struct v4l2_format *f;
++	unsigned int i;
++
++	f = V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type) ? &ctx->coded_fmt :
++		&ctx->decoded_fmt;
++
++	for (i = 0; i < f->fmt.pix_mp.num_planes; ++i) {
++		u32 sizeimage = f->fmt.pix_mp.plane_fmt[i].sizeimage;
++
++		if (vb2_plane_size(vb, i) < sizeimage)
++			return -EINVAL;
++	}
++
++	/*
++	 * Buffer's bytesused must be written by driver for CAPTURE buffers.
++	 * (for OUTPUT buffers, if userspace passes 0 bytesused, v4l2-core
++	 * sets it to buffer length).
++	 */
++	if (V4L2_TYPE_IS_CAPTURE(vb->vb2_queue->type))
++		vb2_set_plane_payload(vb, 0,
++				      f->fmt.pix_mp.plane_fmt[0].sizeimage);
++
++	return 0;
++}
++
++static void apple_vxd_buf_queue(struct vb2_buffer *vb)
++{
++	struct apple_vxd_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
++
++	v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, vbuf);
++}
++
++static int apple_vxd_buf_out_validate(struct vb2_buffer *vb)
++{
++	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
++
++	vbuf->field = V4L2_FIELD_NONE;
++	return 0;
++}
++
++static void apple_vxd_buf_request_complete(struct vb2_buffer *vb)
++{
++	struct apple_vxd_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++
++	v4l2_ctrl_request_complete(vb->req_obj.req, &ctx->ctrl_hdl);
++}
++
++static int apple_vxd_start_streaming(struct vb2_queue *q, unsigned int count)
++{
++	struct apple_vxd_ctx *ctx = vb2_get_drv_priv(q);
++	int ret;
++
++	if (V4L2_TYPE_IS_CAPTURE(q->type))
++		return 0;
++
++	if (!ctx->coded_fmt_desc->ops->start)
++		return 0;
++
++	ret = ctx->coded_fmt_desc->ops->start(ctx);
++	if (ret) {
++		dev_err(ctx->vxd->dev,
++			"failed to start decode context: %d\n", ret);
++		return ret;
++	}
++
++	return 0;
++}
++
++static void apple_vxd_queue_cleanup(struct vb2_queue *vq, u32 state)
++{
++	struct apple_vxd_ctx *ctx = vb2_get_drv_priv(vq);
++
++	while (true) {
++		struct vb2_v4l2_buffer *vbuf;
++
++		if (V4L2_TYPE_IS_OUTPUT(vq->type))
++			vbuf = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
++		else
++			vbuf = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
++
++		if (!vbuf)
++			break;
++
++		v4l2_ctrl_request_complete(vbuf->vb2_buf.req_obj.req,
++					   &ctx->ctrl_hdl);
++		v4l2_m2m_buf_done(vbuf, state);
++	}
++}
++
++static void apple_vxd_stop_streaming(struct vb2_queue *q)
++{
++	struct apple_vxd_ctx *ctx = vb2_get_drv_priv(q);
++
++	if (V4L2_TYPE_IS_OUTPUT(q->type) && ctx->coded_fmt_desc->ops->stop)
++		ctx->coded_fmt_desc->ops->stop(ctx);
++
++	apple_vxd_queue_cleanup(q, VB2_BUF_STATE_ERROR);
++}
++
++static const struct vb2_ops apple_vxd_queue_ops = {
++	.queue_setup = apple_vxd_queue_setup,
++	.buf_prepare = apple_vxd_buf_prepare,
++	.buf_queue = apple_vxd_buf_queue,
++	.buf_out_validate = apple_vxd_buf_out_validate,
++	.buf_request_complete = apple_vxd_buf_request_complete,
++	.start_streaming = apple_vxd_start_streaming,
++	.stop_streaming = apple_vxd_stop_streaming,
++};
++
++static int apple_vxd_request_validate(struct media_request *req)
++{
++	unsigned int count = vb2_request_buffer_cnt(req);
++
++	if (!count)
++		return -ENOENT;
++	else if (count > 1)
++		return -EINVAL;
++
++	return vb2_request_validate(req);
++}
++
++static const struct media_device_ops apple_vxd_media_ops = {
++	.req_validate = apple_vxd_request_validate,
++	.req_queue = v4l2_m2m_request_queue,
++};
++
++static void apple_vxd_device_run(void *priv)
++{
++	struct apple_vxd_ctx *ctx = priv;
++	struct apple_vxd_dev *vxd = ctx->vxd;
++	const struct apple_vxd_coded_fmt_desc *desc = ctx->coded_fmt_desc;
++	int ret;
++
++	if (WARN_ON(!desc))
++		return;
++
++	ret = pm_runtime_resume_and_get(vxd->dev);
++	if (ret < 0) {
++		apple_vxd_job_finish_no_pm(ctx, VB2_BUF_STATE_ERROR);
++		return;
++	}
++
++	ret = desc->ops->run(ctx);
++	if (ret)
++		apple_vxd_job_finish(ctx, VB2_BUF_STATE_ERROR);
++}
++
++static const struct v4l2_m2m_ops apple_vxd_m2m_ops = {
++	.device_run = apple_vxd_device_run,
++};
++
++static int apple_vxd_queue_init(void *priv, struct vb2_queue *src_vq,
++				struct vb2_queue *dst_vq)
++{
++	struct apple_vxd_ctx *ctx = priv;
++	struct apple_vxd_dev *vxd = ctx->vxd;
++	int ret;
++
++	src_vq->type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++	src_vq->io_modes = VB2_MMAP | VB2_DMABUF;
++	src_vq->drv_priv = ctx;
++	src_vq->ops = &apple_vxd_queue_ops;
++	src_vq->mem_ops = &vb2_dma_contig_memops;
++	/* Mostly sequential access; no CPU access on the source queue. */
++	src_vq->dma_attrs = DMA_ATTR_ALLOC_SINGLE_PAGES |
++			    DMA_ATTR_NO_KERNEL_MAPPING;
++	src_vq->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
++	src_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
++	src_vq->lock = &vxd->vdev_lock;
++	src_vq->dev = vxd->v4l2_dev.dev;
++	src_vq->supports_requests = true;
++	src_vq->requires_requests = true;
++
++	ret = vb2_queue_init(src_vq);
++	if (ret)
++		return ret;
++
++	dst_vq->bidirectional = true;
++	dst_vq->mem_ops = &vb2_dma_contig_memops;
++	dst_vq->dma_attrs = DMA_ATTR_ALLOC_SINGLE_PAGES |
++			    DMA_ATTR_NO_KERNEL_MAPPING;
++	dst_vq->type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++	dst_vq->io_modes = VB2_MMAP | VB2_DMABUF;
++	dst_vq->drv_priv = ctx;
++	dst_vq->ops = &apple_vxd_queue_ops;
++	dst_vq->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
++	dst_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
++	dst_vq->lock = &vxd->vdev_lock;
++	dst_vq->dev = vxd->v4l2_dev.dev;
++
++	return vb2_queue_init(dst_vq);
++}
++
++static int apple_vxd_open(struct file *filp)
++{
++	struct apple_vxd_dev *vxd = video_drvdata(filp);
++	struct apple_vxd_ctx *ctx;
++	int ret;
++
++	ctx = kzalloc_obj(*ctx);
++	if (!ctx)
++		return -ENOMEM;
++
++	ctx->vxd = vxd;
++	apple_vxd_reset_coded_fmt(ctx);
++	apple_vxd_reset_decoded_fmt(ctx);
++	v4l2_fh_init(&ctx->fh, video_devdata(filp));
++
++	ctx->fh.m2m_ctx = v4l2_m2m_ctx_init(vxd->m2m_dev, ctx,
++					    apple_vxd_queue_init);
++	if (IS_ERR(ctx->fh.m2m_ctx)) {
++		ret = PTR_ERR(ctx->fh.m2m_ctx);
++		goto err_free_ctx;
++	}
++
++	ret = apple_vxd_init_ctrls(ctx);
++	if (ret)
++		goto err_cleanup_m2m_ctx;
++
++	v4l2_fh_add(&ctx->fh, filp);
++
++	return 0;
++
++err_cleanup_m2m_ctx:
++	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
++err_free_ctx:
++	kfree(ctx);
++	return ret;
++}
++
++static int apple_vxd_release(struct file *filp)
++{
++	struct apple_vxd_ctx *ctx = container_of(file_to_v4l2_fh(filp),
++						 struct apple_vxd_ctx, fh);
++
++	v4l2_fh_del(&ctx->fh, filp);
++	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
++	v4l2_ctrl_handler_free(&ctx->ctrl_hdl);
++	v4l2_fh_exit(&ctx->fh);
++	kfree(ctx);
++
++	return 0;
++}
++
++static const struct v4l2_file_operations apple_vxd_fops = {
++	.owner = THIS_MODULE,
++	.open = apple_vxd_open,
++	.release = apple_vxd_release,
++	.poll = v4l2_m2m_fop_poll,
++	.unlocked_ioctl = video_ioctl2,
++	.mmap = v4l2_m2m_fop_mmap,
++};
++
++int apple_vxd_v4l2_init(struct apple_vxd_dev *vxd)
++{
++	int ret;
++
++	ret = v4l2_device_register(vxd->dev, &vxd->v4l2_dev);
++	if (ret) {
++		dev_err(vxd->dev, "failed to register v4l2 device\n");
++		return ret;
++	}
++
++	vxd->m2m_dev = v4l2_m2m_init(&apple_vxd_m2m_ops);
++	if (IS_ERR(vxd->m2m_dev)) {
++		ret = PTR_ERR(vxd->m2m_dev);
++		v4l2_err(&vxd->v4l2_dev, "failed to init mem2mem device\n");
++		goto err_unregister_v4l2;
++	}
++
++	vxd->mdev.dev = vxd->dev;
++	strscpy(vxd->mdev.model, "apple-vxd", sizeof(vxd->mdev.model));
++	strscpy(vxd->mdev.bus_info, "platform:apple-vxd",
++		sizeof(vxd->mdev.bus_info));
++	media_device_init(&vxd->mdev);
++	vxd->mdev.ops = &apple_vxd_media_ops;
++	vxd->v4l2_dev.mdev = &vxd->mdev;
++
++	vxd->vdev.lock = &vxd->vdev_lock;
++	vxd->vdev.v4l2_dev = &vxd->v4l2_dev;
++	vxd->vdev.fops = &apple_vxd_fops;
++	vxd->vdev.release = video_device_release_empty;
++	vxd->vdev.vfl_dir = VFL_DIR_M2M;
++	vxd->vdev.device_caps = V4L2_CAP_STREAMING |
++				V4L2_CAP_VIDEO_M2M_MPLANE;
++	vxd->vdev.ioctl_ops = &apple_vxd_ioctl_ops;
++	video_set_drvdata(&vxd->vdev, vxd);
++	strscpy(vxd->vdev.name, "apple-vxd", sizeof(vxd->vdev.name));
++
++	ret = video_register_device(&vxd->vdev, VFL_TYPE_VIDEO, -1);
++	if (ret) {
++		v4l2_err(&vxd->v4l2_dev, "failed to register video device\n");
++		goto err_cleanup_mc;
++	}
++
++	ret = v4l2_m2m_register_media_controller(vxd->m2m_dev, &vxd->vdev,
++						 MEDIA_ENT_F_PROC_VIDEO_DECODER);
++	if (ret) {
++		v4l2_err(&vxd->v4l2_dev,
++			 "failed to initialize v4l2 m2m media controller\n");
++		goto err_unregister_vdev;
++	}
++
++	ret = media_device_register(&vxd->mdev);
++	if (ret) {
++		v4l2_err(&vxd->v4l2_dev, "failed to register media device\n");
++		goto err_unregister_mc;
++	}
++
++	return 0;
++
++err_unregister_mc:
++	v4l2_m2m_unregister_media_controller(vxd->m2m_dev);
++err_unregister_vdev:
++	video_unregister_device(&vxd->vdev);
++err_cleanup_mc:
++	media_device_cleanup(&vxd->mdev);
++	v4l2_m2m_release(vxd->m2m_dev);
++err_unregister_v4l2:
++	v4l2_device_unregister(&vxd->v4l2_dev);
++	return ret;
++}
++
++void apple_vxd_v4l2_cleanup(struct apple_vxd_dev *vxd)
++{
++	media_device_unregister(&vxd->mdev);
++	v4l2_m2m_unregister_media_controller(vxd->m2m_dev);
++	video_unregister_device(&vxd->vdev);
++	media_device_cleanup(&vxd->mdev);
++	v4l2_m2m_release(vxd->m2m_dev);
++	v4l2_device_unregister(&vxd->v4l2_dev);
++}

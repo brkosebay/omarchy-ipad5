@@ -1,0 +1,39 @@
+From 8e02b0b5d15fcb74fe312b6f28acf7e5b92d85f4 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 01:53:38 +0000
+Subject: [PATCH 2/5] arm64: dts: apple: describe the iPad 5 D2365 wake event
+ line
+
+Connect the D2365 event output to AP GPIO 76 as recovered from the J71t
+ADT, and describe the PMIC as a one-cell interrupt controller. Keep the
+CPU performance-monitor interrupts unchanged and leave child event
+specifiers out until the irqchip exists.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ arch/arm64/boot/dts/apple/s800x-ipad5.dtsi | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/apple/s800x-ipad5.dtsi b/arch/arm64/boot/dts/apple/s800x-ipad5.dtsi
+index 972d84d6c0..94f2eb4904 100644
+--- a/arch/arm64/boot/dts/apple/s800x-ipad5.dtsi
++++ b/arch/arm64/boot/dts/apple/s800x-ipad5.dtsi
+@@ -55,6 +55,15 @@ pmic@3c {
+ 		#address-cells = <1>;
+ 		#size-cells = <1>;
+ 
++		/* D2365 event line: ADT GPIO 0x4c, not CPU PMU AIC 76. */
++		interrupt-parent = <&pinctrl_ap>;
++		interrupts = <76 IRQ_TYPE_LEVEL_LOW>;
++		wakeup-source;
++
++		/* Child event specifiers need a PMIC irqchip before use. */
++		interrupt-controller;
++		#interrupt-cells = <1>;
++
+ 		rtc@500 {
+ 			compatible = "apple,angel-pmic-rtc", "apple,antigua-pmic-rtc";
+ 			reg = <0x500 0x10>;
+-- 
+2.56.0
+

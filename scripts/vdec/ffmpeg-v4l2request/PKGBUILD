@@ -1,0 +1,290 @@
+# linux-a9 round 7: Arch Linux ARM's ffmpeg 2:9.0.2-2 (archlinuxarm/PKGBUILDs
+# 72248ab7d3, extra/ffmpeg) plus the V4L2 Request API hwaccels, so that mpv
+# (--hwdec=v4l2request-copy) and the ffmpeg CLI (-hwaccel v4l2request) can use
+# the iPad's apple-vxd stateless decoder.
+#
+# Changes against ALARM's PKGBUILD, nothing else:
+#  - pkgrel 2 -> 2.1, arch aarch64, source is the signed release tarball
+#    (signature checked by scripts/vdec/build-ffmpeg-pkg.sh, sum pinned here)
+#  - the 13 patches of Kwiboo/FFmpeg branch v4l2-request-n8.1 (b57fbbe50c,
+#    2026-03-16; Jonas Karlman, Jernej Skrabec, Boris Brezillon), rebased to
+#    n9.0.2 with context reduced to one line (no hunk changed)
+#  - configure --enable-v4l2-request --enable-libudev; depends on systemd-libs
+#  - no --enable-cuda-llvm and no clang: ALARM already drops ffnvcodec-headers
+#    (so no CUDA filter is built); the flag only made configure look for
+#    clang.  build-ffmpeg-pkg.sh checks the decoder, encoder, filter, muxer,
+#    demuxer, protocol and bsf lists are identical to the stock package's.
+#  - glslang listed in makedepends: FFmpeg 9 compiles its Vulkan shaders at
+#    build time (ALARM's builder gets it through libplacebo; without it every
+#    *_vulkan filter, encoder and hwaccel silently disappears)
+#
+# ABI: the only public change is AV_HWDEVICE_TYPE_V4L2REQUEST appended to
+# enum AVHWDeviceType (libavutil/hwcontext.h); sonames are unchanged, so every
+# package built against the stock ffmpeg keeps working (the build script
+# checks sonames, NEEDED and exported symbols against the stock package).
+#
+# Original maintainers:
+# Maintainer: Maxime Gauduin <maintainer@example.invalid>
+# Contributor: Bartłomiej Piotrowski <maintainer@example.invalid>
+# Contributor: Ionut Biru <maintainer@example.invalid>
+# Contributor: Tom Newsom <maintainer@example.invalid>
+# Contributor: Paul Mattal <maintainer@example.invalid>
+# ALARM: Kevin Mihelich <maintainer@example.invalid>
+
+pkgname=ffmpeg
+pkgver=9.0.2
+pkgrel=2.1
+epoch=2
+pkgdesc='Complete solution to record, convert and stream audio and video (V4L2 Request API hwaccels, linux-a9)'
+arch=(aarch64)
+url=https://ffmpeg.org
+license=(GPL-3.0-only)
+depends=(
+  alsa-lib
+  bzip2
+  cairo
+  dav1d
+  fontconfig
+  freetype2
+  fribidi
+  glib2
+  glibc
+  gmp
+  gnutls
+  gsm
+  harfbuzz
+  jack
+  lame
+  lcms2
+  libass
+  libavc1394
+  libbluray
+  libbs2b
+  libdrm
+  libdvdnav
+  libdvdread
+  libgcc
+  libgl
+  libiec61883
+  libjxl
+  libmodplug
+  libopenmpt
+  libplacebo
+  libpulse
+  libraw1394
+  librsvg
+  libsoxr
+  libssh
+  libtheora
+  libva
+  libvdpau
+  libvorbis
+  libvpx
+  libwebp
+  libx11
+  libxcb
+  libxext
+  libxml2
+  libxv
+  ocl-icd
+  opencore-amr
+  openjpeg2
+  opus
+  rubberband
+  sdl2
+  snappy
+  sndio
+  speex
+  srt
+  systemd-libs
+  v4l-utils
+  vapoursynth
+  vid.stab
+  vulkan-icd-loader
+  x264
+  x265
+  xvidcore
+  xz
+  zeromq
+  zimg
+  zlib
+)
+makedepends=(
+  amf-headers
+  avisynthplus
+  frei0r-plugins
+  glslang
+  ladspa
+  mesa
+  nasm
+  opencl-headers
+  spirv-headers
+  vulkan-headers
+)
+optdepends=(
+  'avisynthplus: AviSynthPlus support'
+  'frei0r-plugins: Frei0r video effects support'
+  'ladspa: LADSPA filters'
+)
+provides=(
+  libavcodec.so
+  libavdevice.so
+  libavfilter.so
+  libavformat.so
+  libavutil.so
+  libswresample.so
+  libswscale.so
+)
+_v4l2request=(
+  v4l2request-0001-avutil-hwcontext-Add-hwdevice-type-for-V4L2-Request-.patch
+  v4l2request-0002-avutil-hwcontext_v4l2request-Probe-for-a-capable-med.patch
+  v4l2request-0003-avcodec-Add-common-V4L2-Request-API-code.patch
+  v4l2request-0004-avcodec-v4l2request-Add-common-decode-support-for-hw.patch
+  v4l2request-0005-avcodec-Add-V4L2-Request-API-mpeg2-hwaccel.patch
+  v4l2request-0006-avcodec-h264dec-add-ref_pic_marking-and-pic_order_cn.patch
+  v4l2request-0007-avcodec-Add-V4L2-Request-API-h264-hwaccel.patch
+  v4l2request-0008-avcodec-Add-V4L2-Request-API-hevc-hwaccel.patch
+  v4l2request-0009-avcodec-Add-V4L2-Request-API-vp8-hwaccel.patch
+  v4l2request-0010-avcodec-Add-V4L2-Request-API-vp9-hwaccel.patch
+  v4l2request-0011-avcodec-Add-V4L2-Request-API-av1-hwaccel.patch
+  v4l2request-0012-avutil-hwcontext_v4l2request-Add-support-for-AFBC_16.patch
+  v4l2request-0013-avutil-hwcontext_v4l2request-Add-support-for-BROADCO.patch
+)
+source=(
+  https://ffmpeg.org/releases/ffmpeg-${pkgver}.tar.xz
+  0001-Add-av_stream_get_first_dts-for-Chromium.patch
+  "${_v4l2request[@]}"
+)
+sha256sums=('8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e'
+            'f865d677f8ad39c79dde69186629cb6468c2b289c4156dbb8dec8e68b0131b40'
+            '32b2619e4c39943f2c1eb96df49f45d2565f4a9522fe6842f2ed9cd84bf4969d'
+            'cb57604c49b74c3b1732ac3e9313d85be4d6fae6fe054e36d3aa68855cb7f4b1'
+            '579df16affcbb6386a7ccbb8f00a864cb7eff1b54f505d80846aac16e53941ce'
+            '48124024548b9553dc610e7b6fc36886e75a56b5c3d7c97b99a06a5b7a9184d3'
+            '792a3bbccf3066d35993b1c5e0d39b553794ddf973328d84d2436547135319dd'
+            'bf23c67ee57d095e7fcad91d65f54c89be38e9ff361794f24a6fefc56112a7ed'
+            '33adab9c82f2ee4738af4218f517dc78efa020a92a8ac6537b79f47bdc07a324'
+            'aab35d625f2faeffc9ea094a752d328554900bc782ca7482ba4ee2b1cb552109'
+            '229366c00c6669e88eb4a723073648e4361c05519a7dff2ddc82906ee2b53dad'
+            '8340dd3825b0b7743274eee00881030c723a180f04e9b4f020651495f96bab3c'
+            'c7c8ee004e359baf04f7ab1974274cdf44311c329131163923f5f514b7c9f1d2'
+            'b0d06e853e232d2aeef6f6ca05cf2fcaaaab27d05a76c6a71f37d0bc0f9110bc'
+            'ae1551537d8a8b78ad7c3d41805734e0f2add01c298318412118dd1e12cda7f9')
+
+prepare() {
+  cd ffmpeg-${pkgver}
+
+  # https://crbug.com/1251779
+  patch -Np1 -i ../0001-Add-av_stream_get_first_dts-for-Chromium.patch
+
+  local p
+  for p in "${_v4l2request[@]}"; do
+    patch -Np1 -i "../${p}"
+  done
+}
+
+build() {
+  export PKG_CONFIG_PATH='/usr/lib/mbedtls2/pkgconfig'
+  cd ffmpeg-${pkgver}
+
+  ./configure \
+    --prefix=/usr \
+    --disable-debug \
+    --disable-static \
+    --disable-stripping \
+    --enable-amf \
+    --enable-avisynth \
+    --enable-fontconfig \
+    --enable-frei0r \
+    --enable-gmp \
+    --enable-gnutls \
+    --enable-gpl \
+    --enable-ladspa \
+    --enable-libass \
+    --enable-libbluray \
+    --enable-libbs2b \
+    --enable-libdav1d \
+    --enable-libdrm \
+    --enable-libdvdnav \
+    --enable-libdvdread \
+    --enable-libfreetype \
+    --enable-lcms2 \
+    --enable-libfribidi \
+    --enable-libgsm \
+    --enable-libharfbuzz \
+    --enable-libiec61883 \
+    --enable-libjack \
+    --enable-libjxl \
+    --enable-libmodplug \
+    --enable-libmp3lame \
+    --enable-libopencore_amrnb \
+    --enable-libopencore_amrwb \
+    --enable-libopenjpeg \
+    --enable-libopenmpt \
+    --enable-libopus \
+    --enable-libplacebo \
+    --enable-libpulse \
+    --enable-librsvg \
+    --enable-librubberband \
+    --enable-libsnappy \
+    --enable-libsoxr \
+    --enable-libspeex \
+    --enable-libsrt \
+    --enable-libssh \
+    --enable-libtheora \
+    --enable-libudev \
+    --enable-libv4l2 \
+    --enable-libvidstab \
+    --enable-libvorbis \
+    --enable-libvpx \
+    --enable-libwebp \
+    --enable-libx264 \
+    --enable-libx265 \
+    --enable-libxcb \
+    --enable-libxml2 \
+    --enable-libxvid \
+    --enable-libzimg \
+    --enable-libzmq \
+    --enable-opencl \
+    --enable-opengl \
+    --enable-shared \
+    --enable-v4l2-request \
+    --enable-vapoursynth \
+    --enable-version3 \
+    --enable-vulkan \
+    --disable-decoder=magicyuv # pixelsmash
+  make
+  make tools/qt-faststart
+  make doc/ff{mpeg,play}.1
+}
+
+package() {
+  depends+=(
+    libass.so
+    libbs2b.so
+    libdav1d.so
+    libfreetype.so
+    libharfbuzz.so
+    libopenmpt.so
+    libplacebo.so
+    librsvg-2.so
+    librubberband.so
+    libudev.so
+    libva.so
+    libva-drm.so
+    libva-x11.so
+    libvidstab.so
+    libvorbisenc.so
+    libvorbis.so
+    libvpx.so
+    libx264.so
+    libxvidcore.so
+    libzimg.so
+    libzmq.so
+  )
+
+  make DESTDIR="${pkgdir}" -C ffmpeg-${pkgver} install install-man
+  install -Dm 755 ffmpeg-${pkgver}/tools/qt-faststart "${pkgdir}"/usr/bin/
+}
+
+# vim: ts=2 sw=2 et:

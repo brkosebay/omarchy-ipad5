@@ -1,0 +1,284 @@
+From 661f13de4a905dab48b4e344a71216dc77c38490 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 13:13:59 +0000
+Subject: [PATCH 15/16] spi: apple-s8000: quiesce kexec handoffs and trace
+ synchronous child probes
+
+Drain the SPI queue before stopping the powered controller and deassert GPIO chip selects. Normalize inherited CTRL/CFG/count/status state before registering children, reject stale unsent RX data, and keep the existing bounded PIO deadline. Refuse an unsuccessful kexec shutdown rather than reusing RAM with live work.
+
+Add bounded PIO breadcrumbs, N1 phase/reset-interval diagnostics, and codec MCLK/ID milestones. The observed last controller is SPI1 (CS42L81), not SPI3 (N1). Preserve the existing IRQ-synchronized N1 shutdown.
+---
+ drivers/input/touchscreen/apple_n1.c | 12 ++++
+ drivers/spi/spi-apple-s8000.c        | 87 +++++++++++++++++++++++++++-
+ sound/soc/codecs/cs42l81.c           |  7 +++
+ 3 files changed, 104 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/input/touchscreen/apple_n1.c b/drivers/input/touchscreen/apple_n1.c
+index eecf94a019..50b61d5136 100644
+--- a/drivers/input/touchscreen/apple_n1.c
++++ b/drivers/input/touchscreen/apple_n1.c
+@@ -744,6 +744,9 @@ static int n1_power_on(struct apple_n1 *n1)
+ {
+ 	int ret;
+ 
++	dev_info(&n1->spi->dev, "N1 power/reset begin (reset asserted, LDO off)\n");
++	/* Ensure a real reset interval even after a retained/panic entry. */
++	usleep_range(5000, 6000);
+ 	ret = regulator_enable(n1->vdd);
+ 	if (ret)
+ 		return ret;
+@@ -790,6 +793,7 @@ static int n1_probe(struct spi_device *spi)
+ 	unsigned int stage = READ_ONCE(boot_stage);
+ 	int ret, count, i;
+ 
++	dev_info(dev, "N1 probe begin stage=%u\n", stage);
+ 	if (stage < 1 || stage > 3)
+ 		return -EINVAL;
+ 	n1 = devm_kzalloc(dev, sizeof(*n1), GFP_KERNEL);
+@@ -833,6 +837,7 @@ static int n1_probe(struct spi_device *spi)
+ 	n1->sync_off = pinctrl_lookup_state(n1->pins, "sync-off");
+ 	if (IS_ERR(n1->sync_off))
+ 		return dev_err_probe(dev, PTR_ERR(n1->sync_off), "sync-off state\n");
++	dev_info(dev, "N1 resources ready; loading firmware/calibration\n");
+ 	if (stage >= 2) {
+ 		ret = device_property_read_string(dev, "firmware-name", &name);
+ 		if (ret)
+@@ -886,6 +891,7 @@ static int n1_probe(struct spi_device *spi)
+ 	ret = n1_power_on(n1);
+ 	if (ret)
+ 		goto release_firmware;
++	dev_info(dev, "N1 power/reset complete; HBPP begin\n");
+ 	ret = n1_check_hbpp(n1);
+ 	if (ret)
+ 		goto power_off;
+@@ -899,9 +905,11 @@ static int n1_probe(struct spi_device *spi)
+ 	dev_info(dev, "HBPP detected; N1 controller %#x (stage %u)\n", version, stage);
+ 	if (stage == 1)
+ 		goto power_off;
++	dev_info(dev, "N1 calibration upload begin\n");
+ 	ret = n1_upload_calibration(n1, cal_data);
+ 	if (ret)
+ 		goto power_off;
++	dev_info(dev, "N1 firmware upload begin\n");
+ 	memcpy(n1->tx, fw->data, fw->size);
+ 	ret = n1_send_blob(n1, fw->size);
+ 	if (ret)
+@@ -914,9 +922,11 @@ static int n1_probe(struct spi_device *spi)
+ 	ret = n1_calibrate(n1, version);
+ 	if (ret)
+ 		goto power_off;
++	dev_info(dev, "N1 execute begin\n");
+ 	ret = n1_execute(n1);
+ 	if (ret)
+ 		goto power_off;
++	dev_info(dev, "N1 discovery begin\n");
+ 	ret = n1_discover(n1);
+ 	if (ret || stage == 2)
+ 		goto power_off;
+@@ -987,6 +997,8 @@ static void n1_remove(struct spi_device *spi)
+ {
+ 	struct apple_n1 *n1 = spi_get_drvdata(spi);
+ 
++	dev_info(&spi->dev, "N1 stop begin irq=%u powered=%u\n",
++		 n1->irq_requested, n1->powered);
+ 	/* Free/synchronize even if the error path already masked this IRQ.
+ 	 * Do not race an IRQ-thread flag or add another disable-depth count.
+ 	 * The managed action is removed here, before contacts and power go away.
+diff --git a/drivers/spi/spi-apple-s8000.c b/drivers/spi/spi-apple-s8000.c
+index 12da8fe7ee..7bfa9be80c 100644
+--- a/drivers/spi/spi-apple-s8000.c
++++ b/drivers/spi/spi-apple-s8000.c
+@@ -5,6 +5,7 @@
+ #include <linux/delay.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/io.h>
++#include <linux/kexec.h>
+ #include <linux/ktime.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+@@ -44,8 +45,39 @@ struct s8000_spi {
+ 	void __iomem *base;
+ 	struct clk *clk;
+ 	bool held;
++	unsigned int traced_xfers;
+ };
+ 
++/* Only documented version-1 registers, with RUN, DMA/IRQ modes and counts off.
++ * Retain the existing CTRL_ENABLE sequence for subsequent FIFO transfers.
++ * Do not touch SmartIO: this driver never submits DMA descriptors.
++ */
++static int s8000_spi_idle(struct s8000_spi *spi, struct device *dev)
++{
++	u32 ctrl, cfg, status;
++
++	dev_info(dev, "SPI idle begin\n");
++	ctrl = readl(spi->base + S8000_CTRL);
++	cfg = readl(spi->base + S8000_CFG);
++	status = readl(spi->base + S8000_STATUS);
++	dev_info(dev, "SPI inherited ctrl=%#x cfg=%#x status=%#x\n",
++		 ctrl, cfg, status);
++	writel(0, spi->base + S8000_CTRL);
++	writel(S8000_CFG_BASE, spi->base + S8000_CFG);
++	writel(0, spi->base + S8000_RXCNT);
++	writel(0, spi->base + S8000_TXCNT);
++	writel(S8000_PIN_CS, spi->base + S8000_PIN);
++	writel(S8000_STATUS_CLEAR, spi->base + S8000_STATUS);
++	/* Complete posted writes before publishing children or leaving Linux. */
++	ctrl = readl(spi->base + S8000_CTRL);
++	if (ctrl) {
++		dev_err(dev, "SPI failed to stop: ctrl=%#x\n", ctrl);
++		return -EIO;
++	}
++	dev_info(dev, "SPI idle complete\n");
++	return 0;
++}
++
+ static void s8000_spi_pm_put(void *data)
+ {
+ 	struct device *dev = data;
+@@ -88,6 +120,7 @@ static int s8000_spi_transfer_one(struct spi_controller *ctlr,
+ 	u64 word_delay_cycles;
+ 	ktime_t deadline;
+ 	int word_delay_ns, ret = 0;
++	bool traced = spi->traced_xfers < 8;
+ 
+ 	if (!transfer->len)
+ 		return 0;
+@@ -113,6 +146,11 @@ static int s8000_spi_transfer_one(struct spi_controller *ctlr,
+ 	if (device->mode & SPI_CPOL)
+ 		cfg |= S8000_CFG_CPOL;
+ 
++	if (traced) {
++		spi->traced_xfers++;
++		dev_info(&device->dev, "PIO begin %u len=%u speed=%u\n",
++			 spi->traced_xfers, transfer->len, transfer->effective_speed_hz);
++	}
+ 	/* spi-version 1 has FIFO counts in STATUS, unlike the M1 controller. */
+ 	writel(0, spi->base + S8000_CTRL);
+ 	writel(divisor, spi->base + S8000_CLKDIV);
+@@ -130,7 +168,11 @@ static int s8000_spi_transfer_one(struct spi_controller *ctlr,
+ 		tx_level = FIELD_GET(S8000_TX_LEVEL, status);
+ 		rx_level = FIELD_GET(S8000_RX_LEVEL, status);
+ 		if (tx_level > S8000_FIFO_DEPTH || rx_level > S8000_FIFO_DEPTH ||
+-		    rx_level > transfer->len - received) {
++		    rx_level > transfer->len - received ||
++		    rx_level > sent - received) {
++			dev_err(&device->dev,
++				"invalid PIO FIFO: tx=%u rx=%u status=%#x\n",
++				sent, received, status);
+ 			ret = -EIO;
+ 			break;
+ 		}
+@@ -163,6 +205,11 @@ static int s8000_spi_transfer_one(struct spi_controller *ctlr,
+ 	writel(cfg, spi->base + S8000_CFG);
+ 	writel(0, spi->base + S8000_CTRL);
+ 	writel(S8000_STATUS_CLEAR, spi->base + S8000_STATUS);
++	readl(spi->base + S8000_CTRL);
++	if (traced) {
++		dev_info(&device->dev, "PIO end %u ret=%d tx=%u rx=%u\n",
++			 spi->traced_xfers, ret, sent, received);
++	}
+ 	return ret;
+ }
+ 
+@@ -243,10 +290,14 @@ static int s8000_spi_probe(struct platform_device *pdev)
+ 	ctlr->max_transfer_size = s8000_spi_max_transfer_size;
+ 	ctlr->use_gpio_descriptors = true;
+ 	ctlr->auto_runtime_pm = autosuspend;
++	ret = s8000_spi_idle(spi, &pdev->dev);
++	if (ret)
++		return ret;
+ 	/* No controller IRQ enable bits are set: every PIO transfer is bounded. */
+-	writel(0, spi->base + S8000_CTRL);
+ 	dev_info(&pdev->dev, "Samsung SPI v1 PIO, input clock %lu Hz\n", rate);
++	dev_info(&pdev->dev, "SPI register/children begin\n");
+ 	ret = devm_spi_register_controller(&pdev->dev, ctlr);
++	dev_info(&pdev->dev, "SPI register/children end ret=%d\n", ret);
+ 	if (ret)
+ 		return ret;
+ 	if (autosuspend) {
+@@ -258,6 +309,37 @@ static int s8000_spi_probe(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
++static void s8000_spi_shutdown(struct platform_device *pdev)
++{
++	struct spi_controller *ctlr = platform_get_drvdata(pdev);
++	struct s8000_spi *spi = spi_controller_get_devdata(ctlr);
++	int ret;
++	unsigned int cs;
++
++	/* device_shutdown() has already stopped the children (N1 masks/frees
++	 * its IRQ before asserting reset). Drain before touching controller MMIO.
++	 */
++	dev_info(&pdev->dev, "SPI shutdown queue begin\n");
++	ret = spi_controller_suspend(ctlr);
++	if (!ret)
++		ret = pm_runtime_resume_and_get(&pdev->dev);
++	if (ret >= 0) {
++		/* Core-owned GPIO selects may have been retained by cs_change. */
++		if (ctlr->cs_gpiods)
++			for (cs = 0; cs < ctlr->num_chipselect; cs++)
++				gpiod_set_value_cansleep(ctlr->cs_gpiods[cs], 0);
++		ret = s8000_spi_idle(spi, &pdev->dev);
++	}
++	if (ret < 0) {
++		dev_err(&pdev->dev, "SPI shutdown failed: %d\n", ret);
++		if (kexec_in_progress)
++			panic("S8000 SPI shutdown failed before kexec: %d", ret);
++		return;
++	}
++	/* Pin runtime power until the jump; no transfers may restart here. */
++	dev_info(&pdev->dev, "SPI shutdown complete\n");
++}
++
+ static const struct of_device_id s8000_spi_match[] = {
+ 	{ .compatible = "apple,s8000-spi" },
+ 	{ }
+@@ -266,6 +348,7 @@ MODULE_DEVICE_TABLE(of, s8000_spi_match);
+ 
+ static struct platform_driver s8000_spi_driver = {
+ 	.probe = s8000_spi_probe,
++	.shutdown = s8000_spi_shutdown,
+ 	.driver = {
+ 		.name = "apple-s8000-spi",
+ 		.of_match_table = s8000_spi_match,
+diff --git a/sound/soc/codecs/cs42l81.c b/sound/soc/codecs/cs42l81.c
+index 454ba21d8d..16e6d61e6e 100644
+--- a/sound/soc/codecs/cs42l81.c
++++ b/sound/soc/codecs/cs42l81.c
+@@ -708,9 +708,12 @@ static int cs42l81_check_id(struct cs42l81 *cs)
+ 
+ 	/* MCLK is not known to be needed for the control port; keep it on
+ 	 * anyway while probing so a negative result is meaningful. */
++	dev_info(cs->dev, "codec ID MCLK enable begin\n");
+ 	ret = clk_prepare_enable(cs->mclk);
++	dev_info(cs->dev, "codec ID MCLK enable end ret=%d\n", ret);
+ 	if (ret)
+ 		return dev_err_probe(cs->dev, ret, "could not enable MCLK\n");
++	dev_info(cs->dev, "codec ID SPI reads begin\n");
+ 
+ 	for (i = 0; i < 3; i++) {
+ 		ret = regmap_read(cs->regmap, CS42L81_DEVID_AB + i, &id[i]);
+@@ -719,7 +722,9 @@ static int cs42l81_check_id(struct cs42l81 *cs)
+ 	}
+ 	if (!ret)
+ 		ret = regmap_read(cs->regmap, CS42L81_REVID, &rev);
++	dev_info(cs->dev, "codec ID SPI reads end ret=%d; MCLK disable begin\n", ret);
+ 	clk_disable_unprepare(cs->mclk);
++	dev_info(cs->dev, "codec ID MCLK disable end\n");
+ 
+ 	if (ret)
+ 		return dev_err_probe(cs->dev, ret, "SPI read failed\n");
+@@ -741,6 +746,8 @@ static int cs42l81_spi_probe(struct spi_device *spi)
+ 	u32 max_db_q8 = 0;
+ 	int ret;
+ 
++	dev_info(dev, "codec probe begin\n");
++
+ 	cs = devm_kzalloc(dev, sizeof(*cs), GFP_KERNEL);
+ 	if (!cs)
+ 		return -ENOMEM;
+-- 
+2.56.0
+

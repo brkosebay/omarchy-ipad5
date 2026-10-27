@@ -1,0 +1,4 @@
+  // linux-a9 (docs/boot/kernel-updates.md): kernel updates over Wi-Fi. A new
+  // kernel is tried once and becomes the default only after it passes its checks.
+  "update.ipad-kernel": {"icon":"","label":"iPad Kernel","description":"linux-a9 kernel update: download, install, trial boot","action":"omarchy-launch-floating-terminal-with-presentation 'linux-a9-update update'"},
+  "update.ipad-kernel-rollback": {"icon":"","label":"Roll Back iPad Kernel","description":"cancel a trial or return to the previous linux-a9 kernel","action":"omarchy-launch-floating-terminal-with-presentation 'linux-a9-update status; linux-a9-update rollback --reboot'"},

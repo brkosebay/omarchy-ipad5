@@ -1,0 +1,226 @@
+From 767dad02da8fe771c91c6566dd973b65b5c1931b Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 11:00:43 +0000
+Subject: [PATCH] PCI: apple-h9p: quiesce unbound ANS in the j71t capture
+ kernel
+
+---
+ drivers/pci/controller/pcie-apple-h9p.c | 147 ++++++++++++++++++++++--
+ 1 file changed, 139 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/pci/controller/pcie-apple-h9p.c b/drivers/pci/controller/pcie-apple-h9p.c
+index 3136234a72..4ba83d8861 100644
+--- a/drivers/pci/controller/pcie-apple-h9p.c
++++ b/drivers/pci/controller/pcie-apple-h9p.c
+@@ -15,6 +15,7 @@
+ #include <linux/bitfield.h>
+ #include <linux/bitops.h>
+ #include <linux/clk.h>
++#include <linux/crash_dump.h>
+ #include <linux/delay.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/gpio/consumer.h>
+@@ -28,6 +29,7 @@
+ #include <linux/module.h>
+ #include <linux/kexec.h>
+ #include <linux/msi.h>
++#include <linux/nvme.h>
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+ #include <linux/of_device.h>
+@@ -160,6 +162,10 @@ MODULE_PARM_DESC(aspm_l1_ports,
+ #define H9P_SLEEP_KEEP_LINKS		1
+ #define H9P_SLEEP_L2_POWERED		2
+ #define H9P_SLEEP_L2_ALL		3
++static bool crash_quiesce_supported = true;
++module_param(crash_quiesce_supported, bool, 0444);
++MODULE_PARM_DESC(crash_quiesce_supported, "Capture-kernel host-only ANS quiesce is available");
++
+ static unsigned int h9p_suspend;
+ module_param_named(suspend, h9p_suspend, uint, 0644);
+ MODULE_PARM_DESC(suspend,
+@@ -1676,6 +1682,14 @@ static int apple_s8003_setup_port_once(struct apple_h9p_pcie *pcie,
+ 		return dev_err_probe(dev, ret, "port %u initial power timeout\n", port);
+ 	apple_s8003_port_dump(pcie, port, "inherited");
+ 	apple_s8003_port_stop(pcie, port);
++	if (!port && pcie->nvmmu.base &&
++	    of_machine_is_compatible("apple,j71t")) {
++		dev_info(dev, "ANS inherited NVMMU: SART %#x TCB %#x:%08x; retiring under PERST\n",
++			 readl(pcie->nvmmu.base + H9P_NVMMU_SART_CTRL),
++			 readl(pcie->nvmmu.base + H9P_NVMMU_TCB_BASE_HI),
++			 readl(pcie->nvmmu.base + H9P_NVMMU_TCB_BASE_LO));
++		h9p_writel_flush(0, pcie->nvmmu.base + H9P_NVMMU_SART_CTRL);
++	}
+ 	apple_s8003_port_off(pcie, port);
+ 	if (pcie->nvme_mode[port])
+ 		h9p_writel_flush(0, rc + S8003_RC_NVME_MODE1);
+@@ -2211,6 +2225,8 @@ static int apple_h9p_pcie_get_gpios(struct apple_h9p_pcie *pcie)
+ 	return 0;
+ }
+ 
++static const struct attribute_group apple_h9p_crash_group;
++
+ static int apple_h9p_pcie_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -2309,6 +2325,12 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
++	if (is_kdump_kernel() && of_machine_is_compatible("apple,j71t")) {
++		ret = devm_device_add_group(dev, &apple_h9p_crash_group);
++		if (ret)
++			return ret;
++	}
++
+ 	if (pcie->late_ports) {
+ 		dev_info(dev, "ports %#x: bringing up after their endpoint power\n",
+ 			 pcie->late_ports);
+@@ -2595,17 +2617,13 @@ static int apple_h9p_pcie_resume_noirq(struct device *dev)
+  * PME_TO/L2 and clock removal gained no DMA safety and broke retraining in
+  * test 2. The incoming probe now restarts the port itself before scanning.
+  */
+-static void apple_h9p_pcie_shutdown(struct platform_device *pdev)
++static void apple_h9p_pcie_park(struct apple_h9p_pcie *pcie,
++				unsigned long ports)
+ {
+-	struct apple_h9p_pcie *pcie = apple_h9p_pcie_lookup(&pdev->dev);
+-	unsigned long ports;
+ 	unsigned int port;
+ 
+-	if (!kexec_in_progress || !pcie ||
+-	    !of_device_is_compatible(pdev->dev.of_node, "apple,s8003-pcie"))
+-		return;
+ 	cancel_delayed_work_sync(&pcie->late_work);
+-	ports = pcie->enabled_ports;
++	ports &= pcie->enabled_ports;
+ 	for_each_set_bit(port, &ports, H9P_NUM_PORTS) {
+ 		void __iomem *cfg = pcie->base_config + port * H9P_CFG_PORT_STRIDE;
+ 
+@@ -2625,9 +2643,122 @@ static void apple_h9p_pcie_shutdown(struct platform_device *pdev)
+ 		apple_s8003_port_dump(pcie, port, "kexec parked (powered)");
+ 		pcie->enabled_ports &= ~BIT(port);
+ 	}
+-	dev_info(&pdev->dev, "kexec: PCIe PERST asserted, LTSSM stopped, ports powered; NVMMU SART disabled\n");
++	dev_info(pcie->dev, "kexec: PCIe PERST asserted, LTSSM stopped, ports powered; NVMMU SART disabled\n");
++}
++
++static void apple_h9p_pcie_shutdown(struct platform_device *pdev)
++{
++	struct apple_h9p_pcie *pcie = apple_h9p_pcie_lookup(&pdev->dev);
++
++	if (kexec_in_progress && pcie &&
++	    of_device_is_compatible(pdev->dev.of_node, "apple,s8003-pcie"))
++		apple_h9p_pcie_park(pcie, pcie->enabled_ports);
+ }
+ 
++struct apple_h9p_crash_state {
++	struct apple_h9p_pcie *pcie;
++	int result;
++	bool busy;
++	bool found;
++};
++
++/* No NVMe driver, queues, SHN, or old DMA buffers are needed in phoenix. */
++static int apple_h9p_crash_stop_ans(struct pci_dev *pdev, void *data)
++{
++	struct apple_h9p_crash_state *state = data;
++	struct apple_h9p_pcie *pcie = state->pcie;
++	void __iomem *bar;
++	u32 csts = 0;
++	int i, ret;
++
++	if (pdev->vendor != PCI_VENDOR_ID_APPLE ||
++	    ((pdev->class >> 8) != PCI_CLASS_STORAGE_EXPRESS &&
++	     (pdev->class >> 8) != PCI_CLASS_STORAGE_OTHER))
++		return 0;
++	state->found = true;
++	if (pdev->driver) {
++		state->busy = true;
++		return 1;
++	}
++	if (apple_ans_link_up(&pdev->dev) <= 0) {
++		state->result = -ENOLINK;
++		return 0;
++	}
++	ret = pci_enable_device_mem(pdev);
++	if (ret) {
++		state->result = ret;
++		return 0;
++	}
++	bar = pci_iomap_range(pdev, 0, 0, SZ_8K);
++	if (!bar) {
++		ret = -ENOMEM;
++		goto disable;
++	}
++	/* An unknown queue must never be rung or sent a shutdown notification. */
++	dev_info(pcie->dev, "phoenix ANS: CC %#x CSTS %#x, clearing EN without SHN\n",
++		 readl(bar + NVME_REG_CC), readl(bar + NVME_REG_CSTS));
++	writel(0, bar + NVME_REG_CC);
++	ret = -ETIMEDOUT;
++	for (i = 0; i < 2000; i++) {
++		if (apple_ans_link_up(&pdev->dev) <= 0) {
++			ret = -ENOLINK;
++			break;
++		}
++		csts = readl(bar + NVME_REG_CSTS);
++		if (csts == U32_MAX) {
++			ret = -EIO;
++			break;
++		}
++		if (!(csts & NVME_CSTS_RDY)) {
++			ret = 0;
++			break;
++		}
++		usleep_range(1000, 1100);
++	}
++	dev_info(pcie->dev, "phoenix ANS: disable result %d CSTS %#x; blocking bus master\n",
++		 ret, csts);
++	pci_iounmap(pdev, bar);
++disable:
++	pci_clear_master(pdev);
++	pci_disable_device(pdev);
++	state->result = ret;
++	return 0;
++}
++
++static ssize_t crash_quiesce_store(struct device *dev,
++				   struct device_attribute *attr,
++				   const char *buf, size_t count)
++{
++	struct apple_h9p_pcie *pcie = apple_h9p_pcie_lookup(dev);
++	struct apple_h9p_crash_state state = { .pcie = pcie };
++
++	if (!is_kdump_kernel() || !of_machine_is_compatible("apple,j71t") ||
++	    !pcie || !sysfs_streq(buf, "1"))
++		return -EPERM;
++	/* The endpoint gate must stay closed; don't park under a live driver. */
++	if (pcie->late_ports || work_busy(&pcie->late_work.work))
++		return -EBUSY;
++	pci_walk_bus(pcie->bridge->bus, apple_h9p_crash_stop_ans, &state);
++	if (state.busy)
++		return -EBUSY;
++	/* Isolation is still required after a bounded RDY timeout. */
++	/* Wi-Fi stays linked until its own shutdown callback has run. */
++	apple_h9p_pcie_park(pcie, BIT(0));
++	dev_info(dev, "phoenix: ANS/PCIe quiesced (controller found %d result %d)\n",
++		 state.found, state.result);
++	return count;
++}
++static DEVICE_ATTR_WO(crash_quiesce);
++
++static struct attribute *apple_h9p_crash_attrs[] = {
++	&dev_attr_crash_quiesce.attr,
++	NULL,
++};
++
++static const struct attribute_group apple_h9p_crash_group = {
++	.attrs = apple_h9p_crash_attrs,
++};
++
+ static const struct dev_pm_ops apple_h9p_pcie_pm_ops = {
+ 	.prepare = apple_h9p_pcie_prepare,
+ 	.complete = apple_h9p_pcie_complete,
+-- 
+2.56.0
+

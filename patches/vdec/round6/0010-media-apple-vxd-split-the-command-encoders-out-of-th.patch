@@ -1,0 +1,859 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 11:10:39 +0000
+Subject: [PATCH 10/20] media: apple: vxd: split the command encoders out of the
+ buffer pool
+
+The H.264 command-stream builder (R3c) has to be checked word for word
+against an independent reference generator on the host.  Move the
+encoders, the chunk and packet-list helpers and struct apple_vxd_cmdbuf
+into apple-vxd-cmd.{c,h}, which use no MMIO, no DMA API and no lock, so
+the same file builds in the host harness.  apple-vxd-cmdbuf.c keeps the
+pool, the packet -> mailbox message arithmetic, the self-test and the
+debugfs view.
+
+One addition for the per-picture chunks of single-register writes:
+apple_vxd_cmdbuf_pair_chunk_end() closes a chunk made only of
+0x000f0000 pairs with the 0x40 - (pairs & 7) * 8 byte pad of
+0xfffffff0062b7ab0, and the writer now counts the pairs.  No functional
+change otherwise.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ drivers/media/platform/apple/vxd/Makefile          |   4 +-
+ drivers/media/platform/apple/vxd/apple-vxd-cmd.c   | 320 +++++++++++++++++++++
+ drivers/media/platform/apple/vxd/apple-vxd-cmd.h   |  78 +++++
+ .../media/platform/apple/vxd/apple-vxd-cmdbuf.c    | 284 +-----------------
+ drivers/media/platform/apple/vxd/apple-vxd.h       |  51 +---
+ 5 files changed, 408 insertions(+), 329 deletions(-)
+
+diff --git a/drivers/media/platform/apple/vxd/Makefile b/drivers/media/platform/apple/vxd/Makefile
+index 6a149e2c4b2d44b52fbc8a71d13b8b0b88587784..623003b99c7eef3787a33d80bc3f2fdc7d941aa2 100644
+--- a/drivers/media/platform/apple/vxd/Makefile
++++ b/drivers/media/platform/apple/vxd/Makefile
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: GPL-2.0
+ apple-vxd-objs := apple-vxd-core.o apple-vxd-gart.o apple-vxd-fw.o \
+-		  apple-vxd-mbox.o apple-vxd-cmdbuf.o apple-vxd-v4l2.o \
+-		  apple-vxd-h264.o
++		  apple-vxd-mbox.o apple-vxd-cmd.o apple-vxd-cmdbuf.o \
++		  apple-vxd-v4l2.o apple-vxd-h264.o
+ 
+ obj-$(CONFIG_VIDEO_APPLE_VXD) += apple-vxd.o
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-cmd.c b/drivers/media/platform/apple/vxd/apple-vxd-cmd.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..f1aae6161c588cb23de7b232b8f6d1cc40b33267
+--- /dev/null
++++ b/drivers/media/platform/apple/vxd/apple-vxd-cmd.c
+@@ -0,0 +1,320 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Apple VXD - command-stream encoders (R3b, split out for R3c)
++ *
++ * The H.264 command stream is an MSVDX register program
++ * (docs/periph/ds-vxd-cmdstream.md): per slice one chunk of command words
++ * in a GART-mapped buffer, padded to 64 bytes, plus one 0x78-byte packet
++ * describing that chunk; per picture one more chunk of single-register
++ * writes (the kind-4 / mailbox 0x88 packet).
++ *
++ * What the kext does, byte for byte [E]:
++ *
++ *   CH264Decoder::HOST_H264DecodeFrame, per slice (0xfffffff0062967cc):
++ *     bytes = wptr - base - chunk_start            (payload +0x0c)
++ *     zero-fill 64 - (wptr & 63) bytes, advance by that & 0x7c
++ *     packet = addCommand(pktlist, 0x80000007, 0x78)   <- a second object
++ *     payload +0x10 = chunk_start + cmd->[0x18]
++ *   after the slice loop, 0x62b7ab0: one chunk of 0x000f0000 pairs, padded
++ *     by 0x40 - (pairs & 7) * 8 bytes, payload +0x0c counting the pad
++ *   CmdBuf::addCommand (0xfffffff0062982f8): {magic, size, 0xabcdefab} at
++ *     the list's own offset, gate offset + size + 0xc < capacity
++ *   SubmitCommandBufferInternal (0xfffffff00628a8d4): walk the packet list
++ *     from its base, check both magics, one mailbox message per packet
++ *
++ * The packet list and the register program are therefore two buffers:
++ * the walker starts at the list's base and would reject the first command
++ * word (0x90000000) otherwise.  Only the register program is device
++ * memory.
++ *
++ * Register runs (0xfffffff00629b068) are written through a scoped writer
++ * that asserts exclusive use of the buffer: consecutive registers merge
++ * into one 0x1 header (count += 1) only inside one group, so groups are
++ * explicit here (apple_vxd_cmd_group_open/close) and no other command may
++ * be emitted while one is open.
++ *
++ * Every emitter is bounds-checked; a failure sets a sticky error that the
++ * caller checks once at the end of a chunk.  Nothing here touches MMIO,
++ * the DMA API or a lock, so the file builds unchanged on the host.
++ */
++#include <linux/align.h>
++#include <linux/bitfield.h>
++#include <linux/errno.h>
++#include <linux/limits.h>
++#include <linux/string.h>
++
++#include "apple-vxd-cmd.h"
++
++void apple_vxd_cmdbuf_reset(struct apple_vxd_cmdbuf *cb)
++{
++	cb->used = 0;
++	cb->chunk_start = 0;
++	cb->group_open = false;
++	cb->group_flags = 0;
++	cb->run_hdr = SIZE_MAX;
++	cb->run_next_reg = 0;
++	cb->npairs = 0;
++	cb->error = false;
++	cb->pkt_used = 0;
++	cb->npackets = 0;
++}
++
++static bool vxd_cmd_room(struct apple_vxd_cmdbuf *cb, size_t bytes)
++{
++	if (cb->error)
++		return false;
++	if (bytes > cb->size - cb->used) {
++		cb->error = true;
++		return false;
++	}
++	return true;
++}
++
++static void vxd_cmd_put(struct apple_vxd_cmdbuf *cb, u32 word)
++{
++	cb->vaddr[cb->used / 4] = word;
++	cb->used += 4;
++}
++
++/* Every non-0x1 command: no open register group, room for @words. */
++static bool vxd_cmd_begin(struct apple_vxd_cmdbuf *cb, size_t words)
++{
++	if (cb->group_open) {
++		cb->error = true;
++		return false;
++	}
++	return vxd_cmd_room(cb, words * 4);
++}
++
++void apple_vxd_cmd_word(struct apple_vxd_cmdbuf *cb, u32 word)
++{
++	if (vxd_cmd_begin(cb, 1))
++		vxd_cmd_put(cb, word);
++}
++
++/* Open a 0x1 register group; @flags is OR-ed into every run header. */
++void apple_vxd_cmd_group_open(struct apple_vxd_cmdbuf *cb, u32 flags)
++{
++	if (cb->group_open) {
++		cb->error = true;
++		return;
++	}
++	cb->group_open = true;
++	cb->group_flags = flags;
++	cb->run_hdr = SIZE_MAX;
++}
++
++/*
++ * 0x1 form: 0x10010000 | flags | reg, value; a write to the register right
++ * after the previous one extends that run instead (0xfffffff00629b068).
++ */
++void apple_vxd_cmd_reg(struct apple_vxd_cmdbuf *cb, u32 reg, u32 val)
++{
++	u32 *hdr;
++
++	if (!cb->group_open) {
++		cb->error = true;
++		return;
++	}
++
++	hdr = cb->run_hdr != SIZE_MAX ? &cb->vaddr[cb->run_hdr / 4] : NULL;
++	if (hdr && cb->run_next_reg == reg &&
++	    FIELD_GET(VXD_CMD_REG_RUN_COUNT, *hdr) < FIELD_MAX(VXD_CMD_REG_RUN_COUNT)) {
++		if (!vxd_cmd_room(cb, 4))
++			return;
++		*hdr += VXD_CMD_REG_RUN_ONE;
++	} else {
++		if (!vxd_cmd_room(cb, 8))
++			return;
++		cb->run_hdr = cb->used;
++		vxd_cmd_put(cb, (reg & VXD_CMD_REG_ADDR) | cb->group_flags |
++				VXD_CMD_REG_RUN | VXD_CMD_REG_RUN_ONE);
++	}
++	vxd_cmd_put(cb, val);
++	cb->run_next_reg = reg + 4;
++}
++
++void apple_vxd_cmd_group_close(struct apple_vxd_cmdbuf *cb)
++{
++	if (!cb->group_open)
++		cb->error = true;
++	cb->group_open = false;
++	cb->run_hdr = SIZE_MAX;
++}
++
++/* 0x000f0000 form: one register, (flags & 0xf0) << 16 (0xfffffff00629aa5c). */
++void apple_vxd_cmd_reg1(struct apple_vxd_cmdbuf *cb, u32 reg, u32 val,
++			u32 flags)
++{
++	if (!vxd_cmd_begin(cb, 2))
++		return;
++	vxd_cmd_put(cb, ((flags & VXD_CMD_REG1_FLAGS) << 16) |
++			(reg & VXD_CMD_REG_ADDR) | VXD_CMD_REG1);
++	vxd_cmd_put(cb, val);
++	cb->npairs++;
++}
++
++/* 0x9: the 0x28-byte per-slice block, emitted all zero by Apple. */
++void apple_vxd_cmd_slice_block(struct apple_vxd_cmdbuf *cb)
++{
++	unsigned int i;
++
++	if (!vxd_cmd_begin(cb, VXD_CMD_SLICE_BLOCK_WORDS))
++		return;
++	vxd_cmd_put(cb, VXD_CMD_SLICE_BLOCK);
++	for (i = 1; i < VXD_CMD_SLICE_BLOCK_WORDS; i++)
++		vxd_cmd_put(cb, 0);
++}
++
++/* 0xb: {0xb0000001, header bits consumed, slice bytes} (0x62b5b00). */
++void apple_vxd_cmd_slice_desc(struct apple_vxd_cmdbuf *cb, u32 w1, u32 w2)
++{
++	if (!vxd_cmd_begin(cb, 3))
++		return;
++	vxd_cmd_put(cb, VXD_CMD_SLICE_DESC);
++	vxd_cmd_put(cb, w1);
++	vxd_cmd_put(cb, w2);
++}
++
++/*
++ * 0xa: load @bytes from device address @va (0xfffffff00629a444, asserts
++ * bytes < 1 << 28).  This is how the slice bitstream reaches the core:
++ * @va is the GART VA of the OUTPUT buffer plus the slice offset.
++ */
++void apple_vxd_cmd_load(struct apple_vxd_cmdbuf *cb, u32 va, u32 bytes)
++{
++	if (bytes & ~VXD_CMD_LOAD_MAX) {
++		cb->error = true;
++		return;
++	}
++	if (!vxd_cmd_begin(cb, 2))
++		return;
++	vxd_cmd_put(cb, VXD_CMD_LOAD | bytes);
++	vxd_cmd_put(cb, va);
++}
++
++/* 0xf: install @bytes at @va into destination @dst (0x62b5fcc). */
++void apple_vxd_cmd_table_xfer(struct apple_vxd_cmdbuf *cb, u32 bytes,
++			      u32 va, u32 dst)
++{
++	if (bytes & ~VXD_CMD_LOAD_MAX) {
++		cb->error = true;
++		return;
++	}
++	if (!vxd_cmd_begin(cb, 3))
++		return;
++	vxd_cmd_put(cb, VXD_CMD_TABLE_XFER | bytes);
++	vxd_cmd_put(cb, va);
++	vxd_cmd_put(cb, dst);
++}
++
++void apple_vxd_cmd_end_slice(struct apple_vxd_cmdbuf *cb)
++{
++	apple_vxd_cmd_word(cb, VXD_CMD_END_SLICE);
++}
++
++static int vxd_cmd_pad(struct apple_vxd_cmdbuf *cb, size_t pad)
++{
++	if (!vxd_cmd_room(cb, pad))
++		return -ENOSPC;
++	memset((u8 *)cb->vaddr + cb->used, 0, pad);
++	cb->used += pad;
++	cb->chunk_start = cb->used;
++	cb->npairs = 0;
++	return 0;
++}
++
++/*
++ * Close the current slice chunk: report its offset and its byte count
++ * (payload +0x0c, before padding), then zero-fill 64 - (used & 63) bytes
++ * as Apple does (a full 64 when already aligned).  The next chunk starts
++ * 64-byte aligned.  Returns -ENOSPC on a sticky error.
++ */
++int apple_vxd_cmdbuf_chunk_end(struct apple_vxd_cmdbuf *cb, u32 *offset,
++			       u32 *bytes)
++{
++	if (cb->group_open)
++		cb->error = true;
++	if (cb->error)
++		return -ENOSPC;
++
++	*offset = cb->chunk_start;
++	*bytes = cb->used - cb->chunk_start;
++	return vxd_cmd_pad(cb, VXD_CMD_CHUNK_ALIGN -
++			   (cb->used & (VXD_CMD_CHUNK_ALIGN - 1)));
++}
++
++/*
++ * Close a chunk made only of 0x000f0000 pairs (the per-picture kind-4
++ * chunk, 0x62b7ab0): pad by 0x40 - (pairs & 7) * 8 bytes, a full 64 when
++ * the pair count is a multiple of eight, and report the byte count
++ * including that pad (the kext measures it after the pad; the message
++ * sends it as a pair count, >> 3).
++ */
++int apple_vxd_cmdbuf_pair_chunk_end(struct apple_vxd_cmdbuf *cb, u32 *offset,
++				    u32 *bytes)
++{
++	size_t pad;
++	int ret;
++
++	if (cb->group_open || cb->used - cb->chunk_start != cb->npairs * 8)
++		cb->error = true;
++	if (cb->error)
++		return -ENOSPC;
++
++	*offset = cb->chunk_start;
++	pad = VXD_CMD_CHUNK_ALIGN - (cb->npairs & 7) * 8;
++	ret = vxd_cmd_pad(cb, pad);
++	if (!ret)
++		*bytes = cb->used - *offset;
++	return ret;
++}
++
++/*
++ * CmdBuf::addCommand: append {magic, size, 0xabcdefab} and a zeroed
++ * payload of @size bytes to the host packet list.  Same gate as the kext
++ * (offset + size + 0xc < capacity).  Returns the payload or NULL.
++ */
++u32 *apple_vxd_cmdbuf_add_packet(struct apple_vxd_cmdbuf *cb, u32 magic,
++				 u32 size)
++{
++	u32 *hdr;
++
++	if (!IS_ALIGNED(size, 4) ||
++	    (u64)cb->pkt_used + size + VXD_PKT_HDR_BYTES >= cb->pkt_size) {
++		cb->error = true;
++		return NULL;
++	}
++
++	hdr = (u32 *)(cb->pkt + cb->pkt_used);
++	hdr[0] = magic;
++	hdr[1] = size;
++	hdr[2] = VXD_PKT_MAGIC1;
++	memset(&hdr[3], 0, size);
++	cb->pkt_used += VXD_PKT_HDR_BYTES + size;
++	cb->npackets++;
++	return &hdr[3];
++}
++
++/*
++ * The submit path's container check (0xfffffff00628ac78): from the list
++ * base, both magics on every packet, size + 0xc steps, landing exactly on
++ * the end.  Returns the packet count or -EINVAL.
++ */
++int apple_vxd_cmdbuf_validate(const struct apple_vxd_cmdbuf *cb)
++{
++	size_t off = 0;
++	int n = 0;
++
++	while (off < cb->pkt_used) {
++		const u32 *hdr = (const u32 *)(cb->pkt + off);
++
++		if (cb->pkt_used - off < VXD_PKT_HDR_BYTES ||
++		    hdr[0] != VXD_PKT_MAGIC0 || hdr[2] != VXD_PKT_MAGIC1 ||
++		    hdr[1] > cb->pkt_used - off - VXD_PKT_HDR_BYTES)
++			return -EINVAL;
++		off += VXD_PKT_HDR_BYTES + hdr[1];
++		n++;
++	}
++	return n == cb->npackets ? n : -EINVAL;
++}
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-cmd.h b/drivers/media/platform/apple/vxd/apple-vxd-cmd.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..7bd42cb01d48121be760c2c941935d9ec159510c
+--- /dev/null
++++ b/drivers/media/platform/apple/vxd/apple-vxd-cmd.h
+@@ -0,0 +1,78 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Apple VXD - command-stream encoders (R3b, split out for R3c)
++ *
++ * The containers and encodings of docs/periph/ds-vxd-cmdstream.md, with
++ * no MMIO, no DMA API and no locking, so the H.264 builder on top of them
++ * also compiles on the host (scripts/vdec/host/) and its output can be
++ * diffed word for word against the reference generator.
++ */
++#ifndef __APPLE_VXD_CMD_H__
++#define __APPLE_VXD_CMD_H__
++
++#include <linux/bitfield.h>
++#include <linux/types.h>
++
++#include "apple-vxd-regs.h"
++
++struct apple_vxd_fence;
++
++enum apple_vxd_cmdbuf_state {
++	APPLE_VXD_CMDBUF_FREE = 0,
++	APPLE_VXD_CMDBUF_HOST,
++	APPLE_VXD_CMDBUF_DEVICE,
++};
++
++/*
++ * One command buffer: the device-visible register program plus the
++ * host-only packet list that the submit path turns into mailbox messages
++ * (see apple-vxd.h for the pool and the ownership rules).
++ */
++struct apple_vxd_cmdbuf {
++	unsigned int index;
++	enum apple_vxd_cmdbuf_state state;	/* under mbox_lock */
++	struct apple_vxd_fence *fence;		/* releases it, while DEVICE */
++
++	/* Register program (device-visible). */
++	u32 *vaddr;			/* 64 KiB aligned */
++	dma_addr_t dma;
++	u32 va;				/* GART device VA */
++	size_t size;
++	size_t used;			/* byte cursor, 4-byte granular */
++	size_t chunk_start;		/* current chunk, 64 B aligned */
++	bool group_open;		/* inside a 0x1 register group */
++	u32 group_flags;		/* OR-ed into every run header */
++	size_t run_hdr;			/* open run header, or SIZE_MAX */
++	u32 run_next_reg;		/* register that extends the run */
++	unsigned int npairs;		/* 0x000f0000 writes in this chunk */
++	bool error;			/* sticky: overflow or misuse */
++
++	/* Packet list (host-only). */
++	u8 *pkt;
++	size_t pkt_size;
++	size_t pkt_used;
++	unsigned int npackets;
++};
++
++void apple_vxd_cmdbuf_reset(struct apple_vxd_cmdbuf *cb);
++void apple_vxd_cmd_word(struct apple_vxd_cmdbuf *cb, u32 word);
++void apple_vxd_cmd_group_open(struct apple_vxd_cmdbuf *cb, u32 flags);
++void apple_vxd_cmd_reg(struct apple_vxd_cmdbuf *cb, u32 reg, u32 val);
++void apple_vxd_cmd_group_close(struct apple_vxd_cmdbuf *cb);
++void apple_vxd_cmd_reg1(struct apple_vxd_cmdbuf *cb, u32 reg, u32 val,
++			u32 flags);
++void apple_vxd_cmd_slice_block(struct apple_vxd_cmdbuf *cb);
++void apple_vxd_cmd_slice_desc(struct apple_vxd_cmdbuf *cb, u32 w1, u32 w2);
++void apple_vxd_cmd_load(struct apple_vxd_cmdbuf *cb, u32 va, u32 bytes);
++void apple_vxd_cmd_table_xfer(struct apple_vxd_cmdbuf *cb, u32 bytes,
++			      u32 va, u32 dst);
++void apple_vxd_cmd_end_slice(struct apple_vxd_cmdbuf *cb);
++int apple_vxd_cmdbuf_chunk_end(struct apple_vxd_cmdbuf *cb, u32 *offset,
++			       u32 *bytes);
++int apple_vxd_cmdbuf_pair_chunk_end(struct apple_vxd_cmdbuf *cb, u32 *offset,
++				    u32 *bytes);
++u32 *apple_vxd_cmdbuf_add_packet(struct apple_vxd_cmdbuf *cb, u32 magic,
++				 u32 size);
++int apple_vxd_cmdbuf_validate(const struct apple_vxd_cmdbuf *cb);
++
++#endif /* __APPLE_VXD_CMD_H__ */
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-cmdbuf.c b/drivers/media/platform/apple/vxd/apple-vxd-cmdbuf.c
+index dbad72d10d843309e4ccf07ac8839fbff0b87deb..216fbe3bf74ce401b69d96759740c79cd3f763d2 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-cmdbuf.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-cmdbuf.c
+@@ -2,37 +2,10 @@
+ /*
+  * Apple VXD - command buffers (R3b)
+  *
+- * The H.264 command stream is an MSVDX register program
+- * (docs/periph/ds-vxd-cmdstream.md): per slice one chunk of command words
+- * in a GART-mapped buffer, padded to 64 bytes, plus one 0x78-byte packet
+- * describing that chunk.  This file provides the containers and the
+- * encodings; the H.264 values that go into them are R3c.
+- *
+- * What the kext does, byte for byte [E]:
+- *
+- *   CH264Decoder::HOST_H264DecodeFrame, per slice (0xfffffff0062967cc):
+- *     bytes = wptr - base - chunk_start            (payload +0x0c)
+- *     zero-fill 64 - (wptr & 63) bytes, advance by that & 0x7c
+- *     packet = addCommand(pktlist, 0x80000007, 0x78)   <- a second object
+- *     payload +0x10 = chunk_start + cmd->[0x18]
+- *   CmdBuf::addCommand (0xfffffff0062982f8): {magic, size, 0xabcdefab} at
+- *     the list's own offset, gate offset + size + 0xc < capacity
+- *   SubmitCommandBufferInternal (0xfffffff00628a8d4): walk the packet list
+- *     from its base, check both magics, one mailbox message per packet
+- *
+- * The packet list and the register program are therefore two buffers:
+- * the walker starts at the list's base and would reject the first command
+- * word (0x90000000) otherwise.  Only the register program is device
+- * memory.
+- *
+- * Register runs (0xfffffff00629b068) are written through a scoped writer
+- * that asserts exclusive use of the buffer: consecutive registers merge
+- * into one 0x1 header (count += 1) only inside one group, so groups are
+- * explicit here (apple_vxd_cmd_group_open/close) and no other command may
+- * be emitted while one is open.
+- *
+- * Every emitter is bounds-checked; a failure sets a sticky error that the
+- * caller checks once at the end of a chunk.
++ * The pool of eight 64 KiB GART-mapped command buffers with their
++ * host-only packet lists, the packet -> mailbox message arithmetic, the
++ * probe-time self-test and the debugfs view.  The encoders themselves are
++ * in apple-vxd-cmd.c (host-buildable, R3c).
+  */
+ #include <linux/bitfield.h>
+ #include <linux/debugfs.h>
+@@ -41,236 +14,6 @@
+ 
+ #include "apple-vxd.h"
+ 
+-static bool vxd_cmd_room(struct apple_vxd_cmdbuf *cb, size_t bytes)
+-{
+-	if (cb->error)
+-		return false;
+-	if (bytes > cb->size - cb->used) {
+-		cb->error = true;
+-		return false;
+-	}
+-	return true;
+-}
+-
+-static void vxd_cmd_put(struct apple_vxd_cmdbuf *cb, u32 word)
+-{
+-	cb->vaddr[cb->used / 4] = word;
+-	cb->used += 4;
+-}
+-
+-/* Every non-0x1 command: no open register group, room for @words. */
+-static bool vxd_cmd_begin(struct apple_vxd_cmdbuf *cb, size_t words)
+-{
+-	if (cb->group_open) {
+-		cb->error = true;
+-		return false;
+-	}
+-	return vxd_cmd_room(cb, words * 4);
+-}
+-
+-void apple_vxd_cmd_word(struct apple_vxd_cmdbuf *cb, u32 word)
+-{
+-	if (vxd_cmd_begin(cb, 1))
+-		vxd_cmd_put(cb, word);
+-}
+-
+-/* Open a 0x1 register group; @flags is OR-ed into every run header. */
+-void apple_vxd_cmd_group_open(struct apple_vxd_cmdbuf *cb, u32 flags)
+-{
+-	if (cb->group_open) {
+-		cb->error = true;
+-		return;
+-	}
+-	cb->group_open = true;
+-	cb->group_flags = flags;
+-	cb->run_hdr = SIZE_MAX;
+-}
+-
+-/*
+- * 0x1 form: 0x10010000 | flags | reg, value; a write to the register right
+- * after the previous one extends that run instead (0xfffffff00629b068).
+- */
+-void apple_vxd_cmd_reg(struct apple_vxd_cmdbuf *cb, u32 reg, u32 val)
+-{
+-	u32 *hdr;
+-
+-	if (!cb->group_open) {
+-		cb->error = true;
+-		return;
+-	}
+-
+-	hdr = cb->run_hdr != SIZE_MAX ? &cb->vaddr[cb->run_hdr / 4] : NULL;
+-	if (hdr && cb->run_next_reg == reg &&
+-	    FIELD_GET(VXD_CMD_REG_RUN_COUNT, *hdr) < FIELD_MAX(VXD_CMD_REG_RUN_COUNT)) {
+-		if (!vxd_cmd_room(cb, 4))
+-			return;
+-		*hdr += VXD_CMD_REG_RUN_ONE;
+-	} else {
+-		if (!vxd_cmd_room(cb, 8))
+-			return;
+-		cb->run_hdr = cb->used;
+-		vxd_cmd_put(cb, (reg & VXD_CMD_REG_ADDR) | cb->group_flags |
+-				VXD_CMD_REG_RUN | VXD_CMD_REG_RUN_ONE);
+-	}
+-	vxd_cmd_put(cb, val);
+-	cb->run_next_reg = reg + 4;
+-}
+-
+-void apple_vxd_cmd_group_close(struct apple_vxd_cmdbuf *cb)
+-{
+-	if (!cb->group_open)
+-		cb->error = true;
+-	cb->group_open = false;
+-	cb->run_hdr = SIZE_MAX;
+-}
+-
+-/* 0x000f0000 form: one register, (flags & 0xf0) << 16 (0xfffffff00629aa5c). */
+-void apple_vxd_cmd_reg1(struct apple_vxd_cmdbuf *cb, u32 reg, u32 val,
+-			u32 flags)
+-{
+-	if (!vxd_cmd_begin(cb, 2))
+-		return;
+-	vxd_cmd_put(cb, ((flags & VXD_CMD_REG1_FLAGS) << 16) |
+-			(reg & VXD_CMD_REG_ADDR) | VXD_CMD_REG1);
+-	vxd_cmd_put(cb, val);
+-}
+-
+-/* 0x9: the 0x28-byte per-slice block, emitted all zero by Apple. */
+-void apple_vxd_cmd_slice_block(struct apple_vxd_cmdbuf *cb)
+-{
+-	unsigned int i;
+-
+-	if (!vxd_cmd_begin(cb, VXD_CMD_SLICE_BLOCK_WORDS))
+-		return;
+-	vxd_cmd_put(cb, VXD_CMD_SLICE_BLOCK);
+-	for (i = 1; i < VXD_CMD_SLICE_BLOCK_WORDS; i++)
+-		vxd_cmd_put(cb, 0);
+-}
+-
+-/* 0xb: {0xb0000001, header bits consumed, slice bytes} (0x62b5b00). */
+-void apple_vxd_cmd_slice_desc(struct apple_vxd_cmdbuf *cb, u32 w1, u32 w2)
+-{
+-	if (!vxd_cmd_begin(cb, 3))
+-		return;
+-	vxd_cmd_put(cb, VXD_CMD_SLICE_DESC);
+-	vxd_cmd_put(cb, w1);
+-	vxd_cmd_put(cb, w2);
+-}
+-
+-/*
+- * 0xa: load @bytes from device address @va (0xfffffff00629a444, asserts
+- * bytes < 1 << 28).  This is how the slice bitstream reaches the core:
+- * @va is the GART VA of the OUTPUT buffer plus the slice offset.
+- */
+-void apple_vxd_cmd_load(struct apple_vxd_cmdbuf *cb, u32 va, u32 bytes)
+-{
+-	if (bytes & ~VXD_CMD_LOAD_MAX) {
+-		cb->error = true;
+-		return;
+-	}
+-	if (!vxd_cmd_begin(cb, 2))
+-		return;
+-	vxd_cmd_put(cb, VXD_CMD_LOAD | bytes);
+-	vxd_cmd_put(cb, va);
+-}
+-
+-/* 0xf: install @bytes at @va into destination @dst (0x62b5fcc). */
+-void apple_vxd_cmd_table_xfer(struct apple_vxd_cmdbuf *cb, u32 bytes,
+-			      u32 va, u32 dst)
+-{
+-	if (bytes & ~VXD_CMD_LOAD_MAX) {
+-		cb->error = true;
+-		return;
+-	}
+-	if (!vxd_cmd_begin(cb, 3))
+-		return;
+-	vxd_cmd_put(cb, VXD_CMD_TABLE_XFER | bytes);
+-	vxd_cmd_put(cb, va);
+-	vxd_cmd_put(cb, dst);
+-}
+-
+-void apple_vxd_cmd_end_slice(struct apple_vxd_cmdbuf *cb)
+-{
+-	apple_vxd_cmd_word(cb, VXD_CMD_END_SLICE);
+-}
+-
+-/*
+- * Close the current slice chunk: report its offset and its byte count
+- * (payload +0x0c, before padding), then zero-fill 64 - (used & 63) bytes
+- * as Apple does (a full 64 when already aligned).  The next chunk starts
+- * 64-byte aligned.  Returns -ENOSPC/-EINVAL on a sticky error.
+- */
+-int apple_vxd_cmdbuf_chunk_end(struct apple_vxd_cmdbuf *cb, u32 *offset,
+-			       u32 *bytes)
+-{
+-	size_t pad;
+-
+-	if (cb->group_open)
+-		cb->error = true;
+-	if (cb->error)
+-		return -ENOSPC;
+-
+-	*offset = cb->chunk_start;
+-	*bytes = cb->used - cb->chunk_start;
+-
+-	pad = VXD_CMD_CHUNK_ALIGN - (cb->used & (VXD_CMD_CHUNK_ALIGN - 1));
+-	if (!vxd_cmd_room(cb, pad))
+-		return -ENOSPC;
+-	memset((u8 *)cb->vaddr + cb->used, 0, pad);
+-	cb->used += pad;
+-	cb->chunk_start = cb->used;
+-	return 0;
+-}
+-
+-/*
+- * CmdBuf::addCommand: append {magic, size, 0xabcdefab} and a zeroed
+- * payload of @size bytes to the host packet list.  Same gate as the kext
+- * (offset + size + 0xc < capacity).  Returns the payload or NULL.
+- */
+-u32 *apple_vxd_cmdbuf_add_packet(struct apple_vxd_cmdbuf *cb, u32 magic,
+-				 u32 size)
+-{
+-	u32 *hdr;
+-
+-	if (!IS_ALIGNED(size, 4) ||
+-	    (u64)cb->pkt_used + size + VXD_PKT_HDR_BYTES >= cb->pkt_size) {
+-		cb->error = true;
+-		return NULL;
+-	}
+-
+-	hdr = (u32 *)(cb->pkt + cb->pkt_used);
+-	hdr[0] = magic;
+-	hdr[1] = size;
+-	hdr[2] = VXD_PKT_MAGIC1;
+-	memset(&hdr[3], 0, size);
+-	cb->pkt_used += VXD_PKT_HDR_BYTES + size;
+-	cb->npackets++;
+-	return &hdr[3];
+-}
+-
+-/*
+- * The submit path's container check (0xfffffff00628ac78): from the list
+- * base, both magics on every packet, size + 0xc steps, landing exactly on
+- * the end.  Returns the packet count or -EINVAL.
+- */
+-int apple_vxd_cmdbuf_validate(const struct apple_vxd_cmdbuf *cb)
+-{
+-	size_t off = 0;
+-	int n = 0;
+-
+-	while (off < cb->pkt_used) {
+-		const u32 *hdr = (const u32 *)(cb->pkt + off);
+-
+-		if (cb->pkt_used - off < VXD_PKT_HDR_BYTES ||
+-		    hdr[0] != VXD_PKT_MAGIC0 || hdr[2] != VXD_PKT_MAGIC1 ||
+-		    hdr[1] > cb->pkt_used - off - VXD_PKT_HDR_BYTES)
+-			return -EINVAL;
+-		off += VXD_PKT_HDR_BYTES + hdr[1];
+-		n++;
+-	}
+-	return n == cb->npackets ? n : -EINVAL;
+-}
+-
+ /*
+  * Decode message word 3.  The kext builds it from the GART directory
+  * descriptor (+0x27a8, the object it also programs into MTX_MMU_DIR_ADR
+@@ -347,19 +90,6 @@ int apple_vxd_packet_msg(struct apple_vxd_dev *vxd, u32 *pkt, u16 fence,
+ 
+ /* --- pool ---------------------------------------------------------------- */
+ 
+-static void vxd_cmdbuf_reset(struct apple_vxd_cmdbuf *cb)
+-{
+-	cb->used = 0;
+-	cb->chunk_start = 0;
+-	cb->group_open = false;
+-	cb->group_flags = 0;
+-	cb->run_hdr = SIZE_MAX;
+-	cb->run_next_reg = 0;
+-	cb->error = false;
+-	cb->pkt_used = 0;
+-	cb->npackets = 0;
+-}
+-
+ struct apple_vxd_cmdbuf *apple_vxd_cmdbuf_get(struct apple_vxd_dev *vxd)
+ {
+ 	struct apple_vxd_cmdbuf_pool *pool = &vxd->cmdbufs;
+@@ -378,7 +108,7 @@ struct apple_vxd_cmdbuf *apple_vxd_cmdbuf_get(struct apple_vxd_dev *vxd)
+ 	spin_unlock_irqrestore(&vxd->mbox_lock, flags);
+ 
+ 	if (cb)
+-		vxd_cmdbuf_reset(cb);
++		apple_vxd_cmdbuf_reset(cb);
+ 	return cb;
+ }
+ 
+@@ -522,7 +252,7 @@ int apple_vxd_cmdbufs_init(struct apple_vxd_dev *vxd)
+ 		cb->size = APPLE_VXD_CMDBUF_SIZE;
+ 		cb->pkt = pool->pkt_mem + (size_t)i * APPLE_VXD_PKTLIST_SIZE;
+ 		cb->pkt_size = APPLE_VXD_PKTLIST_SIZE;
+-		vxd_cmdbuf_reset(cb);
++		apple_vxd_cmdbuf_reset(cb);
+ 	}
+ 	pool->ready = true;
+ 
+@@ -605,7 +335,7 @@ int apple_vxd_cmdbuf_selftest(struct apple_vxd_dev *vxd)
+ 	}
+ 	cb.size = 1024;
+ 	cb.pkt_size = 512;
+-	vxd_cmdbuf_reset(&cb);
++	apple_vxd_cmdbuf_reset(&cb);
+ 
+ 	what = "command encodings";
+ 	apple_vxd_cmd_group_open(&cb, 0);
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd.h b/drivers/media/platform/apple/vxd/apple-vxd.h
+index b42eba1805f00f329ad8b9d3d555ac986f17bf0f..4fc8b14193274c082b3fa5ccb9735efd3879c7f3 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd.h
++++ b/drivers/media/platform/apple/vxd/apple-vxd.h
+@@ -38,6 +38,7 @@
+ #include <media/videobuf2-core.h>
+ #include <media/videobuf2-v4l2.h>
+ 
++#include "apple-vxd-cmd.h"
+ #include "apple-vxd-regs.h"
+ 
+ struct dentry;
+@@ -206,39 +207,6 @@ struct apple_vxd_fence {
+ #define APPLE_VXD_CMDBUF_ALIGN		SZ_64K
+ #define APPLE_VXD_PKTLIST_SIZE		SZ_4K
+ 
+-enum apple_vxd_cmdbuf_state {
+-	APPLE_VXD_CMDBUF_FREE = 0,
+-	APPLE_VXD_CMDBUF_HOST,
+-	APPLE_VXD_CMDBUF_DEVICE,
+-};
+-
+-struct apple_vxd_fence;
+-
+-struct apple_vxd_cmdbuf {
+-	unsigned int index;
+-	enum apple_vxd_cmdbuf_state state;	/* under mbox_lock */
+-	struct apple_vxd_fence *fence;		/* releases it, while DEVICE */
+-
+-	/* Register program (device-visible). */
+-	u32 *vaddr;			/* 64 KiB aligned */
+-	dma_addr_t dma;
+-	u32 va;				/* GART device VA */
+-	size_t size;
+-	size_t used;			/* byte cursor, 4-byte granular */
+-	size_t chunk_start;		/* current slice chunk, 64 B aligned */
+-	bool group_open;		/* inside a 0x1 register group */
+-	u32 group_flags;		/* OR-ed into every run header */
+-	size_t run_hdr;			/* open run header, or SIZE_MAX */
+-	u32 run_next_reg;		/* register that extends the run */
+-	bool error;			/* sticky: overflow or misuse */
+-
+-	/* Packet list (host-only). */
+-	u8 *pkt;
+-	size_t pkt_size;
+-	size_t pkt_used;
+-	unsigned int npackets;
+-};
+-
+ struct apple_vxd_cmdbuf_pool {
+ 	struct apple_vxd_dma_buf mem;		/* NUM x SIZE, 64 KiB aligned */
+ 	struct apple_vxd_mapping map;
+@@ -493,23 +461,6 @@ int apple_vxd_cmdbuf_bind(struct apple_vxd_dev *vxd,
+ 			  struct apple_vxd_cmdbuf *cb,
+ 			  struct apple_vxd_fence *fence);
+ void apple_vxd_cmdbuf_retire_locked(struct apple_vxd_cmdbuf *cb);
+-void apple_vxd_cmd_word(struct apple_vxd_cmdbuf *cb, u32 word);
+-void apple_vxd_cmd_group_open(struct apple_vxd_cmdbuf *cb, u32 flags);
+-void apple_vxd_cmd_reg(struct apple_vxd_cmdbuf *cb, u32 reg, u32 val);
+-void apple_vxd_cmd_group_close(struct apple_vxd_cmdbuf *cb);
+-void apple_vxd_cmd_reg1(struct apple_vxd_cmdbuf *cb, u32 reg, u32 val,
+-			u32 flags);
+-void apple_vxd_cmd_slice_block(struct apple_vxd_cmdbuf *cb);
+-void apple_vxd_cmd_slice_desc(struct apple_vxd_cmdbuf *cb, u32 w1, u32 w2);
+-void apple_vxd_cmd_load(struct apple_vxd_cmdbuf *cb, u32 va, u32 bytes);
+-void apple_vxd_cmd_table_xfer(struct apple_vxd_cmdbuf *cb, u32 bytes,
+-			      u32 va, u32 dst);
+-void apple_vxd_cmd_end_slice(struct apple_vxd_cmdbuf *cb);
+-int apple_vxd_cmdbuf_chunk_end(struct apple_vxd_cmdbuf *cb, u32 *offset,
+-			       u32 *bytes);
+-u32 *apple_vxd_cmdbuf_add_packet(struct apple_vxd_cmdbuf *cb, u32 magic,
+-				 u32 size);
+-int apple_vxd_cmdbuf_validate(const struct apple_vxd_cmdbuf *cb);
+ u32 apple_vxd_mmu_ctx_word(struct apple_vxd_dev *vxd, u8 hw_ctx);
+ int apple_vxd_packet_msg(struct apple_vxd_dev *vxd, u32 *pkt, u16 fence,
+ 			 u8 hw_ctx, bool last, u32 msg[VXD_DECODE_MSG_WORDS]);

@@ -1,0 +1,35 @@
+From 711cec52a92ede4bf745dc7d0abf356495fa4e60 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 15:35:15 +0000
+Subject: [PATCH 39/43] pinctrl: apple: gpio: Skip set_wake
+
+The bank interrupts are chained to the AIC, which keeps running in
+suspend-to-idle, so there is nothing to arm. Without
+IRQCHIP_SKIP_SET_WAKE, enable_irq_wake() fails with -ENXIO, and
+gpio-keys (home and power are wakeup-source on the iPad 5) then fails
+its suspend, which aborts every system sleep.
+---
+ drivers/pinctrl/pinctrl-apple-gpio.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/pinctrl/pinctrl-apple-gpio.c b/drivers/pinctrl/pinctrl-apple-gpio.c
+index 6305b96aaa..6de1ec1659 100644
+--- a/drivers/pinctrl/pinctrl-apple-gpio.c
++++ b/drivers/pinctrl/pinctrl-apple-gpio.c
+@@ -367,7 +367,12 @@ static const struct irq_chip apple_gpio_irqchip = {
+ 	.irq_mask		= apple_gpio_irq_mask,
+ 	.irq_unmask		= apple_gpio_irq_unmask,
+ 	.irq_set_type		= apple_gpio_irq_set_type,
+-	.flags			= IRQCHIP_IMMUTABLE,
++	/*
++	 * Nothing to arm: the bank interrupts are chained to the AIC, which
++	 * stays up in suspend-to-idle, and any of them wakes the CPU. Without
++	 * this, enable_irq_wake() fails and so does gpio-keys' suspend.
++	 */
++	.flags			= IRQCHIP_IMMUTABLE | IRQCHIP_SKIP_SET_WAKE,
+ 	GPIOCHIP_IRQ_RESOURCE_HELPERS,
+ };
+ 
+-- 
+2.56.0
+

@@ -1,0 +1,31 @@
+#!/bin/sh
+# Initramfs: copy before systemd-pstore can consume records; print paths only.
+# Normal root: archive that copy to files, without unlinking pstore records.
+set -eu
+saved=/run/linux-a9/pstore
+case "${1:-}" in
+--archive)
+    [ -d "$saved" ] || exit 0
+    boot_id=$(cat /proc/sys/kernel/random/boot_id)
+    dest=/var/lib/linux-a9/pstore/$boot_id
+    mkdir -p "$dest"
+    cp -a "$saved/." "$dest/"
+    echo "linux-a9: previous boot records archived in $dest"
+    ;;
+--read)
+    mkdir -p /sys/fs/pstore "$saved"
+    mount -t pstore pstore /sys/fs/pstore 2>/dev/null || :
+    for file in /sys/fs/pstore/dmesg-ramoops-* /sys/fs/pstore/console-ramoops-*; do
+        [ -f "$file" ] || continue
+        name=${file##*/}
+        # A rescue retry must not replace the original previous-boot copy.
+        [ ! -f "$saved/$name" ] || continue
+        cp "$file" "$saved/$name"
+        # Replaying console-ramoops into printk copies it into this boot's
+        # persistent console, nesting the entire history on every kexec.
+        # Keep both records intact for the host collector or an explicit cat.
+        echo "linux-a9: previous boot $name saved in $saved (not replayed)"
+    done
+    ;;
+*) echo 'usage: linux-a9-pstore --read|--archive' >&2; exit 2 ;;
+esac

@@ -1,0 +1,25 @@
+From 09e836312a47685cc4284e1488342a66fa4bac13 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Mon, 26 Oct 2026 17:08:21 +0000
+Subject: [PATCH] usb: config: disable legacy FunctionFS gadget
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ arch/arm64/configs/apple_a9_usb_host.config | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/arch/arm64/configs/apple_a9_usb_host.config b/arch/arm64/configs/apple_a9_usb_host.config
+index b7611d4d73..6a8ae203f4 100644
+--- a/arch/arm64/configs/apple_a9_usb_host.config
++++ b/arch/arm64/configs/apple_a9_usb_host.config
+@@ -1,6 +1,10 @@
+ # All built in: the test entry does not need a matching /lib/modules tree.
+ CONFIG_USB=y
+ CONFIG_USB_ROLE_SWITCH=y
++# Keep FunctionFS available only through configfs.  The legacy g_ffs gadget
++# otherwise consumes f_fs's single device slot before functions/ffs.iap exists.
++CONFIG_USB_CONFIGFS_F_FS=y
++# CONFIG_USB_FUNCTIONFS is not set
+ CONFIG_USB_ROLES_APPLE_S8000=y
+ CONFIG_PHY_APPLE_AUSB=y
+ CONFIG_USB_EHCI_HCD=y

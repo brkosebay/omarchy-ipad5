@@ -1,0 +1,179 @@
+From 4f70c40735300a516236d4b23406201b714e5623 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 11:16:15 +0000
+Subject: [PATCH 16/43] arm64: dts: apple: s8003: Tunables, NVMMU FIFO mode, no
+ ASPM
+
+- Add the PCIe tunables iBoot puts in the live ADT, copied from j71t
+  (iOS 16.7.10): 4 PHY, 34 common, and per port 6 config and 2 root
+  port records (both bridges carry the same values).
+- Set apple,nvmmu-invalidate-fifo = <1> on j71t/j72t (live ADT
+  nvme-mmu0 invalidate-fifo-workaround).
+- aspm-no-l0s/aspm-no-l1 on both ports: on DT platforms Linux enables
+  L1 by default, and iOS pairs L1 with L1SS/LTR/CLKREQ# programming the
+  driver doesn't do. Keep the link in L0 during bring-up.
+- Disable port 1 on j71t/j72t: the BCM4355 needs a power sequence
+  (PMU-controlled supply, wlan-uart provider) before it can train, and
+  its DART stays off with it.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ arch/arm64/boot/dts/apple/s8003-j71t.dts | 15 +++--
+ arch/arm64/boot/dts/apple/s8003-j72t.dts | 15 +++--
+ arch/arm64/boot/dts/apple/s8003.dtsi     | 70 ++++++++++++++++++++++++
+ 3 files changed, 92 insertions(+), 8 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/apple/s8003-j71t.dts b/arch/arm64/boot/dts/apple/s8003-j71t.dts
+index ee97133d5b..5a29cd51c8 100644
+--- a/arch/arm64/boot/dts/apple/s8003-j71t.dts
++++ b/arch/arm64/boot/dts/apple/s8003-j71t.dts
+@@ -29,12 +29,19 @@ &pcie0_dart0 {
+ 	status = "okay";
+ };
+ 
+-&pcie0_dart1 {
+-	status = "okay";
+-};
+-
+ &pcie0 {
+ 	apple,lane-cfg = <1>;
+ 	apple,nvme-hmb = <&nvme_hmb>;
++	/* live ADT nvme-mmu0 invalidate-fifo-workaround (added by iBoot) */
++	apple,nvmmu-invalidate-fifo = <1>;
+ 	status = "okay";
+ };
++
++/*
++ * The BCM4355 needs a power sequence (PMU-controlled VDD, wlan-uart
++ * provider) before its link can train; until that exists, leave port 1
++ * and its DART off.
++ */
++&pcie0_port1 {
++	status = "disabled";
++};
+diff --git a/arch/arm64/boot/dts/apple/s8003-j72t.dts b/arch/arm64/boot/dts/apple/s8003-j72t.dts
+index ac292cb309..957091e590 100644
+--- a/arch/arm64/boot/dts/apple/s8003-j72t.dts
++++ b/arch/arm64/boot/dts/apple/s8003-j72t.dts
+@@ -29,12 +29,19 @@ &pcie0_dart0 {
+ 	status = "okay";
+ };
+ 
+-&pcie0_dart1 {
+-	status = "okay";
+-};
+-
+ &pcie0 {
+ 	apple,lane-cfg = <1>;
+ 	apple,nvme-hmb = <&nvme_hmb>;
++	/* live ADT nvme-mmu0 invalidate-fifo-workaround (added by iBoot) */
++	apple,nvmmu-invalidate-fifo = <1>;
+ 	status = "okay";
+ };
++
++/*
++ * The BCM4355 needs a power sequence (PMU-controlled VDD, wlan-uart
++ * provider) before its link can train; until that exists, leave port 1
++ * and its DART off.
++ */
++&pcie0_port1 {
++	status = "disabled";
++};
+diff --git a/arch/arm64/boot/dts/apple/s8003.dtsi b/arch/arm64/boot/dts/apple/s8003.dtsi
+index 9b4ecdfed1..3bcc2db87e 100644
+--- a/arch/arm64/boot/dts/apple/s8003.dtsi
++++ b/arch/arm64/boot/dts/apple/s8003.dtsi
+@@ -124,6 +124,52 @@ pcie0: pcie@610000000 {
+ 				<&ps_pcie_link2>, <&ps_pcie_link3>;
+ 		power-domain-names = "core", "aux", "ref", "link0", "link1",
+ 				     "link2", "link3";
++
++		/*
++		 * Tunables iBoot puts in the live ADT (apcie-phy-tunables,
++		 * apcie-common-tunables; per bridge apcie-config-tunables and
++		 * pcie-rc-tunables), as <offset mask value>. Copied from the
++		 * j71t live ADT (iOS 16.7.10 iBoot); both bridges carry the same
++		 * values there.
++		 */
++		apple,tunable-phy = <0x098 0x0000000f 0x00000000>,
++		                    <0x154 0x00f8ff00 0x00000000>,
++		                    <0x000 0x0000318c 0x00002108>,
++		                    <0x004 0x0000318c 0x00002108>;
++		apple,tunable-common = <0x008 0x7f7f7f7f 0x00000000>,
++		                       <0x00c 0x00073f3f 0x00043f00>,
++		                       <0x010 0x00000700 0x00000000>,
++		                       <0x018 0x00ffffff 0x000c0960>,
++		                       <0x01c 0x00001fff 0x0000092c>,
++		                       <0x028 0xffffffff 0x02001000>,
++		                       <0x030 0x000000ff 0x00000009>,
++		                       <0x100 0x31100010 0x01000010>,
++		                       <0x104 0x00000011 0x00000001>,
++		                       <0x108 0x00000007 0x00000000>,
++		                       <0x10c 0x00073f3f 0x00043f00>,
++		                       <0x110 0x0333003f 0x0111000f>,
++		                       <0x120 0x000000ff 0x00000040>,
++		                       <0x128 0x0000007f 0x0000003e>,
++		                       <0x130 0x00000707 0x00000000>,
++		                       <0x134 0x00073f3f 0x00043f00>,
++		                       <0x180 0x31100010 0x01000000>,
++		                       <0x190 0x0333003f 0x0111000f>,
++		                       <0x1a0 0x000000ff 0x00000040>,
++		                       <0x1a8 0x0000007f 0x0000003e>,
++		                       <0x1b0 0x00000707 0x00000000>,
++		                       <0x1b4 0x00073f3f 0x00043f00>,
++		                       <0x200 0x31100010 0x01000000>,
++		                       <0x210 0x0333003f 0x0111000f>,
++		                       <0x220 0x000000ff 0x00000040>,
++		                       <0x228 0x0000007f 0x0000003e>,
++		                       <0x230 0x00000707 0x00000000>,
++		                       <0x234 0x00073f3f 0x00043f00>,
++		                       <0x280 0x31100010 0x01000000>,
++		                       <0x290 0x0333003f 0x0111000f>,
++		                       <0x2a0 0x000000ff 0x00000040>,
++		                       <0x2a8 0x0000007f 0x0000003e>,
++		                       <0x2b0 0x00000707 0x00000000>,
++		                       <0x2b4 0x00073f3f 0x00043f00>;
+ 		status = "disabled";
+ 
+ 		/*
+@@ -137,6 +183,20 @@ pcie0_port0: pci@0,0 {
+ 			reset-gpios = <&pinctrl_ap 160 GPIO_ACTIVE_LOW>;
+ 			max-link-speed = <2>;
+ 			apple,nvme-mode;
++			/*
++			 * Linux would enable ASPM L1 on its own on DT platforms;
++			 * iOS pairs L1 with L1SS/LTR/CLKREQ# setup we don't do.
++			 */
++			aspm-no-l0s;
++			aspm-no-l1;
++			apple,tunable-config = <0x090 0x000000ff 0x00000028>,
++			                       <0x130 0x00000005 0x00000005>,
++			                       <0x134 0x00000001 0x00000001>,
++			                       <0x138 0x00007f7f 0x00000000>,
++			                       <0x13c 0x00000003 0x00000002>,
++			                       <0x140 0x0073ffff 0x00704c4b>;
++			apple,tunable-rc = <0x098 0x0000000f 0x00000000>,
++			                   <0x154 0x00f8ff00 0x00000000>;
+ 
+ 			#address-cells = <3>;
+ 			#size-cells = <2>;
+@@ -148,6 +208,16 @@ pcie0_port1: pci@1,0 {
+ 			reg = <0x800 0x0 0x0 0x0 0x0>;
+ 			reset-gpios = <&pinctrl_ap 161 GPIO_ACTIVE_LOW>;
+ 			max-link-speed = <1>;
++			aspm-no-l0s;
++			aspm-no-l1;
++			apple,tunable-config = <0x090 0x000000ff 0x00000028>,
++			                       <0x130 0x00000005 0x00000005>,
++			                       <0x134 0x00000001 0x00000001>,
++			                       <0x138 0x00007f7f 0x00000000>,
++			                       <0x13c 0x00000003 0x00000002>,
++			                       <0x140 0x0073ffff 0x00704c4b>;
++			apple,tunable-rc = <0x098 0x0000000f 0x00000000>,
++			                   <0x154 0x00f8ff00 0x00000000>;
+ 
+ 			#address-cells = <3>;
+ 			#size-cells = <2>;
+-- 
+2.56.0
+

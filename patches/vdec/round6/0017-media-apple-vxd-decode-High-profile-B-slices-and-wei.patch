@@ -1,0 +1,827 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 12:40:10 +0000
+Subject: [PATCH 17/20] media: apple: vxd: decode High profile, B slices and weighted
+ prediction
+
+The rest of DecodeExecuteH264VLD's register program (0x62c66b0 in the
+dump; field layouts as psb_video's MSVDX headers):
+
+- Scaling lists: the 0xe000 block is Inter Y and Intra Y 8x8, then the
+  4x4 lists 0, 3, 4, 1, 5, 2 (L39756-39766).  AppleD5500's
+  scaling_list() parser (0xfffffff00629c918) stores list[zigzag[j]] and
+  its default tables (0xfffffff005596170) are raster tables equal to
+  Table 7-3/7-4, so the core takes raster order: V4L2's
+  SCALING_MATRIX control goes in as is.  Flat 16 without a matrix, and
+  flat 8x8 lists without the 8x8 transform (0x62be538 L33469).  PPS0
+  already carried transform_8x8_mode_flag.
+- B slices: BE_FOC0/1 then TOP/BOT_FOC per hardware DPB slot (17-bit,
+  sign in bit 16; zero for unused slots, as psb), and one block from
+  BE_COL_PIC0: the co-located picture (RefPicList1[0]) flags with its
+  bottom-field bit chosen by POC distance, its stored-MB buffer,
+  BE_LIST0_INVERSE (first position of each slot in L0) and the L1
+  bytes (L39776-39887).  The reference surfaces now include L1's.
+  device_run() builds both lists with the v4l2-h264 helper plus the
+  slice's modifications and refuses a picture whose co-located
+  picture has no CAPTURE buffer.
+- Weighted prediction: H264_WEIGHTED_FACTORS/OFFSET A (and B for B
+  slices), 32 + 32 words, for explicit and implicit modes
+  (L40086-40134); implicit bi-prediction leaves the kext's tables
+  unrefreshed (zero), the core takes those weights from the POCs.  The
+  denominators (0x7024) are the slice's for explicit tables and 5/5
+  otherwise (0x62be348), and the slice header word carries
+  weighted_pred | weighted_bipred_idc << 1 (L40260).
+- P slices keep the parsed num_ref_idx_l1_active_minus1 (the PPS
+  default) in SLICE1, as 0x62c5fb8 does; only I slices zero it.
+
+What stays refused: interlace (field pictures, MBAFF), 4:2:2/4:4:4,
+more than 8 bits, lossless transform bypass, FMO/ASO, SP/SI slices, and
+scaling matrices signalled without the control.  The host harness
+(scripts/vdec/host-cmdstream.sh in the workspace) matches the extended
+reference generator word for word on 76 pictures, including 720p and
+1080p; the hardware has not decoded any of the new syntax yet.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ .../media/platform/apple/vxd/apple-vxd-h264-cmd.c  | 369 ++++++++++++++++-----
+ .../media/platform/apple/vxd/apple-vxd-h264-cmd.h  |   8 +
+ drivers/media/platform/apple/vxd/apple-vxd-h264.c  | 133 +++++---
+ 3 files changed, 393 insertions(+), 117 deletions(-)
+
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-h264-cmd.c b/drivers/media/platform/apple/vxd/apple-vxd-h264-cmd.c
+index bb093715a0628a92b87e3abac80a9fed436da4cb..fe66019a14f45dc34a71832db8b290f8e4a82447 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-h264-cmd.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-h264-cmd.c
+@@ -17,21 +17,26 @@
+  *                            the core stripping emulation prevention
+  *   REGVALPAIR               entropy front end: control, SPS0, PPS0, PIC0,
+  *                            SLICE0, SLICE1, first MB
+- *   RENDEC_BLOCK x n         entropy back end, flat scaling lists, L0,
+- *                            reference and output surfaces, picture
+- *                            geometry, intra buffer, cache policy, stride
++ *   RENDEC_BLOCK x n         entropy back end, scaling lists, B-slice POCs
++ *                            and co-located picture, reference lists,
++ *                            reference surfaces, prediction weights,
++ *                            picture geometry, intra buffer, cache policy,
++ *                            stride
+  *   CMD_COMPLETION           0x60000000
+  *
+  * The chunks follow each other with no pad; there is no per-picture
+  * (kind-4) chunk in the AVC path.  Apple's register numbers map onto the
+  * public MSVDX layout as 0x6000 + off = VEC + off and 0x7000 + off =
+- * CMDS + off (FE_SPS0 0x200, BE_SPS0 0x2d8, BE_BASE_ADDR_CUR_PIC 0x2ec,
+- * BE_REF0 0x2f0, VLC_TABLE_ADDR0 0xec, ENTDEC_FE/BE_CONTROL 0xc/0x10).
++ * CMDS + off (FE_SPS0 0x200, BE_FOC0 0x250, BE_SPS0 0x2d8,
++ * BE_BASE_ADDR_CUR_PIC 0x2ec, BE_REF0 0x2f0, BE_COL_PIC0 0x2f4,
++ * BE_LIST0 0x33c, H264_WEIGHTED_FACTORS_A 0x200, VLC_TABLE_ADDR0 0xec,
++ * ENTDEC_FE/BE_CONTROL 0xc/0x10).
+  *
+  * Supported here, by apple_vxd_h264_validate() and the slice checks:
+- * progressive frames, 8-bit 4:2:0, I and P slices, CAVLC (CABAC follows
+- * the same recipe but is unvalidated), no weighted prediction, no 8x8
+- * transform, no scaling matrices, no FMO/ASO, no second deblock pass.
++ * progressive frames, 8-bit 4:2:0, I, P and B slices, CAVLC and CABAC,
++ * 8x8 transform and scaling matrices (High profile), explicit and implicit
++ * weighted prediction.  Not supported: interlace (field pictures, MBAFF),
++ * FMO/ASO, SP/SI slices, the second deblock pass, alternate output.
+  */
+ #include <linux/bitfield.h>
+ #include <linux/errno.h>
+@@ -47,25 +52,34 @@
+ #define VXD_H264_VLC_ADDR_HI		0x61c0	/* + 2, the 4:2:2 tables */
+ #define VXD_H264_FE_SPS0		0x6200	/* SPS0 PPS0 PIC0 SLICE0 SLICE1 */
+ #define VXD_H264_FE_SLICE2		0x6218
++#define VXD_H264_BE_FOC0		0x6250	/* current, then per DPB slot */
+ #define VXD_H264_BE_SPS0		0x62d8	/* ... SLICE1, CUR_PIC, REF0 */
++#define VXD_H264_BE_COL_PIC0		0x62f4	/* COL_PIC, LIST0_INVERSE, LIST1 */
+ #define VXD_H264_BE_L0			0x633c
+ #define VXD_H264_SCALING		0xe000
+ /* Render commands (Apple 0x7000 bank = MSVDX CMDS). */
+ #define VXD_H264_CMDS_SIZE		0x7000	/* display, coded, mode, Y, UV */
+ #define VXD_H264_CMDS_INTRA		0x7018
+ #define VXD_H264_CMDS_CACHE		0x701c
+-#define VXD_H264_CMDS_WEIGHTS		0x7024
++#define VXD_H264_CMDS_WEIGHT_DENOM	0x7024
+ #define VXD_H264_CMDS_STRIDE		0x7040
+ #define VXD_H264_CMDS_REFS		0x7100	/* Y, UV per DPB slot */
+ #define VXD_H264_CMDS_CHROMA		0x71b4
++#define VXD_H264_CMDS_WEIGHTS(list)	(0x7200 + 0x100 * (list))
+ 
+ /* Apple's forced profile 3 translates to 0x11 on both ends (0x62c6564). */
+ #define VXD_H264_ENTDEC_CONTROL		0x11
+ #define VXD_H264_CACHE_POLICY		0x013c000c	/* 0x62c4788 */
+-#define VXD_H264_WEIGHTS_UNWEIGHTED	0x55		/* 5 / 5 */
++#define VXD_H264_WEIGHTS_DEFAULT	0x55		/* 5 / 5 */
+ #define VXD_H264_SCALING_WORDS		56		/* 2 x 8x8 + 6 x 4x4 */
+-#define VXD_H264_SCALING_FLAT		0x10101010
++#define VXD_H264_SCALING_FLAT		0x10
+ #define VXD_H264_FIELD_FRAME		2		/* progressive */
++#define VXD_H264_WEIGHT_WORDS		64		/* 32 factors, 32 offsets */
++
++/* Slice codes of the core: I 0, P 1, B 2 (0xfffffff007a6e7b4). */
++#define VXD_H264_CODE_I			0
++#define VXD_H264_CODE_P			1
++#define VXD_H264_CODE_B			2
+ 
+ /* The 26 constant VLC table registers (0xfffffff005597148 [E]). */
+ static const u32 vxd_h264_vlc_addr[] = {
+@@ -80,14 +94,25 @@ static const u32 vxd_h264_vlc_addr_hi[] = {
+ 	0x0010920e, 0x0010d216, 0x0010f21c,
+ };
+ 
+-/* AVC slice type -> the core's code: I 0, P 1, B 2 (0xfffffff007a6e7b4). */
++/*
++ * The scaling-list block (0x62c66b0 L39756-39766 of the dump): Inter Y and
++ * Intra Y 8x8, then the 4x4 lists in this order of the H.264 list index
++ * (Intra Y, Inter Y, Inter Cb, Intra Cb, Inter Cr, Intra Cr), each in
++ * raster order: AppleD5500's scaling_list() parser (0xfffffff00629c918)
++ * stores list[zigzag[i]], and its defaults (0xfffffff005596170) are raster
++ * tables, which is also V4L2's order.
++ */
++static const u8 vxd_h264_scaling_4x4_order[6] = { 0, 3, 4, 1, 5, 2 };
++
+ static int vxd_h264_slice_code(u8 slice_type)
+ {
+ 	switch (slice_type) {
+ 	case V4L2_H264_SLICE_TYPE_I:
+-		return 0;
++		return VXD_H264_CODE_I;
+ 	case V4L2_H264_SLICE_TYPE_P:
+-		return 1;
++		return VXD_H264_CODE_P;
++	case V4L2_H264_SLICE_TYPE_B:
++		return VXD_H264_CODE_B;
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -100,8 +125,35 @@ u32 apple_vxd_h264_colocated_size(unsigned int width_mbs,
+ 	return (width_mbs * height_mbs * 0x80 + 0x41ff) & ~0xfffU;
+ }
+ 
++static bool vxd_h264_has_scaling(const struct v4l2_ctrl_h264_pps *pps)
++{
++	return pps->flags & V4L2_H264_PPS_FLAG_SCALING_MATRIX_PRESENT;
++}
++
++/* A scaling factor is 1..255: a zero list means the control was never set. */
++static bool vxd_h264_scaling_set(const struct v4l2_ctrl_h264_pps *pps,
++				 const struct v4l2_ctrl_h264_scaling_matrix *m)
++{
++	unsigned int i, j;
++
++	if (!m)
++		return false;
++	for (i = 0; i < 6; i++)
++		for (j = 0; j < 16; j++)
++			if (!m->scaling_list_4x4[i][j])
++				return false;
++	if (!(pps->flags & V4L2_H264_PPS_FLAG_TRANSFORM_8X8_MODE))
++		return true;
++	for (i = 0; i < 2; i++)
++		for (j = 0; j < 64; j++)
++			if (!m->scaling_list_8x8[i][j])
++				return false;
++	return true;
++}
++
+ int apple_vxd_h264_validate(const struct v4l2_ctrl_h264_sps *sps,
+ 			    const struct v4l2_ctrl_h264_pps *pps,
++			    const struct v4l2_ctrl_h264_scaling_matrix *scaling,
+ 			    const char **why)
+ {
+ 	if (!(sps->flags & V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY))
+@@ -112,15 +164,14 @@ int apple_vxd_h264_validate(const struct v4l2_ctrl_h264_sps *sps,
+ 		*why = "chroma format other than 4:2:0";
+ 	else if (sps->bit_depth_luma_minus8 || sps->bit_depth_chroma_minus8)
+ 		*why = "bit depth above 8";
++	else if (sps->flags & V4L2_H264_SPS_FLAG_QPPRIME_Y_ZERO_TRANSFORM_BYPASS)
++		*why = "lossless transform bypass";
+ 	else if (pps->num_slice_groups_minus1)
+ 		*why = "slice groups (FMO)";
+-	else if (pps->flags & V4L2_H264_PPS_FLAG_SCALING_MATRIX_PRESENT)
+-		*why = "scaling matrices";
+-	else if (pps->flags & V4L2_H264_PPS_FLAG_TRANSFORM_8X8_MODE)
+-		*why = "8x8 transform (High profile)";
+-	else if ((pps->flags & V4L2_H264_PPS_FLAG_WEIGHTED_PRED) ||
+-		 pps->weighted_bipred_idc)
+-		*why = "weighted prediction";
++	else if (pps->weighted_bipred_idc > 2)
++		*why = "weighted_bipred_idc out of range";
++	else if (vxd_h264_has_scaling(pps) && !vxd_h264_scaling_set(pps, scaling))
++		*why = "scaling matrices signalled but the SCALING_MATRIX control is not set";
+ 	else
+ 		return 0;
+ 	return -EINVAL;
+@@ -138,6 +189,157 @@ static u32 vxd_h264_header_bits(const struct v4l2_ctrl_h264_pps *pps,
+ 	return bits;
+ }
+ 
++/* POC registers: 17 bits, sign in bit 16 (0x62c66b0 L39779-39792). */
++static u32 vxd_h264_poc(s32 poc)
++{
++	return ((u32)poc >> 15 & 0x10000) | ((u32)poc & 0xffff);
++}
++
++/* Explicit weights in the bitstream (the kext's 0x62be348 condition). */
++static bool vxd_h264_explicit_weights(const struct v4l2_ctrl_h264_pps *pps,
++				      int code)
++{
++	return ((pps->flags & V4L2_H264_PPS_FLAG_WEIGHTED_PRED) &&
++		code == VXD_H264_CODE_P) ||
++	       (pps->weighted_bipred_idc == 1 && code == VXD_H264_CODE_B);
++}
++
++/* The weight tables go out for explicit and implicit modes (L40086). */
++static bool vxd_h264_weight_tables(const struct v4l2_ctrl_h264_pps *pps,
++				   int code)
++{
++	return ((pps->flags & V4L2_H264_PPS_FLAG_WEIGHTED_PRED) &&
++		code == VXD_H264_CODE_P) ||
++	       (pps->weighted_bipred_idc && code == VXD_H264_CODE_B);
++}
++
++static void vxd_h264_scaling_words(const struct apple_vxd_h264_frame *f,
++				   u32 *w)
++{
++	const struct v4l2_ctrl_h264_scaling_matrix *m = f->scaling;
++	u8 bytes[4 * VXD_H264_SCALING_WORDS];
++	unsigned int i;
++
++	memset(bytes, VXD_H264_SCALING_FLAT, sizeof(bytes));
++	if (vxd_h264_has_scaling(f->pps) && m) {
++		/* 8x8 lists only with the 8x8 transform (0x62be538 L33469). */
++		if (f->pps->flags & V4L2_H264_PPS_FLAG_TRANSFORM_8X8_MODE) {
++			memcpy(&bytes[0], m->scaling_list_8x8[1], 64);
++			memcpy(&bytes[64], m->scaling_list_8x8[0], 64);
++		}
++		for (i = 0; i < 6; i++)
++			memcpy(&bytes[128 + 16 * i],
++			       m->scaling_list_4x4[vxd_h264_scaling_4x4_order[i]],
++			       16);
++	}
++	for (i = 0; i < VXD_H264_SCALING_WORDS; i++)
++		w[i] = bytes[4 * i] | bytes[4 * i + 1] << 8 |
++		       bytes[4 * i + 2] << 16 | (u32)bytes[4 * i + 3] << 24;
++}
++
++/* @n bytes of a reference list, four per word, low byte first. */
++static unsigned int vxd_h264_pack_list(const u8 *list, unsigned int n, u32 *w)
++{
++	unsigned int i, words = DIV_ROUND_UP(n, 4);
++
++	for (i = 0; i < words; i++)
++		w[i] = 0;
++	for (i = 0; i < 4 * words; i++)
++		w[i / 4] |= (u32)list[i] << (8 * (i % 4));
++	return words;
++}
++
++static bool vxd_h264_dpb_active(const struct v4l2_h264_dpb_entry *e)
++{
++	return (e->flags & V4L2_H264_DPB_ENTRY_FLAG_VALID) &&
++	       (e->flags & V4L2_H264_DPB_ENTRY_FLAG_ACTIVE);
++}
++
++/*
++ * B slices: the picture order counts (BE_FOC0/1, then TOP/BOT_FOC per
++ * hardware DPB slot) and the co-located picture block (BE_COL_PIC0,
++ * BE_BASE_ADDR_COL_PIC, BE_LIST0_INVERSE x 8, BE_LIST1), 0x62c66b0
++ * L39776-39887.  The co-located picture is RefPicList1[0].
++ */
++static void vxd_h264_emit_b(struct apple_vxd_cmdbuf *cb,
++			    const struct apple_vxd_h264_frame *f,
++			    const u8 *l0, const u8 *l1, u8 l1_minus1,
++			    unsigned int highwater, u32 *w)
++{
++	const struct v4l2_ctrl_h264_decode_params *dp = f->dp;
++	u8 inverse[V4L2_H264_REF_LIST_LEN];
++	unsigned int i, n;
++	u8 col = l1[0];
++
++	w[0] = vxd_h264_poc(dp->top_field_order_cnt);
++	w[1] = vxd_h264_poc(dp->bottom_field_order_cnt);
++	for (i = 0; i < highwater; i++) {
++		const struct v4l2_h264_dpb_entry *e = &dp->dpb[i];
++		bool active = vxd_h264_dpb_active(e);
++
++		w[2 + 2 * i] = active ? vxd_h264_poc(e->top_field_order_cnt) : 0;
++		w[3 + 2 * i] = active ? vxd_h264_poc(e->bottom_field_order_cnt) : 0;
++	}
++	apple_vxd_cmd_block(cb, VXD_H264_BE_FOC0, 0, w, 2 + 2 * highwater);
++
++	if (col < V4L2_H264_NUM_DPB_ENTRIES && f->dpb_colocated[col]) {
++		const struct v4l2_h264_dpb_entry *e = &dp->dpb[col];
++		s32 cur = min(dp->top_field_order_cnt, dp->bottom_field_order_cnt);
++		s64 dtop = abs((s64)cur - e->top_field_order_cnt);
++		s64 dbot = abs((s64)cur - e->bottom_field_order_cnt);
++
++		/*
++		 * Frame co-located picture: COL_NOTFRAME and COL_MBAFF clear,
++		 * bottom field flag by POC distance, as psb_video and the kext.
++		 */
++		w[0] = dbot <= dtop;
++		w[1] = f->dpb_colocated[col];
++	} else {
++		w[0] = APPLE_VXD_H264_UNUSED_VA;
++		w[1] = APPLE_VXD_H264_UNUSED_VA;
++	}
++
++	/* Inverse L0: first position of each slot (bottom fields at +16). */
++	memset(inverse, APPLE_VXD_H264_NO_REF, sizeof(inverse));
++	for (i = V4L2_H264_REF_LIST_LEN; i--; )
++		if (l0[i] != APPLE_VXD_H264_NO_REF)
++			inverse[(l0[i] >> 3 & 0x10) | (l0[i] & 0x1f)] = i;
++	vxd_h264_pack_list(inverse, V4L2_H264_REF_LIST_LEN, &w[2]);
++	n = vxd_h264_pack_list(l1, l1_minus1 + 1, &w[10]);
++	apple_vxd_cmd_block(cb, VXD_H264_BE_COL_PIC0, 0, w, 10 + n);
++}
++
++/*
++ * H264_WEIGHTED_FACTORS/OFFSET A (list 0) and B (list 1), 32 entries each
++ * (0x62c66b0 L40086-40134, field layout as psb_video's msvdx_cmds_io2.h).
++ * Implicit bi-prediction leaves the kext's tables unrefreshed (zero in a
++ * fresh context); the core derives those weights from the POCs.
++ */
++static void vxd_h264_emit_weights(struct apple_vxd_cmdbuf *cb,
++				  const struct apple_vxd_h264_frame *f,
++				  const struct apple_vxd_h264_slice *sl,
++				  const u8 *ref_slots, unsigned int list,
++				  u8 n_minus1, int code, u32 *w)
++{
++	bool expl = vxd_h264_explicit_weights(f->pps, code);
++	unsigned int i;
++
++	memset(w, 0, VXD_H264_WEIGHT_WORDS * sizeof(*w));
++	for (i = 0; expl && i <= n_minus1; i++) {
++		const struct apple_vxd_h264_weight *wt = &sl->weights[list][i];
++
++		if (ref_slots[i] == APPLE_VXD_H264_NO_REF)
++			continue;
++		w[i] = ((u32)wt->weight[2] & 0x1ff) << 18 |
++		       ((u32)wt->weight[1] & 0x1ff) << 9 |
++		       ((u32)wt->weight[0] & 0x1ff);
++		w[32 + i] = (u32)(u8)wt->offset[2] << 16 |
++			    (u32)(u8)wt->offset[1] << 8 | (u8)wt->offset[0];
++	}
++	apple_vxd_cmd_block(cb, VXD_H264_CMDS_WEIGHTS(list), 0, w,
++			    VXD_H264_WEIGHT_WORDS);
++}
++
+ static void vxd_h264_emit_slice(struct apple_vxd_cmdbuf *cb,
+ 				const struct apple_vxd_h264_frame *f,
+ 				unsigned int idx, int code)
+@@ -146,18 +348,25 @@ static void vxd_h264_emit_slice(struct apple_vxd_cmdbuf *cb,
+ 	const struct v4l2_ctrl_h264_pps *pps = f->pps;
+ 	const struct apple_vxd_h264_slice *sl = &f->slices[idx];
+ 	const u8 *l0 = f->ref_slots[idx][0];
++	const u8 *l1 = f->ref_slots[idx][1];
+ 	u32 w = sps->pic_width_in_mbs_minus1 + 1;
+ 	u32 h = sps->pic_height_in_map_units_minus1 + 1;
+ 	u32 mb_x = sl->first_mb_in_slice % w, mb_y = sl->first_mb_in_slice / w;
+ 	u32 chroma = V4L2_H264_SPS_HAS_CHROMA_FORMAT(sps) ? sps->chroma_format_idc : 1;
++	u32 wmode = !!(pps->flags & V4L2_H264_PPS_FLAG_WEIGHTED_PRED) |
++		    pps->weighted_bipred_idc << 1;
+ 	u32 hdr[VXD_CMD_SLICE_BLOCK_WORDS - 1] = { };
+-	u32 scaling[VXD_H264_SCALING_WORDS];
+-	u32 refs[2 * V4L2_H264_NUM_DPB_ENTRIES];
+-	u32 regs[7], l0w[V4L2_H264_REF_LIST_LEN / 4];
+ 	u32 sps0, pps0, pic0, slice0, slice1, skip, bits, longterm = 0;
+ 	unsigned int i, n, highwater = 0;
+ 	bool min_bipred8, used[V4L2_H264_NUM_DPB_ENTRIES] = { };
++	/*
++	 * I slices zero both counts; P slices keep the parsed L1 count (the
++	 * PPS default, 0x62a0058) as the kext does (0x62c5fb8 L39477-39483).
++	 */
+ 	u8 l0_minus1 = code ? sl->num_ref_idx_l0_active_minus1 : 0;
++	u8 l1_minus1 = code ? sl->num_ref_idx_l1_active_minus1 : 0;
++	/* Scratch for one block at a time: the largest is the weight table. */
++	u32 buf[VXD_H264_WEIGHT_WORDS];
+ 
+ 	min_bipred8 = w > 80 && sps->level_idc > 30;
+ 	sps0 = ((chroma >> 1) & 1) << 28 | sps->bit_depth_chroma_minus8 << 25 |
+@@ -182,10 +391,11 @@ static void vxd_h264_emit_slice(struct apple_vxd_cmdbuf *cb,
+ 		 sl->cabac_init_idc << 14 | (idx & 0x3fff);
+ 	slice1 = mb_y << 24 | mb_x << 16 |
+ 		 ((26 + pps->pic_init_qp_minus26 + sl->slice_qp_delta) & 63) << 10 |
+-		 l0_minus1;
++		 (l1_minus1 & 31) << 5 | (l0_minus1 & 31);
+ 
+-	/* CTRL_ALLOC_HEADER */
++	/* CTRL_ALLOC_HEADER; MODE_CONFIG = weighted_pred | bipred_idc << 1. */
+ 	hdr[0] = !!(pps->flags & V4L2_H264_PPS_FLAG_CONSTRAINED_INTRA_PRED) << 23 |
++		 wmode << 17 |
+ 		 sl->disable_deblocking_filter_idc << 12 |
+ 		 ((u8)sl->slice_alpha_c0_offset_div2 & 15) << 8 |
+ 		 ((u8)sl->slice_beta_offset_div2 & 15) << 4 |
+@@ -231,76 +441,85 @@ static void vxd_h264_emit_slice(struct apple_vxd_cmdbuf *cb,
+ 	apple_vxd_cmd_group_close(cb);
+ 
+ 	/* Entropy back end. */
+-	regs[0] = VXD_H264_ENTDEC_CONTROL;
+-	apple_vxd_cmd_block(cb, VXD_H264_BE_CONTROL, 0, regs, 1);
++	buf[0] = VXD_H264_ENTDEC_CONTROL;
++	apple_vxd_cmd_block(cb, VXD_H264_BE_CONTROL, 0, buf, 1);
+ 
+ 	for (i = 0; i < V4L2_H264_NUM_DPB_ENTRIES; i++) {
+ 		const struct v4l2_h264_dpb_entry *e = &f->dp->dpb[i];
+ 
+-		if (!(e->flags & V4L2_H264_DPB_ENTRY_FLAG_VALID) ||
+-		    !(e->flags & V4L2_H264_DPB_ENTRY_FLAG_ACTIVE))
++		if (!vxd_h264_dpb_active(e))
+ 			continue;
+ 		highwater = i + 1;
+ 		if (e->flags & V4L2_H264_DPB_ENTRY_FLAG_LONG_TERM)
+ 			longterm |= BIT(i);
+ 	}
+-	regs[0] = sps0;
+-	regs[1] = pps0;
+-	regs[2] = pic0;
+-	regs[3] = slice0;
+-	regs[4] = slice1;
+-	regs[5] = f->colocated;
+-	regs[6] = longterm;
+-	apple_vxd_cmd_block(cb, VXD_H264_BE_SPS0, 0, regs, 7);
+-
+-	for (i = 0; i < VXD_H264_SCALING_WORDS; i++)
+-		scaling[i] = VXD_H264_SCALING_FLAT;
+-	apple_vxd_cmd_block(cb, VXD_H264_SCALING, 0, scaling,
++	buf[0] = sps0;
++	buf[1] = pps0;
++	buf[2] = pic0;
++	buf[3] = slice0;
++	buf[4] = slice1;
++	buf[5] = f->colocated;
++	buf[6] = longterm;
++	apple_vxd_cmd_block(cb, VXD_H264_BE_SPS0, 0, buf, 7);
++
++	vxd_h264_scaling_words(f, buf);
++	apple_vxd_cmd_block(cb, VXD_H264_SCALING, 0, buf,
+ 			    VXD_H264_SCALING_WORDS);
+ 
++	if (code == VXD_H264_CODE_B)
++		vxd_h264_emit_b(cb, f, l0, l1, l1_minus1, highwater, buf);
++
+ 	if (code) {
+-		n = l0_minus1 / 4 + 1;
+-		for (i = 0; i < n; i++)
+-			l0w[i] = 0;
+-		for (i = 0; i < 4 * n; i++) {
+-			u8 slot = i <= l0_minus1 ? l0[i] : APPLE_VXD_H264_NO_REF;
+-
+-			l0w[i / 4] |= (u32)slot << (8 * (i % 4));
+-			if (slot < V4L2_H264_NUM_DPB_ENTRIES)
+-				used[slot] = true;
+-		}
+-		apple_vxd_cmd_block(cb, VXD_H264_BE_L0, 0, l0w, n);
++		n = vxd_h264_pack_list(l0, l0_minus1 + 1, buf);
++		apple_vxd_cmd_block(cb, VXD_H264_BE_L0, 0, buf, n);
+ 	}
+ 
++	/* Surfaces only for the references this slice's lists use. */
++	for (i = 0; code && i <= l0_minus1; i++)
++		if (l0[i] < V4L2_H264_NUM_DPB_ENTRIES)
++			used[l0[i]] = true;
++	for (i = 0; code == VXD_H264_CODE_B && i <= l1_minus1; i++)
++		if (l1[i] < V4L2_H264_NUM_DPB_ENTRIES)
++			used[l1[i]] = true;
+ 	if (highwater) {
+ 		for (i = 0; i < highwater; i++) {
+ 			bool real = used[i] && f->dpb_luma[i];
+ 
+-			refs[2 * i] = real ? f->dpb_luma[i] : APPLE_VXD_H264_UNUSED_VA;
+-			refs[2 * i + 1] = real ? f->dpb_chroma[i] :
+-						 APPLE_VXD_H264_UNUSED_VA;
++			buf[2 * i] = real ? f->dpb_luma[i] : APPLE_VXD_H264_UNUSED_VA;
++			buf[2 * i + 1] = real ? f->dpb_chroma[i] :
++						APPLE_VXD_H264_UNUSED_VA;
+ 		}
+ 		apple_vxd_cmd_block(cb, VXD_H264_CMDS_REFS, VXD_CMD_BLOCK_FLAG_REFS,
+-				    refs, 2 * highwater);
++				    buf, 2 * highwater);
++	}
++
++	if (vxd_h264_weight_tables(pps, code)) {
++		vxd_h264_emit_weights(cb, f, sl, l0, 0, l0_minus1, code, buf);
++		if (code == VXD_H264_CODE_B)
++			vxd_h264_emit_weights(cb, f, sl, l1, 1, l1_minus1, code,
++					      buf);
+ 	}
+ 
+ 	/* Picture geometry, operating mode, output. */
+-	regs[0] = (16 * h - 1) << 12 | (16 * w - 1);
+-	regs[1] = regs[0];
+-	regs[2] = APPLE_VXD_H264_OPMODE_BASE | 2 << 20 | (chroma != 0) << 12;
+-	regs[3] = f->dst_luma;
+-	regs[4] = f->dst_chroma;
+-	apple_vxd_cmd_block(cb, VXD_H264_CMDS_SIZE, 0, regs, 5);
+-	regs[0] = f->bufs.intra;
+-	apple_vxd_cmd_block(cb, VXD_H264_CMDS_INTRA, 0, regs, 1);
+-	regs[0] = VXD_H264_WEIGHTS_UNWEIGHTED;
+-	apple_vxd_cmd_block(cb, VXD_H264_CMDS_WEIGHTS, 0, regs, 1);
+-	regs[0] = VXD_H264_CACHE_POLICY;
+-	apple_vxd_cmd_block(cb, VXD_H264_CMDS_CACHE, 0, regs, 1);
+-	regs[0] = f->dst_stride & ~63U;
+-	apple_vxd_cmd_block(cb, VXD_H264_CMDS_STRIDE, 0, regs, 1);
+-	regs[0] = chroma;
+-	apple_vxd_cmd_block(cb, VXD_H264_CMDS_CHROMA, 0, regs, 1);
++	buf[0] = (16 * h - 1) << 12 | (16 * w - 1);
++	buf[1] = buf[0];
++	buf[2] = APPLE_VXD_H264_OPMODE_BASE | 2 << 20 | (chroma != 0) << 12;
++	buf[3] = f->dst_luma;
++	buf[4] = f->dst_chroma;
++	apple_vxd_cmd_block(cb, VXD_H264_CMDS_SIZE, 0, buf, 5);
++	buf[0] = f->bufs.intra;
++	apple_vxd_cmd_block(cb, VXD_H264_CMDS_INTRA, 0, buf, 1);
++	/* Denominators: the slice's when explicit, 5 / 5 otherwise. */
++	buf[0] = vxd_h264_explicit_weights(pps, code) ?
++		 sl->chroma_log2_weight_denom << 4 | sl->luma_log2_weight_denom :
++		 VXD_H264_WEIGHTS_DEFAULT;
++	apple_vxd_cmd_block(cb, VXD_H264_CMDS_WEIGHT_DENOM, 0, buf, 1);
++	buf[0] = VXD_H264_CACHE_POLICY;
++	apple_vxd_cmd_block(cb, VXD_H264_CMDS_CACHE, 0, buf, 1);
++	buf[0] = f->dst_stride & ~63U;
++	apple_vxd_cmd_block(cb, VXD_H264_CMDS_STRIDE, 0, buf, 1);
++	buf[0] = chroma;
++	apple_vxd_cmd_block(cb, VXD_H264_CMDS_CHROMA, 0, buf, 1);
+ 
+ 	apple_vxd_cmd_end_slice(cb);
+ }
+@@ -319,7 +538,7 @@ int apple_vxd_h264_build(struct apple_vxd_cmdbuf *cb,
+ 	int ret;
+ 
+ 	*why = NULL;
+-	ret = apple_vxd_h264_validate(f->sps, f->pps, why);
++	ret = apple_vxd_h264_validate(f->sps, f->pps, f->scaling, why);
+ 	if (ret)
+ 		return ret;
+ 	if (!f->nslices) {
+@@ -333,7 +552,7 @@ int apple_vxd_h264_build(struct apple_vxd_cmdbuf *cb,
+ 		u32 off, bytes, *p;
+ 
+ 		if (code < 0) {
+-			*why = "B/SP/SI slices are not supported yet";
++			*why = "SP/SI slices are not supported";
+ 			return -EINVAL;
+ 		}
+ 		if (vxd_h264_header_bits(f->pps, sl) >= 0x10000 ||
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-h264-cmd.h b/drivers/media/platform/apple/vxd/apple-vxd-h264-cmd.h
+index 9ddb6538c11ccc271eceaa80728e71a899ed8694..38c2c950a403532001914a9cac5684bd28f90217 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-h264-cmd.h
++++ b/drivers/media/platform/apple/vxd/apple-vxd-h264-cmd.h
+@@ -36,6 +36,11 @@ struct apple_vxd_h264_frame {
+ 	const struct v4l2_ctrl_h264_sps *sps;
+ 	const struct v4l2_ctrl_h264_pps *pps;
+ 	const struct v4l2_ctrl_h264_decode_params *dp;
++	/*
++	 * Used when the PPS has V4L2_H264_PPS_FLAG_SCALING_MATRIX_PRESENT;
++	 * flat (16) lists otherwise.
++	 */
++	const struct v4l2_ctrl_h264_scaling_matrix *scaling;
+ 	const struct apple_vxd_h264_slice *slices;
+ 	unsigned int nslices;
+ 	/* Per slice: final RefPicList0/1 as DPB slots, NO_REF past the end. */
+@@ -47,12 +52,15 @@ struct apple_vxd_h264_frame {
+ 	u32 colocated;			/* CAPTURE's stored-MB parameter buffer */
+ 	u32 dpb_luma[V4L2_H264_NUM_DPB_ENTRIES];	/* 0: not resolvable */
+ 	u32 dpb_chroma[V4L2_H264_NUM_DPB_ENTRIES];
++	/* Each reference's stored-MB buffer: the B co-located picture's. */
++	u32 dpb_colocated[V4L2_H264_NUM_DPB_ENTRIES];
+ 	struct apple_vxd_h264_bufs bufs;
+ 	bool first_picture;		/* first picture of the context */
+ };
+ 
+ int apple_vxd_h264_validate(const struct v4l2_ctrl_h264_sps *sps,
+ 			    const struct v4l2_ctrl_h264_pps *pps,
++			    const struct v4l2_ctrl_h264_scaling_matrix *scaling,
+ 			    const char **why);
+ int apple_vxd_h264_build(struct apple_vxd_cmdbuf *cb,
+ 			 const struct apple_vxd_h264_frame *f,
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-h264.c b/drivers/media/platform/apple/vxd/apple-vxd-h264.c
+index e48554b67d7d2378eee999fa6fe8ffab44e8809b..9fa72ee19866e7a05ca99c595d917d87abaf64c8 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-h264.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-h264.c
+@@ -9,8 +9,9 @@
+  *   1. validates SPS/PPS against what the AVC recipe covers,
+  *   2. finds and parses the slices itself (frame-based mode has no
+  *      SLICE_PARAMS, apple-vxd-h264-parse.c),
+- *   3. builds RefPicList0 (v4l2-h264 helper + the slice's modifications)
+- *      and resolves the DPB to CAPTURE device addresses by timestamp,
++ *   3. builds RefPicList0/1 (v4l2-h264 helper + the slice's
++ *      modifications) and resolves the DPB to CAPTURE device addresses
++ *      (and, for B slices, stored-MB buffers) by timestamp,
+  *   4. builds the command stream (apple-vxd-h264-cmd.c) into a pooled
+  *      command buffer and submits one 0x81 message per slice.
+  *
+@@ -61,8 +62,8 @@ static int apple_vxd_h264_validate_sps(struct apple_vxd_ctx *ctx,
+ 	 * No allow-list: the control's default (profile_idc 0, before
+ 	 * userspace sets an SPS) must pass, or TRY_EXT_CTRLS on the current
+ 	 * values fails (v4l2-compliance, round 3 QEMU smoke).  What the AVC
+-	 * command recipe does not cover yet (interlace, FMO, scaling lists,
+-	 * weighted prediction, 8x8 transform) is refused per picture.
++	 * command recipe does not cover (interlace, FMO) is refused per
++	 * picture.
+ 	 */
+ 	switch (sps->profile_idc) {
+ 	case 88: /* extended: data partitioning */
+@@ -208,53 +209,106 @@ static const void *apple_vxd_h264_ctrl(struct apple_vxd_ctx *ctx, u32 id)
+ }
+ 
+ /*
+- * RefPicList0 per P slice as DPB slots: the default list (8.2.4.2.1),
+- * truncated to num_ref_idx_l0_active, then the slice's modifications
++ * RefPicList0/1 per slice as DPB slots: the initial lists (8.2.4.2.1 for
++ * P, 8.2.4.2.3 for B, built once per picture by the v4l2-h264 helper),
++ * truncated to num_ref_idx_lX_active, then the slice's modifications
+  * (8.2.4.3).  Entries past the available references are NO_REF.
+  */
++enum { VXD_LIST_P, VXD_LIST_B0, VXD_LIST_B1, VXD_LISTS };
++
+ static int apple_vxd_h264_ref_lists(struct apple_vxd_h264_ctx *h,
+ 				    unsigned int nslices,
+ 				    const struct v4l2_ctrl_h264_sps *sps,
+ 				    const struct v4l2_ctrl_h264_decode_params *dp)
+ {
+-	struct v4l2_h264_reference plist[V4L2_H264_REF_LIST_LEN];
++	struct v4l2_h264_reference init[VXD_LISTS][V4L2_H264_REF_LIST_LEN];
+ 	struct v4l2_h264_reference list[V4L2_H264_REF_LIST_LEN];
+ 	struct v4l2_h264_reflist_builder b;
+-	bool built = false;
+-	unsigned int i, k;
++	bool have_p = false, have_b = false;
++	unsigned int i, k, lst;
+ 	int ret;
+ 
++	v4l2_h264_init_reflist_builder(&b, dp, sps, dp->dpb);
+ 	for (i = 0; i < nslices; i++) {
+ 		const struct apple_vxd_h264_slice *sl = &h->slices[i];
+-		unsigned int len = sl->num_ref_idx_l0_active_minus1 + 1;
++		bool bslice = sl->slice_type == V4L2_H264_SLICE_TYPE_B;
+ 
+ 		memset(h->ref_slots[i], APPLE_VXD_H264_NO_REF,
+ 		       sizeof(h->ref_slots[i]));
+-		if (sl->slice_type != V4L2_H264_SLICE_TYPE_P)
++		if (sl->slice_type != V4L2_H264_SLICE_TYPE_P && !bslice)
+ 			continue;
+ 
+-		if (!built) {
+-			v4l2_h264_init_reflist_builder(&b, dp, sps, dp->dpb);
+-			v4l2_h264_build_p_ref_list(&b, plist);
+-			built = true;
++		if (!bslice && !have_p) {
++			v4l2_h264_build_p_ref_list(&b, init[VXD_LIST_P]);
++			have_p = true;
++		}
++		if (bslice && !have_b) {
++			v4l2_h264_build_b_ref_lists(&b, init[VXD_LIST_B0],
++						    init[VXD_LIST_B1]);
++			have_b = true;
+ 		}
+-		for (k = 0; k < V4L2_H264_REF_LIST_LEN; k++) {
+-			list[k] = plist[k];
+-			if (k >= b.num_valid)
+-				list[k].index = APPLE_VXD_H264_NO_REF;
++		for (lst = 0; lst < (bslice ? 2 : 1); lst++) {
++			const struct v4l2_h264_reference *src =
++				init[bslice ? VXD_LIST_B0 + lst : VXD_LIST_P];
++			unsigned int len = 1 + (lst ? sl->num_ref_idx_l1_active_minus1 :
++						      sl->num_ref_idx_l0_active_minus1);
++
++			for (k = 0; k < V4L2_H264_REF_LIST_LEN; k++) {
++				list[k] = src[k];
++				if (k >= b.num_valid)
++					list[k].index = APPLE_VXD_H264_NO_REF;
++			}
++			ret = apple_vxd_h264_modify_ref_list(sl, lst, sps, dp,
++							     list, len);
++			if (ret)
++				return ret;
++			for (k = 0; k < len; k++)
++				h->ref_slots[i][lst][k] = list[k].index;
+ 		}
+-		ret = apple_vxd_h264_modify_ref_list(sl, 0, sps, dp, list, len);
+-		if (ret)
+-			return ret;
+-		for (k = 0; k < len; k++)
+-			h->ref_slots[i][0][k] = list[k].index;
+ 	}
+ 	return 0;
+ }
+ 
++/* Every reference a slice names must resolve to a CAPTURE buffer. */
++static const char *apple_vxd_h264_check_refs(const struct apple_vxd_h264_ctx *h,
++					     unsigned int nslices,
++					     const struct apple_vxd_h264_frame *f)
++{
++	unsigned int i, k, lst;
++
++	for (i = 0; i < nslices; i++) {
++		const struct apple_vxd_h264_slice *sl = &h->slices[i];
++		bool bslice = sl->slice_type == V4L2_H264_SLICE_TYPE_B;
++
++		if (sl->slice_type != V4L2_H264_SLICE_TYPE_P && !bslice)
++			continue;
++		for (lst = 0; lst < (bslice ? 2 : 1); lst++) {
++			unsigned int len = 1 + (lst ? sl->num_ref_idx_l1_active_minus1 :
++						      sl->num_ref_idx_l0_active_minus1);
++
++			for (k = 0; k < len; k++) {
++				u8 slot = h->ref_slots[i][lst][k];
++
++				if (slot < V4L2_H264_NUM_DPB_ENTRIES &&
++				    !f->dpb_luma[slot])
++					return "a reference picture has no CAPTURE buffer";
++			}
++		}
++		if (bslice) {
++			u8 col = h->ref_slots[i][1][0];
++
++			if (col >= V4L2_H264_NUM_DPB_ENTRIES ||
++			    !f->dpb_colocated[col])
++				return "co-located picture (RefPicList1[0]) unresolved";
++		}
++	}
++	return NULL;
++}
++
+ static int apple_vxd_h264_run(struct apple_vxd_ctx *ctx)
+ {
+ 	const struct v4l2_pix_format_mplane *pix = &ctx->decoded_fmt.fmt.pix_mp;
++	const struct v4l2_ctrl_h264_scaling_matrix *scaling;
+ 	const struct v4l2_ctrl_h264_decode_params *dp;
+ 	const struct v4l2_ctrl_h264_sps *sps;
+ 	const struct v4l2_ctrl_h264_pps *pps;
+@@ -287,16 +341,16 @@ static int apple_vxd_h264_run(struct apple_vxd_ctx *ctx)
+ 	sps = apple_vxd_h264_ctrl(ctx, V4L2_CID_STATELESS_H264_SPS);
+ 	pps = apple_vxd_h264_ctrl(ctx, V4L2_CID_STATELESS_H264_PPS);
+ 	dp = apple_vxd_h264_ctrl(ctx, V4L2_CID_STATELESS_H264_DECODE_PARAMS);
++	scaling = apple_vxd_h264_ctrl(ctx, V4L2_CID_STATELESS_H264_SCALING_MATRIX);
+ 	if (!sps || !pps || !dp) {
+ 		ret = -EINVAL;
+ 		goto out;
+ 	}
+-	ret = apple_vxd_h264_validate(sps, pps, &why);
++	ret = apple_vxd_h264_validate(sps, pps, scaling, &why);
+ 	if (ret)
+ 		goto out_why;
+-	if (dp->flags & (V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC |
+-			 V4L2_H264_DECODE_PARAM_FLAG_BFRAME)) {
+-		why = "field or B pictures";
++	if (dp->flags & V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC) {
++		why = "field pictures";
+ 		ret = -EINVAL;
+ 		goto out_why;
+ 	}
+@@ -320,7 +374,7 @@ static int apple_vxd_h264_run(struct apple_vxd_ctx *ctx)
+ 	if (ret)
+ 		goto out_why;
+ 	if (nslices > APPLE_VXD_JOB_MAX_PACKETS) {
+-		why = "more than 8 slices in one picture";
++		why = "more slices in one picture than packets in a job";
+ 		ret = -EINVAL;
+ 		goto out_why;
+ 	}
+@@ -334,6 +388,7 @@ static int apple_vxd_h264_run(struct apple_vxd_ctx *ctx)
+ 	f.sps = sps;
+ 	f.pps = pps;
+ 	f.dp = dp;
++	f.scaling = scaling;
+ 	f.slices = h->slices;
+ 	f.nslices = nslices;
+ 	f.ref_slots = (const u8 (*)[2][V4L2_H264_REF_LIST_LEN])h->ref_slots;
+@@ -362,19 +417,12 @@ static int apple_vxd_h264_run(struct apple_vxd_ctx *ctx)
+ 		}
+ 		f.dpb_luma[i] = apple_vxd_buf_va(to_vb2_v4l2_buffer(ref));
+ 		f.dpb_chroma[i] = f.dpb_luma[i] + stride * pix->height;
++		f.dpb_colocated[i] = apple_vxd_buf_aux_va(to_vb2_v4l2_buffer(ref));
+ 	}
+-	for (i = 0; i < nslices; i++) {
+-		unsigned int k, len = h->slices[i].num_ref_idx_l0_active_minus1 + 1;
+-
+-		for (k = 0; h->slices[i].slice_type == V4L2_H264_SLICE_TYPE_P && k < len; k++) {
+-			u8 slot = h->ref_slots[i][0][k];
+-
+-			if (slot < V4L2_H264_NUM_DPB_ENTRIES && !f.dpb_luma[slot]) {
+-				why = "a reference picture has no CAPTURE buffer";
+-				ret = -EINVAL;
+-				goto out_why;
+-			}
+-		}
++	why = apple_vxd_h264_check_refs(h, nslices, &f);
++	if (why) {
++		ret = -EINVAL;
++		goto out_why;
+ 	}
+ 
+ 	cb = apple_vxd_cmdbuf_get(vxd);
+@@ -388,8 +436,9 @@ static int apple_vxd_h264_run(struct apple_vxd_ctx *ctx)
+ 		goto out_why;
+ 
+ 	vxd_step_io(vxd->dev,
+-		    "decode: src %u va %#x (%zu bytes, %u slices, first NAL %#x+%u, header %u bits), dst %u Y %#x UV %#x stride %u, %zu command bytes in buf %u (va %#x), %u packets",
++		    "decode: src %u va %#x (%zu bytes, %u slices, first %c NAL %#x+%u, header %u bits), dst %u Y %#x UV %#x stride %u, %zu command bytes in buf %u (va %#x), %u packets",
+ 		    run.src->vb2_buf.index, f.src_va, src_len, nslices,
++		    "PBIps"[h->slices[0].slice_type % 5],
+ 		    h->slices[0].nal_offset, h->slices[0].nal_size,
+ 		    8 + h->slices[0].header_bits_raw, run.dst->vb2_buf.index,
+ 		    f.dst_luma, f.dst_chroma, stride, cb->used, cb->index,

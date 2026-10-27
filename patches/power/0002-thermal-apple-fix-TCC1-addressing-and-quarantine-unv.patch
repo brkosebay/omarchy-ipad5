@@ -1,0 +1,260 @@
+From b553f1ebafabd9e2086cfd9ad445b81476ddc14c Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 00:06:42 +0000
+Subject: [PATCH] thermal: apple: fix TCC1 addressing and quarantine
+ unvalidated A9 channels
+
+Use the nonuniform TCC offsets from the live ADT and LLB. The old 0x100 stride wrote accumulation control into a shared TCC0 calibration coefficient. Keep all coefficients read-only and expose control/configuration diagnostics for a normal-boot validation. Bind trips and the tuning guard only to the live-validated SOC0, SOC1 and TCC2 channels.
+---
+ arch/arm64/boot/dts/apple/s8003-thermal.dtsi | 84 --------------------
+ drivers/cpufreq/apple-a9-tuning.h            |  3 +-
+ drivers/thermal/Kconfig                      |  2 +-
+ drivers/thermal/apple-s8003-thermal.c        | 52 ++++++++++--
+ 4 files changed, 46 insertions(+), 95 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/apple/s8003-thermal.dtsi b/arch/arm64/boot/dts/apple/s8003-thermal.dtsi
+index d375b2d155..20fd657db4 100644
+--- a/arch/arm64/boot/dts/apple/s8003-thermal.dtsi
++++ b/arch/arm64/boot/dts/apple/s8003-thermal.dtsi
+@@ -75,90 +75,6 @@ cpu {
+ 				};
+ 			};
+ 		};
+-		apple-a9-soc2 {
+-			polling-delay-passive = <100>;
+-			polling-delay = <100>;
+-			thermal-sensors = <&a9_thermal 2>;
+-			trips {
+-				a9_soc2_passive: passive {
+-					temperature = <80000>;
+-					hysteresis = <5000>;
+-					type = "passive";
+-				};
+-				hot {
+-					temperature = <90000>;
+-					hysteresis = <5000>;
+-					type = "hot";
+-				};
+-				critical {
+-					temperature = <100000>;
+-					hysteresis = <0>;
+-					type = "critical";
+-				};
+-			};
+-			cooling-maps {
+-				cpu {
+-					trip = <&a9_soc2_passive>;
+-					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+-		};
+-		apple-a9-tcc0 {
+-			polling-delay-passive = <100>;
+-			polling-delay = <100>;
+-			thermal-sensors = <&a9_thermal 3>;
+-			trips {
+-				a9_tcc0_passive: passive {
+-					temperature = <80000>;
+-					hysteresis = <5000>;
+-					type = "passive";
+-				};
+-				hot {
+-					temperature = <90000>;
+-					hysteresis = <5000>;
+-					type = "hot";
+-				};
+-				critical {
+-					temperature = <100000>;
+-					hysteresis = <0>;
+-					type = "critical";
+-				};
+-			};
+-			cooling-maps {
+-				cpu {
+-					trip = <&a9_tcc0_passive>;
+-					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+-		};
+-		apple-a9-tcc1 {
+-			polling-delay-passive = <100>;
+-			polling-delay = <100>;
+-			thermal-sensors = <&a9_thermal 4>;
+-			trips {
+-				a9_tcc1_passive: passive {
+-					temperature = <80000>;
+-					hysteresis = <5000>;
+-					type = "passive";
+-				};
+-				hot {
+-					temperature = <90000>;
+-					hysteresis = <5000>;
+-					type = "hot";
+-				};
+-				critical {
+-					temperature = <100000>;
+-					hysteresis = <0>;
+-					type = "critical";
+-				};
+-			};
+-			cooling-maps {
+-				cpu {
+-					trip = <&a9_tcc1_passive>;
+-					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+-		};
+ 		apple-a9-tcc2 {
+ 			polling-delay-passive = <100>;
+ 			polling-delay = <100>;
+diff --git a/drivers/cpufreq/apple-a9-tuning.h b/drivers/cpufreq/apple-a9-tuning.h
+index 5a68f419db..a9faed9239 100644
+--- a/drivers/cpufreq/apple-a9-tuning.h
++++ b/drivers/cpufreq/apple-a9-tuning.h
+@@ -18,8 +18,7 @@ static const unsigned int a9_step_khz[] = {
+ 	1896000, 1944000, 1992000, 2040000, 2088000, 2160000,
+ };
+ static const char * const a9_zone_names[] = {
+-	"apple-a9-soc0", "apple-a9-soc1", "apple-a9-soc2",
+-	"apple-a9-tcc0", "apple-a9-tcc1", "apple-a9-tcc2",
++	"apple-a9-soc0", "apple-a9-soc1", "apple-a9-tcc2",
+ };
+ 
+ struct a9_guard {
+diff --git a/drivers/thermal/Kconfig b/drivers/thermal/Kconfig
+index c4a3d412ae..c0d6b3ad6c 100644
+--- a/drivers/thermal/Kconfig
++++ b/drivers/thermal/Kconfig
+@@ -536,7 +536,7 @@ config APPLE_S8003_THERMAL
+     depends on OF && THERMAL_OF
+     depends on HWMON
+     help
+-      Six calibrated SOC/TCC thermal sensors and hwmon inputs on Apple A9
++      Validated SOC0/SOC1/TCC2 zones and six-channel raw diagnostics on A9
+       S8003. Preserves bootloader trim and hardware SoCHOT protections.
+ 
+ endif
+diff --git a/drivers/thermal/apple-s8003-thermal.c b/drivers/thermal/apple-s8003-thermal.c
+index be569be84f..fe0233b13e 100644
+--- a/drivers/thermal/apple-s8003-thermal.c
++++ b/drivers/thermal/apple-s8003-thermal.c
+@@ -21,6 +21,10 @@
+ #define A9_SENSORS 6
+ #define A9_SAMPLE_MS 100
+ #define A9_STALE_MS 500
++/* integ31 live readings validate these three; retain the others as raw
++ * diagnostics until their corrected mapping/calibration is checked on-device.
++ */
++#define A9_TRUSTED_MASK (BIT(0) | BIT(1) | BIT(5))
+ 
+ struct a9_thermal;
+ struct a9_sensor {
+@@ -44,9 +48,17 @@ static const char * const a9_names[A9_SENSORS] = {
+ 	"apple-a9-tcc0", "apple-a9-tcc1", "apple-a9-tcc2",
+ };
+ 
++static const u16 a9_offsets[A9_SENSORS] = { 0, 0x100, 0x200, 0, 0x40, 0x200 };
++static const u16 a9_clear_offsets[A9_SENSORS] = { 4, 0x104, 0x204, 0x408, 0x438, 0x468 };
++
++static bool a9_sensor_trusted(unsigned int id)
++{
++	return id < A9_SENSORS && (A9_TRUSTED_MASK & BIT(id));
++}
++
+ static void __iomem *a9_sensor_base(struct a9_sensor *s)
+ {
+-	return s->parent->base[s->id / 3] + (s->id % 3) * 0x100;
++	return s->parent->base[s->id / 3] + a9_offsets[s->id];
+ }
+ 
+ static void a9_sample(struct a9_sensor *s)
+@@ -56,7 +68,7 @@ static void a9_sample(struct a9_sensor *s)
+ 	int q6;
+ 
+ 	/* iOS timer: freeze accumulation, read, then start the next interval. */
+-	writel(BIT(3), base + (tcc ? 0x408 - (s->id % 3) * 0xd0 : 4));
++	writel(BIT(3), s->parent->base[s->id / 3] + a9_clear_offsets[s->id]);
+ 	s->ctl = readl(base);
+ 	s->bk = readl(base + (tcc ? 0x20 : 0x18));
+ 	s->count = readl(base + (tcc ? 0x38 : 0x24));
+@@ -96,7 +108,7 @@ static int a9_sensor_temp(struct a9_sensor *s, int *temp)
+ 	int ret;
+ 
+ 	mutex_lock(&s->parent->lock);
+-	ret = s->error;
++	ret = a9_sensor_trusted(s->id) ? s->error : -ENODATA;
+ 	if (!ret && time_after(jiffies, s->sampled + msecs_to_jiffies(A9_STALE_MS)))
+ 		ret = -ETIMEDOUT;
+ 	if (!ret)
+@@ -112,11 +124,18 @@ static int a9_get_temp(struct thermal_zone_device *tz, int *temp)
+ 
+ static void a9_thermal_hot(struct thermal_zone_device *tz)
+ {
+-	apple_a9_thermal_revert();
++	struct a9_sensor *s = thermal_zone_device_priv(tz);
++
++	if (a9_sensor_trusted(s->id))
++		apple_a9_thermal_revert();
+ }
+ 
+ static void a9_thermal_critical(struct thermal_zone_device *tz)
+ {
++	struct a9_sensor *s = thermal_zone_device_priv(tz);
++
++	if (!a9_sensor_trusted(s->id))
++		return;
+ 	/* Synchronous bounded fallback first, then the normal shutdown path. */
+ 	apple_a9_thermal_revert();
+ 	thermal_zone_device_critical(tz);
+@@ -179,14 +198,29 @@ static int a9_thermal_snapshot_show(struct seq_file *seq, void *unused)
+ 	struct a9_thermal *a = seq->private;
+ 	int i;
+ 
+-	seq_puts(seq, "format=1 units=milliC trim=boot-preserved sample_ms=100\n");
++	seq_printf(seq, "format=2 units=milliC trim=boot-preserved sample_ms=100 trusted_mask=%02x\n",
++		   (unsigned int)A9_TRUSTED_MASK);
+ 	mutex_lock(&a->lock);
+ 	for (i = 0; i < A9_SENSORS; i++) {
+ 		struct a9_sensor *s = &a->sensor[i];
++		void __iomem *base = a9_sensor_base(s);
++		bool tcc = i >= 3;
+ 
+-		seq_printf(seq, "%s bk=%08x count=%08x max=%08x ctl=%08x temp=%d error=%d age_ms=%u\n",
++		seq_printf(seq, "%s bk=%08x count=%08x max=%08x ctl=%08x temp=%d error=%d age_ms=%u trusted=%u ctl_offset=%03x ctl1=%08x ctl2=%08x params=%08x\n",
+ 			   a9_names[i], s->bk, s->count, s->maximum, s->ctl,
+-			   s->temp, s->error, jiffies_to_msecs(jiffies - s->sampled));
++			   s->temp, s->error, jiffies_to_msecs(jiffies - s->sampled),
++			   a9_sensor_trusted(i), a9_offsets[i], readl(base + 8),
++			   readl(base + (tcc ? 16 : 12)), tcc ? readl(base + 24) : 0);
++	}
++	/* LLB 20H350 table at 0x1803b1af8 initializes these shared TCC
++	 * coefficients. The old uniform-stride bug wrote CTL bits into +100.
++	 * Read only: a normal LLB boot must restore calibration after integ31.
++	 */
++	for (i = 0; i < 3; i++) {
++		void __iomem *base = a->base[1] + 0x100 + i * 0x18;
++
++		seq_printf(seq, "tcc-coeff%u offset=%03x a=%08x b=%08x c=%08x\n",
++			   i, 0x100 + i * 0x18, readl(base), readl(base + 8), readl(base + 16));
+ 	}
+ 	mutex_unlock(&a->lock);
+ 	return 0;
+@@ -235,6 +269,8 @@ static int a9_thermal_probe(struct platform_device *pdev)
+ 	for (i = 0; i < A9_SENSORS; i++) {
+ 		struct thermal_zone_device *tz;
+ 
++		if (!a9_sensor_trusted(i))
++			continue;
+ 		tz = devm_thermal_of_zone_register(dev, i, &a->sensor[i], &a9_thermal_ops);
+ 		if (IS_ERR(tz))
+ 			return dev_err_probe(dev, PTR_ERR(tz), "thermal zone %d\n", i);
+@@ -256,5 +292,5 @@ static struct platform_driver a9_thermal_driver = {
+ 	},
+ };
+ module_platform_driver(a9_thermal_driver);
+-MODULE_DESCRIPTION("Apple S8003 six-channel die thermal sensors");
++MODULE_DESCRIPTION("Apple S8003 validated die thermals and raw channel diagnostics");
+ MODULE_LICENSE("GPL");
+-- 
+2.56.0
+

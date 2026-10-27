@@ -1,0 +1,748 @@
+#!/usr/bin/env python3
+"""Smart Cover handling for Omarchy on the iPad (linux-a9).
+
+The cover's hall sensor is an input switch (SW_LID) from the kernel's
+gpio-keys-polled device "iPad Smart Cover" (PMIC GPIO line 0; line 10 is a
+second hall, "iPad Smart Cover 2", SW_MACHINE_COVER). This daemon follows it:
+
+  cover closed   lock the screen (when there is a password to unlock it with),
+                 turn the display off (DPMS and backlight), tell
+                 ipad-als-brightness to hold still; optionally suspend
+  cover open     display on, brightness back; the lock stays until unlocked
+
+It is the only thing acting on the cover: the device is named so that
+systemd-logind and Omarchy's own lid bindings (both look for "Lid Switch")
+leave it alone, and a logind drop-in ignores a lid switch anyway. It does
+nothing but watch and log until it is switched on, and it never suspends unless
+asked to (suspend resume still crashes on this device).
+
+  ipad-lid on|off|toggle       lock + display off on close (state: lid_actions)
+  ipad-lid suspend on|off      also suspend after the cover has been closed for
+                               suspend_delay seconds (state: lid_suspend; opt-in)
+  ipad-lid status              what the running daemon last saw
+  ipad-lid --list              the switch devices found and their state now
+  ipad-lid --watch [S]         print every switch event for S seconds (default
+                               60): open and close the cover to see which level
+                               means closed
+  ipad-lid --available         exit status 0 when a lid switch device exists
+                               (what the unit's ExecCondition asks)
+  ipad-lid [daemon]            the daemon (what the unit runs)
+
+Testing without hardware: --mock PATH (lines `closed`, `open`, or `lid 0|1`,
+`cover2 0|1`, from a FIFO or file), --mock-evdev PATH (packed input_event
+records from a FIFO), IPAD_LID_HYPRCTL, IPAD_LID_SLEEP, IPAD_LID_PASSWD_STATUS
+(replace hyprctl, ipad-sleep and `passwd -S`), IPAD_ALS_BRIGHTNESSCTL and
+IPAD_ALS_BACKLIGHT_ROOT (as for ipad-als-brightness), IPAD_LID_SYSFS.
+
+Switches live in ~/.local/state/linux-a9/display as lid_actions=on|off and
+lid_suspend=on|off (absent: the conf keys below, default off).
+
+~/.config/linux-a9/lid.conf (key = value, # comments; restart to apply):
+  actions = off            default for lid_actions
+  suspend = off            default for lid_suspend
+  suspend_delay = 3.0      seconds closed before suspending
+  lock = auto              auto: only when the user has a password (a lock with
+                           no password cannot be undone); on; off
+  lock_cmd = auto          auto: hyprlock if installed, else omarchy-system-lock
+  invert = off             treat the switch the other way round (a stopgap until
+                           the device tree's GPIO_ACTIVE_LOW/HIGH is fixed)
+  cover2 = ignore          closed: the second hall also counts as closing
+  device =                 only switch devices whose name contains this
+  settle = 0.4             seconds a change must hold
+  backlight =              /sys/class/backlight name (default: the first)
+"""
+
+import argparse
+import fcntl
+import glob
+import json
+import os
+import re
+import select
+import shlex
+import shutil
+import signal
+import stat
+import struct
+import subprocess
+import sys
+import time
+
+SW_LID, SW_MACHINE_COVER = 0, 0x10
+EV_SW = 5
+EVENT = struct.Struct("llHHi")  # struct input_event on 64-bit: timeval, type, code, value
+SYSFS = "/sys/class/input"
+TICK = 0.1
+DEFAULTS = {
+    "actions": False,
+    "suspend": False,
+    "suspend_delay": 3.0,
+    "lock": "auto",
+    "lock_cmd": "auto",
+    "invert": False,
+    "cover2": "ignore",
+    "device": "",
+    "settle": 0.4,
+    "backlight": "",
+}
+
+
+def log(*args):
+    print("ipad-lid:", *args, file=sys.stderr, flush=True)
+
+
+# --- configuration and state ---------------------------------------------------
+def config_home():
+    return os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+
+
+def state_path():
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.join(base, "linux-a9", "display")
+
+
+def runtime_dir():
+    return os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "linux-a9")
+
+
+def status_path():
+    return os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "ipad-lid.json")
+
+
+def flag_path():
+    return os.path.join(runtime_dir(), "lid-closed")
+
+
+def load_conf():
+    conf = dict(DEFAULTS)
+    try:
+        with open(os.path.join(config_home(), "linux-a9", "lid.conf")) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        line = line.split("#", 1)[0].strip()
+        if "=" not in line:
+            continue
+        key, value = (part.strip() for part in line.split("=", 1))
+        if key not in DEFAULTS:
+            log(f"lid.conf: unknown key {key}")
+        elif key in ("actions", "suspend", "invert"):
+            conf[key] = value.lower() in ("on", "yes", "true", "1")
+        elif key in ("lock", "lock_cmd", "cover2", "device", "backlight"):
+            conf[key] = value
+        else:
+            try:
+                conf[key] = float(value)
+            except ValueError:
+                log(f"lid.conf: {key} = {value}: not a number")
+    if conf["lock"] not in ("auto", "on", "off"):
+        log(f"lid.conf: lock = {conf['lock']}: not auto, on or off; using auto")
+        conf["lock"] = "auto"
+    if conf["cover2"] not in ("ignore", "closed"):
+        log(f"lid.conf: cover2 = {conf['cover2']}: not ignore or closed; using ignore")
+        conf["cover2"] = "ignore"
+    return conf
+
+
+def read_state():
+    values = {}
+    try:
+        with open(state_path()) as f:
+            for line in f:
+                m = re.match(r"\s*([\w]+)\s*=\s*(\S+)", line)
+                if m:
+                    values[m.group(1)] = m.group(2)
+    except OSError:
+        pass
+    return values
+
+
+def set_state(key, value):
+    path = state_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        with open(path) as f:
+            lines = [ln for ln in f.read().splitlines() if not re.match(rf"\s*{re.escape(key)}\s*=", ln)]
+    except OSError:
+        lines = []
+    lines.append(f"{key}={value}")
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(tmp, path)
+
+
+def switch_on(key, conf_key, conf):
+    value = read_state().get(key)
+    if value in ("on", "off"):
+        return value == "on"
+    return conf[conf_key]
+
+
+# --- the switch devices ------------------------------------------------------------
+def sysfs_root():
+    return os.environ.get("IPAD_LID_SYSFS") or SYSFS
+
+
+def read_text(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def find_devices(name_filter=""):
+    """[(name, /dev/input/eventN, set of switch codes)] for every input device
+    reporting SW_LID or the iPad's second hall (SW_MACHINE_COVER)."""
+    found = []
+    for base in sorted(glob.glob(os.path.join(sysfs_root(), "input[0-9]*"))):
+        caps = read_text(os.path.join(base, "capabilities", "sw"))
+        words = (caps or "").split()
+        try:
+            bits = int(words[-1], 16) if words else 0
+        except ValueError:
+            continue
+        codes = {c for c in (SW_LID, SW_MACHINE_COVER) if bits & (1 << c)}
+        if not codes:
+            continue
+        name = read_text(os.path.join(base, "name")) or os.path.basename(base)
+        if name_filter and name_filter not in name:
+            continue
+        events = sorted(glob.glob(os.path.join(base, "event*")))
+        node = os.environ.get("IPAD_LID_DEVDIR", "/dev/input")
+        if events:
+            found.append((name, os.path.join(node, os.path.basename(events[0])), codes))
+    return found
+
+
+def has_lid(devices):
+    return any(SW_LID in codes for _name, _node, codes in devices)
+
+
+def eviocgsw(fd):
+    """The switches' state now, as a bitmask (EVIOCGSW)."""
+    length = 8
+    request = (2 << 30) | (length << 16) | (ord("E") << 8) | 0x1B
+    buf = bytearray(length)
+    fcntl.ioctl(fd, request, buf)
+    return int.from_bytes(buf, "little")
+
+
+# --- event sources: poll(timeout) -> [(code, value)] ----------------------------------
+class EvdevSource:
+    kind = "evdev"
+
+    def __init__(self, devices):
+        self.fds = {}
+        self.initial = []
+        for name, node, codes in devices:
+            try:
+                fd = os.open(node, os.O_RDONLY | os.O_NONBLOCK)
+            except OSError as e:
+                log(f"cannot open {node} ({name}): {e}" +
+                    ("; is the user in the input group?" if e.errno == 13 else ""))
+                continue
+            self.fds[fd] = (name, node, b"")
+            try:
+                state = eviocgsw(fd)
+                self.initial += [(code, (state >> code) & 1) for code in sorted(codes)]
+            except OSError as e:
+                log(f"EVIOCGSW on {node}: {e}")
+
+    def poll(self, timeout):
+        out = self.initial
+        self.initial = []
+        if not self.fds:
+            time.sleep(timeout)
+            return out
+        ready, _, _ = select.select(list(self.fds), [], [], timeout)
+        for fd in ready:
+            name, node, buf = self.fds[fd]
+            try:
+                data = os.read(fd, 4096)
+            except BlockingIOError:
+                continue
+            except OSError as e:
+                log(f"{node}: {e}; no longer watching it")
+                os.close(fd)
+                del self.fds[fd]
+                continue
+            buf += data
+            while len(buf) >= EVENT.size:
+                _s, _us, etype, code, value = EVENT.unpack_from(buf)
+                buf = buf[EVENT.size:]
+                if etype == EV_SW and code in (SW_LID, SW_MACHINE_COVER):
+                    out.append((code, value))
+            self.fds[fd] = (name, node, buf)
+        return out
+
+    def close(self):
+        for fd in self.fds:
+            os.close(fd)
+
+
+class PackedSource(EvdevSource):
+    """Packed input_event records from a FIFO (--mock-evdev)."""
+
+    kind = "mock-evdev"
+
+    def __init__(self, path):
+        self.fds = {}
+        self.initial = []
+        if not os.path.exists(path):
+            os.mkfifo(path, 0o600)
+        fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        self.fds[fd] = ("mock", path, b"")
+
+
+class LineSource:
+    """`closed`, `open`, `lid 0|1`, `cover2 0|1` lines (--mock)."""
+
+    kind = "mock"
+
+    def __init__(self, path):
+        self.path = path
+        self.buf = b""
+        self.fd = None
+        self.offset = 0
+        self.pending = []
+        if not os.path.exists(path):
+            os.mkfifo(path, 0o600)
+        self.fifo = stat.S_ISFIFO(os.stat(path).st_mode)
+        if self.fifo:
+            self.fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        else:
+            with open(path) as f:
+                self.pending = [e for e in map(self.parse, f.read().splitlines()) if e]
+            self.offset = os.path.getsize(path)
+
+    @staticmethod
+    def parse(line):
+        parts = line.split("#", 1)[0].strip().lower().split()
+        if parts == ["closed"]:
+            return (SW_LID, 1)
+        if parts == ["open"]:
+            return (SW_LID, 0)
+        if len(parts) == 2 and parts[0] in ("lid", "cover2") and parts[1] in ("0", "1"):
+            return (SW_LID if parts[0] == "lid" else SW_MACHINE_COVER, int(parts[1]))
+        return None
+
+    def poll(self, timeout):
+        out = list(self.pending)
+        self.pending = []
+        if self.fifo:
+            ready, _, _ = select.select([self.fd], [], [], timeout)
+            if ready:
+                self.buf += os.read(self.fd, 4096)
+                *lines, self.buf = self.buf.split(b"\n")
+                out += [self.parse(ln.decode(errors="replace")) for ln in lines]
+        else:
+            time.sleep(min(timeout, 0.2))
+            try:
+                size = os.path.getsize(self.path)
+            except OSError:
+                size = self.offset
+            if size < self.offset:
+                self.offset = 0
+            if size > self.offset:
+                with open(self.path, "rb") as f:
+                    f.seek(self.offset)
+                    data = f.read()
+                self.offset += len(data)
+                out += [self.parse(ln.decode(errors="replace")) for ln in data.splitlines()]
+        return [e for e in out if e]
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+
+
+# --- the actions -----------------------------------------------------------------------
+def hypr_env():
+    """The environment for hyprctl and hyprlock from outside the compositor's own
+    children (the user unit has none of it)."""
+    env = dict(os.environ)
+    run = env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    sig = env.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+    if not sig or not os.path.exists(os.path.join(run, "hypr", sig, ".socket.sock")):
+        sockets = glob.glob(os.path.join(run, "hypr", "*", ".socket.sock"))
+        if sockets:
+            env["HYPRLAND_INSTANCE_SIGNATURE"] = os.path.basename(os.path.dirname(max(sockets, key=os.path.getmtime)))
+    if not env.get("WAYLAND_DISPLAY"):
+        wayland = sorted(glob.glob(os.path.join(run, "wayland-[0-9]")), key=os.path.getmtime)
+        if wayland:
+            env["WAYLAND_DISPLAY"] = os.path.basename(wayland[-1])
+    env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={run}/bus")
+    return env
+
+
+def run(cmd, **kw):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=20, **kw)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"{cmd[0]}: {e}")
+        return None
+
+
+def hyprctl_dispatch(expr):
+    cmd = shlex.split(os.environ.get("IPAD_LID_HYPRCTL", "hyprctl")) + ["dispatch", expr]
+    result = run(cmd, env=hypr_env())
+    if result is None or result.returncode != 0:
+        log("hyprctl dispatch failed:", (result.stderr or result.stdout).strip() if result else "not run")
+        return False
+    return True
+
+
+def has_password():
+    cmd = shlex.split(os.environ.get("IPAD_LID_PASSWD_STATUS", "passwd -S"))
+    result = run(cmd)
+    if result is None or result.returncode != 0:
+        return False
+    fields = result.stdout.split()
+    return len(fields) >= 2 and fields[1] == "P"
+
+
+def lock_command(conf):
+    if conf["lock_cmd"] != "auto":
+        return conf["lock_cmd"]
+    if shutil.which("hyprlock"):
+        return "pgrep -x hyprlock >/dev/null || exec hyprlock"
+    return "omarchy-system-lock"
+
+
+def brightnessctl_cmd():
+    return shlex.split(os.environ.get("IPAD_ALS_BRIGHTNESSCTL", "brightnessctl"))
+
+
+def backlight_root():
+    return os.environ.get("IPAD_ALS_BACKLIGHT_ROOT") or "/sys/class/backlight"
+
+
+def find_backlight(name=""):
+    root = backlight_root()
+    if name:
+        return name if os.path.exists(os.path.join(root, name, "brightness")) else None
+    for path in sorted(glob.glob(os.path.join(root, "*"))):
+        if os.path.exists(os.path.join(path, "brightness")):
+            return os.path.basename(path)
+    return None
+
+
+def read_brightness(name):
+    try:
+        with open(os.path.join(backlight_root(), name, "brightness")) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def set_brightness(name, raw):
+    result = run(brightnessctl_cmd() + ["-q", "-d", name, "set", str(raw)])
+    return result is not None and result.returncode == 0
+
+
+class Actions:
+    def __init__(self, conf, dry):
+        self.conf, self.dry = conf, dry
+        self.saved = None  # the backlight to go back to
+
+    def closed(self):
+        log("cover closed: " + ("dry run, doing nothing" if self.dry else "locking and turning the display off"))
+        if self.dry:
+            return
+        os.makedirs(runtime_dir(), exist_ok=True)
+        name = find_backlight(self.conf["backlight"])
+        raw = read_brightness(name) if name else None
+        # The flag holds ipad-als-brightness still, and remembers the backlight
+        # across a restart of this daemon.
+        with open(flag_path(), "w") as f:
+            f.write(f"{os.getpid()}\n{name or ''} {raw if raw is not None else ''}\n")
+        self.saved = (name, raw)
+        want_lock = self.conf["lock"] == "on" or (self.conf["lock"] == "auto" and has_password())
+        if want_lock:
+            subprocess.Popen(["bash", "-c", lock_command(self.conf)], env=hypr_env(), start_new_session=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            log("lock started")
+            time.sleep(0.5)  # the lock surface up before the screen goes
+        else:
+            log("not locking" + (": the user has no password, a lock could not be undone" if self.conf["lock"] == "auto" else ""))
+        hyprctl_dispatch('hl.dsp.dpms({ action = "disable" })')
+        if name:
+            set_brightness(name, 0)
+
+    def opened(self):
+        log("cover open: " + ("dry run, doing nothing" if self.dry else "display on"))
+        if self.dry:
+            return
+        saved = self.saved
+        if saved is None:
+            # A restart of the daemon with the cover closed before.
+            try:
+                with open(flag_path()) as f:
+                    lines = f.read().splitlines()
+                name, _, raw = (lines[1] if len(lines) > 1 else "").partition(" ")
+                saved = (name or None, int(raw) if raw else None)
+            except (OSError, ValueError):
+                saved = (find_backlight(self.conf["backlight"]), None)
+        name, raw = saved
+        if name:
+            if not raw:
+                # Never saw the brightness: half of the panel's range.
+                try:
+                    with open(os.path.join(backlight_root(), name, "max_brightness")) as f:
+                        raw = max(1, int(f.read().strip()) // 2)
+                except (OSError, ValueError):
+                    raw = None
+            if raw:
+                set_brightness(name, raw)
+        hyprctl_dispatch('hl.dsp.dpms({ action = "enable" })')
+        self.saved = None
+        try:
+            os.unlink(flag_path())
+        except OSError:
+            pass
+
+    def suspend(self):
+        log("cover closed: suspending (lid_suspend is on)")
+        if not self.dry:
+            run(shlex.split(os.environ.get("IPAD_LID_SLEEP", "ipad-sleep")))
+
+
+# --- the daemon --------------------------------------------------------------------------
+class Daemon:
+    def __init__(self, conf, source, dry):
+        self.conf, self.source, self.dry = conf, source, dry
+        self.actions = Actions(conf, dry)
+        self.lid = None  # True: closed
+        self.cover2 = None
+        self.applied = None  # the closed state the actions were last run for
+        self.changed_at = 0.0
+        self.closed_since = None
+        self.suspended = False
+        self.stop = False
+        self.events = 0
+
+    def closed_now(self):
+        if self.lid is None and self.cover2 is None:
+            return None
+        closed = bool(self.lid)
+        if self.conf["cover2"] == "closed" and self.cover2:
+            closed = True
+        return closed != self.conf["invert"]
+
+    def on_event(self, code, value, now):
+        value = bool(value)
+        if code == SW_LID:
+            if self.lid == value:
+                return
+            self.lid = value
+        else:
+            if self.cover2 == value:
+                return
+            self.cover2 = value
+        self.events += 1
+        self.changed_at = now
+        raw_name = "SW_LID" if code == SW_LID else "SW_MACHINE_COVER"
+        log(f"{raw_name} = {int(value)} -> cover {'closed' if self.closed_now() else 'open'}"
+            + (" (inverted)" if self.conf["invert"] else ""))
+        self.write_status()
+
+    def tick(self, now):
+        closed = self.closed_now()
+        if closed is None or now - self.changed_at < self.conf["settle"]:
+            return
+        if not switch_on("lid_actions", "actions", self.conf):
+            if self.applied is not None:
+                # Switched off with the screen blanked for the cover: put it back.
+                if self.applied:
+                    self.actions.opened()
+                self.applied = None
+                self.closed_since = None
+                self.write_status()
+            return
+        if closed != self.applied:
+            first = self.applied is None
+            self.applied = closed
+            self.suspended = False
+            self.closed_since = now if closed else None
+            if closed:
+                self.actions.closed()
+            elif not first or os.path.exists(flag_path()):
+                # Not at start-up with the cover open, unless a daemon before
+                # this one left the screen blanked.
+                self.actions.opened()
+            self.write_status()
+        if closed and self.closed_since is not None and not self.suspended \
+                and switch_on("lid_suspend", "suspend", self.conf) \
+                and now - self.closed_since >= self.conf["suspend_delay"]:
+            self.suspended = True
+            self.actions.suspend()
+
+    def write_status(self):
+        closed = self.closed_now()
+        data = {
+            "pid": os.getpid(),
+            "source": self.source.kind,
+            "lid": None if self.lid is None else int(self.lid),
+            "cover2": None if self.cover2 is None else int(self.cover2),
+            "cover": None if closed is None else ("closed" if closed else "open"),
+            "actions": switch_on("lid_actions", "actions", self.conf),
+            "suspend": switch_on("lid_suspend", "suspend", self.conf),
+            "events": self.events,
+            "time": time.time(),
+        }
+        tmp = status_path() + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, status_path())
+        except OSError:
+            pass
+
+    def run(self, seconds=None):
+        end = time.monotonic() + seconds if seconds else None
+        actions_on = switch_on("lid_actions", "actions", self.conf)
+        log(f"source {self.source.kind}; cover actions {'on' if actions_on else 'off (watching only)'}"
+            + (", dry run" if self.dry else "") + (", inverted" if self.conf["invert"] else ""))
+        self.write_status()
+        while not self.stop and (end is None or time.monotonic() < end):
+            for code, value in self.source.poll(TICK):
+                self.on_event(code, value, time.monotonic())
+            self.tick(time.monotonic())
+        self.source.close()
+        try:
+            os.unlink(status_path())
+        except OSError:
+            pass
+        # A daemon that stops with the cover closed must not leave the screen off.
+        if self.applied and not self.dry:
+            self.actions.opened()  # a stopped daemon must not leave the screen off
+
+
+# --- commands -------------------------------------------------------------------------------
+def running_pid():
+    try:
+        with open(status_path()) as f:
+            pid = json.load(f)["pid"]
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def cmd_switch(key, conf_key, label, action, conf):
+    now = switch_on(key, conf_key, conf)
+    want = (not now) if action == "toggle" else action == "on"
+    set_state(key, "on" if want else "off")
+    print(label, "on" if want else "off")
+    if want and not running_pid():
+        print("note: the daemon isn't running (no cover switch in this kernel, or not logged in yet)", file=sys.stderr)
+    return 0
+
+
+def cmd_status(conf):
+    pid = running_pid()
+    print("cover actions:", "on" if switch_on("lid_actions", "actions", conf) else "off",
+          "| suspend on close:", "on" if switch_on("lid_suspend", "suspend", conf) else "off",
+          "| daemon:", f"running (pid {pid})" if pid else "not running")
+    if pid:
+        try:
+            with open(status_path()) as f:
+                print(f.read())
+        except OSError:
+            pass
+    return 0 if pid else 1
+
+
+def cmd_list(conf):
+    devices = find_devices(conf["device"])
+    if not devices:
+        print("no input device reports SW_LID")
+        return 1
+    for name, node, codes in devices:
+        state = ""
+        try:
+            fd = os.open(node, os.O_RDONLY | os.O_NONBLOCK)
+            bits = eviocgsw(fd)
+            os.close(fd)
+            state = "  SW_LID=%d SW_MACHINE_COVER=%d" % (bits & 1, (bits >> SW_MACHINE_COVER) & 1)
+        except OSError as e:
+            state = f"  (cannot read it: {e})"
+        print(f"{node}  {name}{state}")
+    return 0
+
+
+def cmd_watch(conf, seconds):
+    devices = find_devices(conf["device"])
+    if not devices:
+        print("no input device reports SW_LID", file=sys.stderr)
+        return 1
+    source = EvdevSource(devices)
+    end = time.monotonic() + seconds
+    print(f"watching {', '.join(d[0] for d in devices)} for {seconds:.0f} s; open and close the cover")
+    t0 = time.monotonic()
+    while time.monotonic() < end:
+        for code, value in source.poll(0.2):
+            print("%7.2f s  %s = %d" % (time.monotonic() - t0, "SW_LID" if code == SW_LID else "SW_MACHINE_COVER", value), flush=True)
+    source.close()
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("command", nargs="?", default="daemon",
+                        choices=("daemon", "on", "off", "toggle", "suspend", "status"))
+    parser.add_argument("value", nargs="?", choices=("on", "off", "toggle"))
+    parser.add_argument("--mock")
+    parser.add_argument("--mock-evdev")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--list", action="store_true")
+    parser.add_argument("--available", action="store_true")
+    parser.add_argument("--watch", nargs="?", const=60, type=float)
+    parser.add_argument("-h", "--help", action="store_true")
+    args = parser.parse_args()
+    if args.help:
+        print(__doc__.strip("\n"))
+        return 0
+    conf = load_conf()
+    if args.available:
+        return 0 if has_lid(find_devices(conf["device"])) else 1
+    if args.list:
+        return cmd_list(conf)
+    if args.watch is not None:
+        return cmd_watch(conf, args.watch)
+    if args.command in ("on", "off", "toggle"):
+        return cmd_switch("lid_actions", "actions", "cover actions", args.command, conf)
+    if args.command == "suspend":
+        if not args.value:
+            parser.error("suspend needs on, off or toggle")
+        return cmd_switch("lid_suspend", "suspend", "suspend on cover close", args.value, conf)
+    if args.command == "status":
+        return cmd_status(conf)
+
+    if args.mock:
+        source = LineSource(args.mock)
+    elif args.mock_evdev:
+        source = PackedSource(args.mock_evdev)
+    else:
+        devices = find_devices(conf["device"])
+        if not has_lid(devices):
+            log("no input device reports SW_LID (the kernel has no cover switch); nothing to do")
+            return 0
+        log("watching", ", ".join(f"{d[0]} ({d[1]})" for d in devices))
+        source = EvdevSource(devices)
+    daemon = Daemon(conf, source, args.dry_run)
+
+    def stop(*_):
+        daemon.stop = True
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    daemon.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

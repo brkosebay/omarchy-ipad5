@@ -1,0 +1,131 @@
+From 946c7da17f16a80a8c69f2a5a2a99b6adacd4b1d Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 13:20:20 +0000
+Subject: [PATCH 31/43] arm64: dts: apple: s8003-j71t: Wi-Fi on PCIe port 1
+
+The BCM4355 C0 (USI module "FearA", 14e4:43dc) on port 1, all from the
+j71t live ADT:
+- REG_ON: uart2/wlan function-reg_on = D2365 PMU GPIO 14, as pwren-gpios
+  of port 1. The PMU GPIO node frees line 14 (13 stays Bluetooth's).
+- DEVICE_WAKE: pci-bridge1 function-device_wake = AP GPIO 67.
+- board type "apple,feara" from module-instance, antenna SKU "XX" (the
+  staged firmware's, also A10 J172's), for brcmfmac's Apple firmware
+  selection (brcmfmac4355-pcie.apple,feara-YSBC-u-4.1-XX.*).
+- wifi0 alias, so m1n1 fills local-mac-address (and brcm,cal-blob with
+  the matching m1n1 patch).
+- uart2, which hosts the ADT "wlan" node, enabled with its TX/RTS pins
+  (ADT function-tx/-rts, GPIO 192/194) in the UART function and its
+  power domain held, as Pauli1Go's A10 wlan-uart provider does.
+- CLKREQ# of port 1 (pci-bridge1 function-clkreq, AP GPIO 165) muxed to
+  its peripheral function through the PCIe node's default pinctrl
+  (function 1 by analogy with A10 J172; not verified on A9).
+- pcie0_dart1 enabled (iommu-map 0x200, bus 2), bus-range <2 2>.
+---
+ arch/arm64/boot/dts/apple/s8003-j71t.dts | 84 ++++++++++++++++++++++--
+ 1 file changed, 80 insertions(+), 4 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/apple/s8003-j71t.dts b/arch/arm64/boot/dts/apple/s8003-j71t.dts
+index 5a29cd51c8..c298ace046 100644
+--- a/arch/arm64/boot/dts/apple/s8003-j71t.dts
++++ b/arch/arm64/boot/dts/apple/s8003-j71t.dts
+@@ -15,6 +15,8 @@ / {
+ 
+ 	aliases {
+ 		nvme-hmb = &nvme_hmb; /* Used by loader */
++		serial2 = &wlan_uart;
++		wifi0 = &wifi0; /* m1n1: local-mac-address, brcm,cal-blob */
+ 	};
+ 
+ 	reserved-memory {
+@@ -38,10 +40,84 @@ &pcie0 {
+ };
+ 
+ /*
+- * The BCM4355 needs a power sequence (PMU-controlled VDD, wlan-uart
+- * provider) before its link can train; until that exists, leave port 1
+- * and its DART off.
++ * Wi-Fi: BCM4355 C0 (USI module "FearA"), 14e4:43dc, on port 1. From the
++ * j71t live ADT:
++ * - REG_ON: uart2/wlan function-reg_on = D2365 PMU GPIO 14
++ * - DEVICE_WAKE: pci-bridge1 function-device_wake = AP GPIO 67
++ * - PERST#: pci-bridge1 function-perst = AP GPIO 161 (s8003.dtsi)
++ * - board type: uart2/wlan module-instance "feara"
++ * The PCIe driver powers the chip and trains the link after probe (the
++ * port has pwren-gpios), then rescans; NVMe on port 0 doesn't wait for it.
+  */
++&{/soc/i2c@20a110000/pmic@3c} {
++	wlan_pmu_gpio: gpio {
++		compatible = "apple,d2365-pmic-gpio";
++		gpio-controller;
++		#gpio-cells = <2>;
++		/* 13: Bluetooth power enable, 14: WLAN REG_ON */
++		gpio-reserved-ranges = <0 13>, <15 9>;
++	};
++};
++
++&{/soc} {
++	/*
++	 * uart2 hosts the ADT's "wlan" (wlan-pcie-uart,bcm4355) node. Keep it
++	 * powered and in its UART pin function while Wi-Fi runs, as Pauli1Go's
++	 * A10 wlan-uart provider does (ADT function-tx = GPIO 192,
++	 * function-rts = GPIO 194). The serial driver does exactly that.
++	 */
++	wlan_uart: serial@20a0c8000 {
++		compatible = "apple,s5l-uart";
++		reg = <0x2 0x0a0c8000 0x0 0x4000>;
++		reg-io-width = <4>;
++		interrupt-parent = <&aic>;
++		interrupts = <AIC_IRQ 194 IRQ_TYPE_LEVEL_HIGH>;
++		clocks = <&clkref>, <&clkref>;
++		clock-names = "uart", "clk_uart_baud0";
++		power-domains = <&ps_uart2>;
++		pinctrl-0 = <&wlan_uart2_pins>;
++		pinctrl-names = "default";
++	};
++};
++
++&pinctrl_ap {
++	wlan_uart2_pins: wlan-uart2-pins {
++		pinmux = <APPLE_PINMUX(192, 1)>, <APPLE_PINMUX(194, 1)>;
++	};
++
++	/*
++	 * Port 1 CLKREQ# (pci-bridge1 function-clkreq, AP GPIO 165) in its
++	 * peripheral function: iBoot doesn't set it up for Wi-Fi on a tethered
++	 * boot. Function 1 by analogy with A10 J172 (pin 19) and the UART pins.
++	 */
++	wifi_clkreq_pins: wifi-clkreq-pins {
++		pinmux = <APPLE_PINMUX(165, 1)>;
++	};
++};
++
++&pcie0 {
++	pinctrl-0 = <&wifi_clkreq_pins>;
++	pinctrl-names = "default";
++};
++
++&pcie0_dart1 {
++	status = "okay";
++};
++
+ &pcie0_port1 {
+-	status = "disabled";
++	/* Linux numbers it after port 0's bus 1 */
++	bus-range = <2 2>;
++	pwren-gpios = <&wlan_pmu_gpio 14 GPIO_ACTIVE_HIGH>;
++	device-wake-gpios = <&pinctrl_ap 67 GPIO_ACTIVE_HIGH>;
++
++	wifi0: wifi@0,0 {
++		compatible = "pci14e4,43dc";
++		/* port 1's secondary bus is 2 (iommu-map 0x200 -> pcie0_dart1) */
++		reg = <0x20000 0x0 0x0 0x0 0x0>;
++		brcm,board-type = "apple,feara";
++		/* the staged firmware's antenna SKU (A10 J172 uses the same) */
++		apple,antenna-sku = "XX";
++		/* filled by m1n1 from the ADT */
++		local-mac-address = [00 00 00 00 00 00];
++	};
+ };
+-- 
+2.56.0
+

@@ -1,0 +1,5 @@
+  // linux-a9 (docs/boot/warm-reboot.md): Reboot stays in Linux (kexec);
+  // leaving for iOS takes a second, explicit step.
+  "system.reboot": {"label":"Reboot Linux (warm)","description":"kexec into /boot/linux-a9/default, no Mac needed"},
+  "system.ios": {"icon":"","label":"Reboot to iOS…","description":"Leaves Linux; coming back needs the Mac and a DFU boot"},
+  "system.ios.confirm": {"icon":"","label":"Yes, reboot to iOS (Mac + DFU to return)","action":"sudo -n /usr/local/bin/linux-a9-kexec ios --yes"},

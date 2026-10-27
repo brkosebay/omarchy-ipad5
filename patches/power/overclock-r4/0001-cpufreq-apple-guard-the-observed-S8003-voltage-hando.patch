@@ -1,0 +1,151 @@
+From 49c0339866d2ec2fae2d031b58212d28d0c53b52 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 09:23:40 +0000
+Subject: [PATCH] cpufreq: apple: guard the observed S8003 voltage handoff
+
+Cold-boot j71t reports voltage_ctl=0 and routes=1782. A write of 1 by m1n1 did not establish sticky readback semantics; requiring it rejects arm with EOPNOTSUPP before thermal validation. Require the exact observed pair at boot and at runtime, without changing voltage control or routing. Recheck under the transition lock and gate every experimental target. Report the handoff and control errno through format 3. Keep the fixed dual-rail +50 mV ceiling, thermal callbacks, heartbeat and stock fallback.
+---
+ drivers/cpufreq/apple-a9-tuning.h | 47 ++++++++++++++++++++++++-------
+ 1 file changed, 37 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/cpufreq/apple-a9-tuning.h b/drivers/cpufreq/apple-a9-tuning.h
+index a9faed9239..c022d6f383 100644
+--- a/drivers/cpufreq/apple-a9-tuning.h
++++ b/drivers/cpufreq/apple-a9-tuning.h
+@@ -32,6 +32,8 @@ struct a9_guard {
+ 	u64 stock1[16], stock2[16];
+ 	unsigned int limit, configured, dirty, delta_uv;
+ 	u32 trip_generation;
++	u32 voltage_ctl_boot, voltage_routes_boot;
++	int control_error;
+ 	unsigned long heartbeat;
+ 	bool armed, ready, latched;
+ 	bool thermal_qos_pending;
+@@ -41,6 +43,18 @@ struct a9_guard {
+ 
+ static struct a9_guard __rcu *a9_active_guard;
+ 
++/* The cold-boot j71t logs observe 0/1782, not a sticky copy of m1n1's
++ * write of 1. This is an exact observed-handoff allowlist, not a new hardware
++ * mode decoder. Preserve it; never program voltage control, DWI or the PMIC.
++ * Both the initial handoff and every live check must match. Unknown bits,
++ * routing changes and a changed handoff are refused even at delta zero.
++ */
++static bool a9_voltage_handoff_ok(struct a9_guard *g)
++{
++	return g->voltage_ctl_boot == 0 && g->voltage_routes_boot == 0x1782 &&
++		readl(g->voltage_base) == 0 && readl(g->voltage_base + 4) == 0x1782;
++}
++
+ static unsigned int a9_psinfo1_offset(unsigned int state)
+ {
+ 	return state < 8 ? 0x68 + state * 8 : 0x368 + (state - 8) * 8;
+@@ -217,7 +231,7 @@ static void a9_guard_work(struct work_struct *work)
+ 	ret = a9_temperatures(&hottest);
+ 	g->hottest = ret ? INT_MIN : hottest;
+ 	if (g->armed) {
+-		fault = readl(g->voltage_base) != 1 || readl(g->voltage_base + 4) != 0x1782 ?
++		fault = !a9_voltage_handoff_ok(g) ?
+ 			"voltage-mode" : a9_guard_fault(ret, hottest,
+ 			 time_after(jiffies, g->heartbeat + msecs_to_jiffies(A9_HEARTBEAT_MS)));
+ 		if (fault)
+@@ -270,10 +284,8 @@ static int a9_arm(struct a9_guard *g)
+ 
+ 	if (!a9_tuning || !g->ready)
+ 		return -EPERM;
+-	/* m1n1 selects automatic voltage mode=1; matching LLB sets routing=1782.
+-	 * Never compensate for a different handoff by programming DWI/PMIC here.
+-	 */
+-	if (readl(g->voltage_base) != 1 || readl(g->voltage_base + 4) != 0x1782)
++	/* Validate the observed cold-boot handoff, without mode/routing writes. */
++	if (!a9_voltage_handoff_ok(g))
+ 		return -EOPNOTSUPP;
+ 	ret = a9_check_stock(g);
+ 	if (ret)
+@@ -284,6 +296,10 @@ static int a9_arm(struct a9_guard *g)
+ 	if (g->dirty || g->revert_error || g->armed)
+ 		return -EBUSY;
+ 	raw_spin_lock_irqsave(&g->priv->lock, flags);
++	if (!a9_voltage_handoff_ok(g)) {
++		raw_spin_unlock_irqrestore(&g->priv->lock, flags);
++		return -EOPNOTSUPP;
++	}
+ 	if (generation != g->trip_generation) {
+ 		raw_spin_unlock_irqrestore(&g->priv->lock, flags);
+ 		return -EAGAIN;
+@@ -317,7 +333,7 @@ static int a9_configure(struct a9_guard *g, unsigned int khz, unsigned int delta
+ 	if (!a9_tuning || !g->armed ||
+ 	    time_after(jiffies, g->heartbeat + msecs_to_jiffies(A9_HEARTBEAT_MS)))
+ 		return -EPERM;
+-	if (readl(g->voltage_base) != 1 || readl(g->voltage_base + 4) != 0x1782)
++	if (!a9_voltage_handoff_ok(g))
+ 		return -EOPNOTSUPP;
+ 	ret = a9_temperatures(&hottest);
+ 	if (ret || hottest >= 75000)
+@@ -334,6 +350,10 @@ static int a9_configure(struct a9_guard *g, unsigned int khz, unsigned int delta
+ 		ret = -EPERM;
+ 		goto unlock;
+ 	}
++	if (!a9_voltage_handoff_ok(g)) {
++		ret = -EOPNOTSUPP;
++		goto unlock;
++	}
+ 	ret = a9_restore_locked(g);
+ 	if (ret)
+ 		goto unlock;
+@@ -373,16 +393,18 @@ static int a9_status_show(struct seq_file *s, void *unused)
+ 	unsigned int n;
+ 
+ 	mutex_lock(&g->control);
+-	seq_printf(s, "format=2 enable=%u armed=%u latched=%u reason=%s limit_khz=%u configured=%x dirty=%x revert_error=%d hottest_millic=%d heartbeat_ms=%u ceiling_delta_uv=%u voltage_writes=psinfo dac_step_uv=%u delta_uv=%u\n",
++	seq_printf(s, "format=3 enable=%u armed=%u latched=%u reason=%s limit_khz=%u configured=%x dirty=%x revert_error=%d hottest_millic=%d heartbeat_ms=%u ceiling_delta_uv=%u voltage_writes=psinfo dac_step_uv=%u delta_uv=%u\n",
+ 		   a9_tuning, g->armed, g->latched, g->reason, g->limit,
+ 		   g->configured, g->dirty, g->revert_error, g->hottest,
+ 		   jiffies_to_msecs(jiffies - g->heartbeat), A9_OVERVOLT_LIMIT_UV,
+ 		   A9_DAC_STEP_UV, g->delta_uv);
+-	seq_printf(s, "cmd=%016llx status=%08x actual_khz=%u voltage_ctl=%08x voltage_routes=%08x\n",
++	seq_printf(s, "cmd=%016llx status=%08x actual_khz=%u voltage_ctl=%08x voltage_routes=%08x voltage_ctl_boot=%08x voltage_routes_boot=%08x voltage_handoff_ok=%u handoff_policy=s8003-r4 control_error=%d\n",
+ 		   readq(g->priv->reg_base + APPLE_DVFS_CMD),
+ 		   readl(g->priv->reg_base + APPLE_DVFS_STATUS),
+ 		   apple_soc_cpufreq_get_rate(g->policy->cpu),
+-		   readl(g->voltage_base), readl(g->voltage_base + 4));
++		   readl(g->voltage_base), readl(g->voltage_base + 4),
++		   g->voltage_ctl_boot, g->voltage_routes_boot,
++		   a9_voltage_handoff_ok(g), g->control_error);
+ 	for (n = 1; n < 16; n++) {
+ 		u64 live1 = readq(g->priv->reg_base + a9_psinfo1_offset(n));
+ 		u64 live2 = readq(g->priv->reg_base + 0x868 + n * 8);
+@@ -433,9 +455,12 @@ static ssize_t a9_control_write(struct file *file, const char __user *buffer,
+ 			WRITE_ONCE(g->heartbeat, jiffies);
+ 	} else if (sscanf(command, "configure %u %u %c", &khz, &delta, &tail) == 2) {
+ 		ret = a9_configure(g, khz, delta);
++		if (ret && (g->armed || g->dirty))
++			a9_revert(g, "configure-error");
+ 	} else {
+ 		ret = -EINVAL;
+ 	}
++	g->control_error = ret;
+ 	mutex_unlock(&g->control);
+ 	return ret ? ret : count;
+ }
+@@ -463,6 +488,8 @@ static int a9_guard_init(struct cpufreq_policy *policy)
+ 		kfree(g);
+ 		return -ENOMEM;
+ 	}
++	g->voltage_ctl_boot = readl(g->voltage_base);
++	g->voltage_routes_boot = readl(g->voltage_base + 4);
+ 	g->priv = priv;
+ 	g->policy = policy;
+ 	g->limit = A9_STOCK_KHZ;
+@@ -527,7 +554,7 @@ static bool a9_target_allowed(struct apple_cpu_priv *priv, unsigned int state,
+ 		return false;
+ 	if (state > 8 && !(g->configured & BIT(state)))
+ 		return false;
+-	return state <= 7 || (g->armed && a9_tuning &&
++	return state <= 7 || (g->armed && a9_tuning && a9_voltage_handoff_ok(g) &&
+ 		!time_after(jiffies, READ_ONCE(g->heartbeat) + msecs_to_jiffies(A9_HEARTBEAT_MS)));
+ }
+ #else
+-- 
+2.56.0
+

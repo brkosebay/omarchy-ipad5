@@ -1,0 +1,484 @@
+#!/bin/busybox sh
+# linux-a9 root initramfs for Omarchy on the iPad 5: NBD root from the Mac,
+# or the ext4 root on the iPad's own NVMe (docs/nvme-install/DESIGN.md).
+#
+# USB gadget (ECM or NCM, + ACM, one enumeration) -> 172.16.42.1/24 on usb0 with a
+# DHCP server handing the Mac 172.16.42.2 -> nbd-client to the Mac's NBD
+# server -> mount /dev/nbd0 -> switch_root into systemd. With omarchy.root=nvme
+# the root is the NVMe partition instead, and NBD is the fallback.
+#
+# Any failure lands in a rescue shell (USB serial /dev/cu.usbmodem* on the
+# Mac, and telnet 172.16.42.1), never in a panic. From that shell,
+# `touch /run/omarchy-continue` makes this init try the boot again, and
+# `touch /run/omarchy-hold` (during the NBD wait) stops before switch_root.
+#
+# Kernel command line (all optional):
+#   omarchy.nbd=HOST:PORT/EXPORT  NBD server   [172.16.42.2:10809/omarchy]
+#   omarchy.wait=SECONDS          how long to wait for it   [600]
+#   omarchy.rescue                stop in the rescue shell, no NBD
+#   omarchy.init=PATH             init in the new root   [/usr/lib/systemd/systemd]
+#   omarchy.usbnet=ecm|ncm        USB network function   [ecm]: NCM's aggregated
+#                                 transfers stalled the NBD root against macOS
+#                                 (device boots 1 and 2); ECM sends one frame each
+#   omarchy.ip=IF:ADDR/LEN:GW     also put ADDR on IF with a default route via
+#                                 GW, to reach an NBD server off the USB link
+#                                 (QEMU tests: eth0:192.0.2.15/24:192.0.2.2)
+#   omarchy.root=nbd|nvme         where the root is   [nbd]
+#   omarchy.nvme=DEV|window       NVMe root partition   [window: the partition
+#                                 that is exactly nvme.write_window]
+#   omarchy.label=LABEL           its ext4 label must be this   [omarchy-nvme]
+#   omarchy.nvme_wait=SECONDS     how long to wait for DEV   [60]
+#   omarchy.fallback=nbd|rescue   if the NVMe root can't be used   [nbd]
+#   omarchy.netconsole_wait=SECS  NVMe root: wait for the Mac before netconsole [10]
+#
+# An NVMe root partition must be exactly nvme.write_window (the kernel's only
+# writable LBA range, docs/nvme-install/DESIGN.md), or it isn't used. Device
+# names aren't trusted: nvmeXnY follows the scan order, not the NSID.
+#
+# Gadget and logging helpers are HoolockRD's own (init_functions.sh, GPLv3,
+# github.com/HoolockLinux/HoolockRD), sourced unchanged.
+
+# init_functions.sh expects its variables exported (as HoolockRD's init does).
+set -a
+LOG_PREFIX="[omarchy-rd]"
+. /init_functions.sh
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+/bin/busybox --install -s
+/bin/busybox-extras --install -s
+# Upstream nbd-client (scripts/omarchy/build-nbd-client.sh), always by full
+# path: BusyBox's own nbd-client applet (ioctl only, no -l/-N) lands in
+# /usr/sbin, ahead of /sbin in PATH.
+NBD_CLIENT=/sbin/nbd-client
+
+nbd_server=172.16.42.2
+nbd_port=10809
+nbd_export=omarchy
+nbd_wait=600
+new_init=/usr/lib/systemd/systemd
+want_rescue=0
+CLIENT_IP=172.16.42.2
+shell_pids=""
+dhcp_pid=""
+usb_if=""
+extra_ip=""
+extra_addr=""
+usbnet=ecm
+root_mode=nbd
+nvme_dev=window
+nvme_root=""
+nvme_label=omarchy-nvme
+nvme_wait=60
+fallback=nbd
+netconsole_wait=10
+try_nvme=0
+root_dev=""
+
+parse_cmdline() {
+  local arg v rest
+  for arg in $(cat /proc/cmdline); do
+    case "$arg" in
+      omarchy.nbd=*)
+        v=${arg#*=}
+        nbd_server=${v%%:*}
+        rest=${v#*:}
+        nbd_port=${rest%%/*}
+        nbd_export=${rest#*/}
+        ;;
+      omarchy.wait=*) nbd_wait=${arg#*=} ;;
+      omarchy.rescue | omarchy.rescue=1) want_rescue=1 ;;
+      omarchy.init=*) new_init=${arg#*=} ;;
+      omarchy.ip=*) extra_ip=${arg#*=} ;;
+      omarchy.usbnet=*) usbnet=${arg#*=} ;;
+      omarchy.root=*) root_mode=${arg#*=} ;;
+      omarchy.nvme=*) nvme_dev=${arg#*=} ;;
+      omarchy.label=*) nvme_label=${arg#*=} ;;
+      omarchy.nvme_wait=*) nvme_wait=${arg#*=} ;;
+      omarchy.fallback=*) fallback=${arg#*=} ;;
+      omarchy.netconsole_wait=*) netconsole_wait=${arg#*=} ;;
+    esac
+  done
+  [ "$root_mode" = nvme ] && try_nvme=1
+}
+
+# omarchy.ip=IF:ADDR/LEN:GW
+setup_extra_ip() {
+  local ifc addr gw
+  [ -n "$extra_ip" ] || return 0
+  ifc=${extra_ip%%:*}
+  addr=${extra_ip#*:}
+  gw=${addr#*:}
+  addr=${addr%%:*}
+  ip link set "$ifc" up && ip addr add "$addr" dev "$ifc" && ip route add default via "$gw" dev "$ifc" &&
+    echo "Extra network: $ifc $addr via $gw" && extra_addr=${addr%/*}
+}
+
+# HoolockRD's gadget with the omarchy.usbnet function (RNDIS fallback), plus the ACM serial function before
+# the first bind, so the Mac enumerates once and the serial console exists
+# from the start. Stable MAC addresses (from the device serial number) keep
+# the Mac's view of the link the same across boots.
+setup_gadget() {
+  local i=0 g fn h mac
+  while [ -z "$(ls /sys/class/udc 2>/dev/null)" ] && [ $i -lt 50 ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  setup_usb_network_configfs skip-udc
+  g=$CONFIGFS/g1
+  [ -d "$g" ] || return 1
+  # HoolockRD's helper always makes ncm.usb0: swap in omarchy.usbnet while
+  # the UDC is still unbound.
+  if [ "$usbnet" != ncm ] && [ -d "$g/functions/ncm.usb0" ] &&
+    mkdir "$g/functions/$usbnet.usb0" 2>/dev/null; then
+    rm -f "$g/configs/c.1/ncm.usb0"
+    rmdir "$g/functions/ncm.usb0"
+    ln -s "$g/functions/$usbnet.usb0" "$g/configs/c.1/"
+  elif [ "$usbnet" != ncm ]; then
+    echo "  Couldn't create $usbnet.usb0, keeping NCM"
+    usbnet=ncm
+  fi
+  echo "Omarchy on iPad (linux-a9)" >"$g/strings/0x409/product"
+  fn=$(ls -d "$g/functions/$usbnet.usb0" "$g"/functions/rndis.usb0 2>/dev/null | head -1)
+  echo "USB network function: ${fn##*/}"
+  h=$(printf 'linux-a9-%s' "$(cat /proc/device-tree/serial-number 2>/dev/null)" | md5sum | cut -c1-10)
+  mac=$(echo "$h" | sed 's/\(..\)/\1:/g; s/:$//')
+  if [ -n "$fn" ]; then
+    # u_ether refuses address writes (EBUSY) while the function is linked into
+    # a config, and HoolockRD's helper has already linked it: unlink, set,
+    # relink. The UDC isn't bound yet, so the host sees none of this.
+    rm -f "$g/configs/c.1/${fn##*/}"
+    echo "02:$mac" >"$fn/dev_addr" || echo "  Couldn't set dev_addr"
+    echo "06:$mac" >"$fn/host_addr" || echo "  Couldn't set host_addr"
+    ln -s "$fn" "$g/configs/c.1/" || echo "  Couldn't relink ${fn##*/}"
+  fi
+  mkdir "$g/functions/$CONFIGFS_ACM_FUNCTION" &&
+    ln -s "$g/functions/$CONFIGFS_ACM_FUNCTION" "$g/configs/c.1" ||
+    echo "  Couldn't add the ACM serial function"
+  setup_usb_configfs_udc
+}
+
+# 172.16.42.1/24 on usb0 (the address the rootfs keeps) and the DHCP server
+# that gives the Mac 172.16.42.2.
+setup_network() {
+  local g=$CONFIGFS/g1 i=0
+  # musl's getaddrinfo (AI_ADDRCONFIG) treats IPv4 as absent unless it can
+  # connect a UDP socket to 127.0.0.1: without lo, nbd-client segfaults.
+  ip link set lo up
+  while [ $i -lt 50 ]; do
+    usb_if=$(cat "$g/functions/$usbnet.usb0/ifname" "$g/functions/rndis.usb0/ifname" 2>/dev/null | grep -v unnamed | head -1)
+    [ -n "$usb_if" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if [ -z "$usb_if" ]; then
+    echo "No USB network interface; interfaces:"
+    ip link
+    return 1
+  fi
+  ip link set "$usb_if" up
+  ip addr add "$HOST_IP/24" dev "$usb_if"
+  echo "USB network: $usb_if $HOST_IP/24, DHCP for the Mac: $CLIENT_IP"
+  unudhcpd -i "$usb_if" -s "$HOST_IP" -c "$CLIENT_IP" &
+  dhcp_pid=$!
+}
+
+# Charge7+ derives the source and board ceiling in the kernel. Keep the call
+# for older initramfs consumers without manufacturing a per-attach user cap.
+charger_limit() { :; }
+
+# Root shells for the whole initramfs phase: USB serial and telnet.
+start_shells() {
+  cat <<-EOF >/README
+
+	linux-a9 Omarchy NBD-root initramfs
+
+	Log: /HL_init.log (also in dmesg)
+	Root: omarchy.root=$root_mode (NVMe: $nvme_dev, label $nvme_label)
+	NBD client: /sbin/nbd-client (plain nbd-client is BusyBox's applet)
+	Retry the boot:            touch /run/omarchy-continue
+	Stop before switch_root:   touch /run/omarchy-hold
+
+	EOF
+  cat <<-EOF >/sbin/pmos_getty
+	#!/bin/sh
+	cat /README
+	exec /bin/sh -l
+	EOF
+  chmod +x /sbin/pmos_getty
+  if [ -e /dev/ttyGS0 ]; then
+    run_getty ttyGS0
+    shell_pids="$shell_pids $!"
+  fi
+  telnetd -F -b "${HOST_IP}:23" -l /sbin/pmos_getty &
+  shell_pids="$shell_pids $!"
+  # The test network (omarchy.ip=) gets a rescue shell too: QEMU forwards to it.
+  if [ -n "$extra_addr" ]; then
+    telnetd -F -b "${extra_addr}:23" -l /sbin/pmos_getty &
+    shell_pids="$shell_pids $!"
+  fi
+}
+
+stop_shells() {
+  [ -n "$shell_pids" ] && kill $shell_pids 2>/dev/null
+  killall getty telnetd 2>/dev/null
+  shell_pids=""
+}
+
+rescue() {
+  echo "#################### RESCUE: $* ####################"
+  echo "Shell: USB serial (/dev/cu.usbmodem* on the Mac) or telnet $HOST_IP"
+  echo "Retry with: touch /run/omarchy-continue"
+  rm -f /run/omarchy-continue
+  while [ ! -e /run/omarchy-continue ]; do
+    sleep 2
+  done
+  rm -f /run/omarchy-continue /run/omarchy-hold
+  echo "Retrying the boot"
+  [ "$root_mode" = nvme ] && try_nvme=1
+}
+
+# The kernel owns the socket after a netlink connect, so nothing is left to
+# kill at shutdown; ioctl mode (-L) is the fallback, marked for systemd (-m)
+# and reconnecting (-p). No I/O timeout: a slow Mac stalls I/O, never fails it.
+nbd_size() { cat /sys/block/nbd0/size 2>/dev/null || echo 0; }
+
+# Kernel log to the Mac over UDP (scripts/omarchy/netconsole.py listens on
+# port 6666). Unlike journald or sshd, it keeps working when the NBD root
+# stalls, and it survives switch_root.
+start_netconsole() {
+  local t=/config/netconsole/mac mac
+  [ -d /config/netconsole ] || { echo "netconsole: not in this kernel"; return 0; }
+  [ -d "$t" ] && return 0
+  ping -c 1 -W 1 "$nbd_server" >/dev/null 2>&1
+  mac=$(ip neigh show "$nbd_server" | awk '/lladdr/ { print $5; exit }')
+  [ -n "$mac" ] || { echo "netconsole: no MAC for $nbd_server"; return 0; }
+  mkdir "$t" &&
+    echo "$usb_if" >"$t/dev_name" &&
+    echo "$HOST_IP" >"$t/local_ip" &&
+    echo "$nbd_server" >"$t/remote_ip" &&
+    echo "$mac" >"$t/remote_mac" &&
+    echo 6666 >"$t/remote_port" &&
+    echo 1 >"$t/enabled" &&
+    echo "netconsole: kernel log -> $nbd_server:6666 ($mac)"
+}
+
+connect_nbd() {
+  local start now
+  [ "$(nbd_size)" -gt 0 ] && return 0
+  echo "Waiting up to ${nbd_wait}s for NBD $nbd_server:$nbd_port export '$nbd_export'"
+  echo "(on the Mac: scripts/omarchy/serve-root.sh)"
+  start=$(get_uptime_seconds)
+  while :; do
+    if $NBD_CLIENT -l "$nbd_server" "$nbd_port" >/dev/null 2>&1; then
+      $NBD_CLIENT -N "$nbd_export" -b 4096 "$nbd_server" "$nbd_port" /dev/nbd0 ||
+        $NBD_CLIENT -N "$nbd_export" -b 4096 -L -p -m "$nbd_server" "$nbd_port" /dev/nbd0
+      if [ "$(nbd_size)" -gt 0 ]; then
+        echo "NBD connected: /dev/nbd0 $(($(nbd_size) / 2097152)) GiB"
+        echo 1024 >/sys/block/nbd0/queue/read_ahead_kb 2>/dev/null
+        start_netconsole
+        return 0
+      fi
+      echo "NBD server answered but the connect failed"
+    fi
+    [ -e /run/omarchy-hold ] && return 1
+    now=$(get_uptime_seconds)
+    if [ $((now - start)) -ge "$nbd_wait" ]; then
+      echo "No NBD server after ${nbd_wait}s"
+      return 1
+    fi
+    sleep 3
+  done
+}
+
+mount_root() {
+  local dev=$1
+  mkdir -p /newroot
+  mountpoint -q /newroot && return 0
+  mount -t ext4 -o rw,noatime "$dev" /newroot || return 1
+  if [ ! -x "/newroot$new_init" ]; then
+    echo "/newroot$new_init is missing"
+    umount /newroot
+    return 1
+  fi
+  root_dev=$dev
+}
+
+# The ext4 label of $1, from its superblock (magic 0xEF53 at byte 1080, label
+# at 1144); fails if there is no ext4 superblock.
+ext4_label() {
+  [ "$(dd if="$1" bs=1 skip=1080 count=2 2>/dev/null | od -An -tx1 | tr -d ' \n')" = 53ef ] ||
+    return 1
+  dd if="$1" bs=1 skip=1144 count=16 2>/dev/null | tr -d '\000'
+}
+
+# nvme.write_window=NSID:FIRST-LAST (in LBAs) is the kernel's only writable
+# NVMe range. window_match NAME succeeds if partition NAME (e.g. nvme0n1p2)
+# is exactly that range on that namespace. The NSID comes from sysfs:
+# nvmeXnY numbering follows the scan order, not the NSID.
+window_match() {
+  local name=$1 disk=${1%p*} ww nsid first last lbs start size
+  ww=$(cat /sys/module/nvme/parameters/write_window 2>/dev/null)
+  [ -n "$ww" ] || return 1
+  nsid=$(cat "/sys/block/$disk/nsid" 2>/dev/null) || return 1
+  first=${ww#*:}
+  last=${first#*-}
+  first=${first%-*}
+  lbs=$(cat "/sys/block/$disk/queue/logical_block_size")
+  start=$(cat "/sys/class/block/$name/start")
+  size=$(cat "/sys/class/block/$name/size")
+  [ "${ww%%:*}" = "$nsid" ] && [ $((start * 512 % lbs)) = 0 ] &&
+    [ $((start * 512 / lbs)) = "$first" ] && [ $(((start + size) * 512 / lbs - 1)) = "$last" ]
+}
+
+# omarchy.nvme=window: the partition that is exactly the write window
+window_partition() {
+  local p
+  for p in /sys/class/block/nvme*n*p*; do
+    [ -e "$p/partition" ] && window_match "${p##*/}" && echo "/dev/${p##*/}" && return 0
+  done
+  return 1
+}
+
+# Is the write window's namespace there yet (partitions appear right after)?
+window_disk_present() {
+  local b nsid
+  nsid=$(cat /sys/module/nvme/parameters/write_window 2>/dev/null)
+  for b in /sys/block/nvme*n*; do
+    [ "$(cat "$b/nsid" 2>/dev/null)" = "${nsid%%:*}" ] && return 0
+  done
+  return 1
+}
+
+# The NVMe root partition: present (the controller comes up in the
+# background), exactly the write window (else it is read-only, or the bootarg
+# is stale), and ext4 with the expected label. Sets nvme_root.
+connect_nvme() {
+  local start now label seen=""
+  nvme_root=""
+  if [ -z "$(cat /sys/module/nvme/parameters/write_window 2>/dev/null)" ]; then
+    echo "omarchy.root=nvme: no nvme.write_window on the kernel command line, so the NVMe disk is read-only"
+    return 1
+  fi
+  echo "Waiting up to ${nvme_wait}s for the NVMe root ($nvme_dev, write window $(cat /sys/module/nvme/parameters/write_window))"
+  start=$(get_uptime_seconds)
+  while :; do
+    if [ "$nvme_dev" = window ]; then
+      nvme_root=$(window_partition) && break
+    elif [ -b "$nvme_dev" ]; then
+      nvme_root=$nvme_dev
+      break
+    fi
+    [ -e /run/omarchy-hold ] && return 1
+    now=$(get_uptime_seconds)
+    # The namespace is up but no partition matches: don't wait it out
+    if [ "$nvme_dev" = window ] && window_disk_present; then
+      [ -n "$seen" ] || seen=$now
+      if [ $((now - seen)) -ge 3 ]; then
+        echo "No NVMe partition is exactly the write window $(cat /sys/module/nvme/parameters/write_window) (stale nvme.write_window?)"
+        return 1
+      fi
+    fi
+    if [ $((now - start)) -ge "$nvme_wait" ]; then
+      echo "No NVMe root ($nvme_dev) after ${nvme_wait}s"
+      return 1
+    fi
+    sleep 1
+  done
+  if ! window_match "${nvme_root#/dev/}"; then
+    echo "$nvme_root is not the write window $(cat /sys/module/nvme/parameters/write_window), so it is read-only"
+    return 1
+  fi
+  echo "$nvme_root is the write window $(cat /sys/module/nvme/parameters/write_window)"
+  if ! label=$(ext4_label "$nvme_root"); then
+    echo "$nvme_root has no ext4 superblock"
+    return 1
+  fi
+  if [ "$label" != "$nvme_label" ]; then
+    echo "$nvme_root is labelled '$label', expected '$nvme_label'"
+    return 1
+  fi
+}
+
+nvme_fallback() {
+  if [ "$fallback" = rescue ]; then
+    rescue "$*"
+  else
+    echo "$*: falling back to the NBD root"
+    try_nvme=0
+  fi
+}
+
+# With a local root nothing has talked to the Mac yet: give its DHCP lease a
+# few seconds so netconsole can find it, then go on regardless.
+netconsole_local_root() {
+  local i=0
+  while [ $i -lt "$netconsole_wait" ]; do
+    ping -c 1 -W 1 "$nbd_server" >/dev/null 2>&1 && break
+    i=$((i + 1))
+  done
+  start_netconsole
+}
+
+boot_root() {
+  local d
+  # Everything that can fail is checked first: from the first mount --move
+  # on, there is no way back, and switch_root replaces PID 1.
+  for d in proc sys dev run; do
+    [ -d "/newroot/$d" ] || { echo "/newroot/$d is missing"; return 1; }
+  done
+  echo "Switching to $new_init on $root_dev"
+  stop_shells
+  [ -n "$dhcp_pid" ] && kill "$dhcp_pid" 2>/dev/null
+  # Undo setup_log: give the console back, stop the log helpers. A failed
+  # redirection on exec would end PID 1, so only use fds that are open.
+  echo ratelimit >/proc/sys/kernel/printk_devkmsg
+  if [ -e /proc/$$/fd/3 ] && [ -e /proc/$$/fd/4 ]; then
+    exec 1>&3 2>&4 3>&- 4>&-
+  else
+    exec >/dev/console 2>&1
+  fi
+  exec </dev/console
+  killall tee logger syslogd 2>/dev/null
+  mount --move /proc /newroot/proc
+  mount --move /sys /newroot/sys
+  mount --move /config /newroot/sys/kernel/config 2>/dev/null
+  mount --move /dev /newroot/dev
+  mount --move /run /newroot/run
+  exec switch_root /newroot "$new_init"
+}
+
+mount_proc_sys_dev
+setup_log
+parse_cmdline
+setup_gadget || echo "USB gadget setup failed"
+setup_network || echo "USB network setup failed"
+setup_extra_ip || echo "omarchy.ip=$extra_ip failed"
+charger_limit
+start_shells
+
+[ "$want_rescue" = 1 ] && rescue "omarchy.rescue on the kernel command line"
+while :; do
+  if [ -e /run/omarchy-hold ]; then
+    rescue "held by /run/omarchy-hold"
+  elif [ "$try_nvme" = 1 ]; then
+    if ! connect_nvme; then
+      nvme_fallback "no usable NVMe root"
+    elif ! mount_root "$nvme_root"; then
+      nvme_fallback "could not mount $nvme_root"
+    elif [ -e /run/omarchy-hold ]; then
+      rescue "held by /run/omarchy-hold"
+    else
+      netconsole_local_root
+      boot_root
+      rescue "switch_root failed"
+    fi
+  elif ! connect_nbd; then
+    rescue "no NBD root"
+  elif ! mount_root /dev/nbd0; then
+    rescue "could not mount /dev/nbd0"
+  elif [ -e /run/omarchy-hold ]; then
+    rescue "held by /run/omarchy-hold"
+  else
+    boot_root
+    rescue "switch_root failed"
+  fi
+done

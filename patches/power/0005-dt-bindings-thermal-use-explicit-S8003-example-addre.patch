@@ -1,0 +1,37 @@
+From ef949de95bf54c8a47703ee0172d78c66e36de21 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 23:20:43 +0000
+Subject: [PATCH 5/7] dt-bindings: thermal: use explicit S8003 example address
+ cells
+
+---
+ .../bindings/thermal/apple,s8003-thermal.yaml     | 15 ++++++++++-----
+ 1 file changed, 10 insertions(+), 5 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/thermal/apple,s8003-thermal.yaml b/Documentation/devicetree/bindings/thermal/apple,s8003-thermal.yaml
+index dcc4caaadf..25ae893b28 100644
+--- a/Documentation/devicetree/bindings/thermal/apple,s8003-thermal.yaml
++++ b/Documentation/devicetree/bindings/thermal/apple,s8003-thermal.yaml
+@@ -40,9 +40,14 @@ additionalProperties: false
+ 
+ examples:
+   - |
+-    thermal-sensor@20e0c0000 {
+-        compatible = "apple,s8003-thermal";
+-        reg = <0x2 0x0e0c0000 0x1000>, <0x2 0x02230000 0x1000>;
+-        reg-names = "soc", "tcc";
+-        #thermal-sensor-cells = <1>;
++    / {
++        #address-cells = <2>;
++        #size-cells = <2>;
++        thermal-sensor@20e0c0000 {
++            compatible = "apple,s8003-thermal";
++            reg = <0x2 0x0e0c0000 0x0 0x1000>,
++                  <0x2 0x02230000 0x0 0x1000>;
++            reg-names = "soc", "tcc";
++            #thermal-sensor-cells = <1>;
++        };
+     };
+-- 
+2.56.0
+

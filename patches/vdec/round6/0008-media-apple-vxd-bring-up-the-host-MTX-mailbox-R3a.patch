@@ -1,0 +1,1703 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 10:03:22 +0000
+Subject: [PATCH 08/20] media: apple: vxd: bring up the host<->MTX mailbox (R3a)
+
+Implements docs/periph/ds-vxd-decode-protocol.md sections 2, 3 and 6,
+plus what the DEVA firmware disassembly adds to them.  Every step follows
+AppleD5500's order.
+
+Ring geometry.  0x2024 (TO_MTX) and 0x2018 (TO_HOST) are not firmware
+build halves.  They are the ring geometry the firmware publishes with
+the 0xa5a5a5a5 magic, as (base_bytes << 16) | capacity_words, and word
+i of a ring is the register at 0x2000 + base + 4 * i.  The boot reads
+them once and refuses a geometry that leaves the MMIO window, overlaps
+the other ring, or cannot hold a maximum-size message.
+
+Push (0xfffffff0062990bc).  Write the words, then 0x2030 = wr, then the
+flush reads of 0x2028/0x2030/0x201c/0x2020, then the doorbell 0x88 = 1,
+then a flush read of 0x2000.  The free-slot count uses Apple's formula,
+rd + ~wr (+ cap), which is one word less than rounds 1-3 computed.  The
+capacity comes from the geometry, not a constant.  Indices outside the
+capacity, lengths of 0 or above the firmware's 0x14 words, and a ring
+still full after 100 ms are errors.
+
+Init message.  After the magic the boot sends the mandatory 0x80
+message: {0x8005, firmware device address, (u8)seq << 16 | image pages,
+0xffff0000, 0}.  The page count is taken from the blob size (0x17 for
+the 0x17e98-byte image), not from the page-aligned allocation.  The
+firmware never replies to 0x80.  Its reader publishes the new
+TO_MTX_RD (0x2028) before it dispatches (fw 0x1000a9c), so the boot
+waits up to 100 ms for 0x2028 to pass the message.  Only then is
+hw_ready set and IRQ 157 enabled.  If the firmware is up but never takes
+the message, the image and PM reference are kept so the debugfs dumps
+and the ping can be used to diagnose it, and the boot returns the error.
+
+IRQ (0xfffffff00629a0ac).  The handler reads 0x410.  If bit 20 is clear
+it returns IRQ_NONE.  Otherwise it writes 0x414 = 0x100000 before it
+drains, then drains TO_HOST (host rd 0x201c, fw wr 0x2020), up to the
+kext's 0x70-message bound, under a spinlock.  The dispatch follows
+ProcessFWMessages:
+- 0xc0 completion: the fence is in w0[31:16], the status in w2; the
+  fault class (0x18000000), "after core reset" and REATTEMPT_SINGLEPIPE
+  are logged.
+- 0xc6 contiguity warning.
+- 0xc7 FW_DEVA_PANIC: fails every pending fence and turns decode off.
+- 0xd1-0xd4 and 0xe1-0xe4 are dropped silently.
+- Any other type is counted as unknown.
+An oversized or out-of-range message resyncs the read index instead of
+pinning the ring.  The firmware raises bit 20 only after it has posted a
+message, so 1000 interrupts in a row with nothing to drain mean that
+0x414 does not clear the level line.  The handler then disables the IRQ
+with an error instead of livelocking the CPU; the hand drain (ping)
+keeps working.  The rename of 0x410/0x414/0x418 from "CMD descriptor
+addr/size/status" to IRQ status/clear/enable makes the known-state
+epilogues read as what they are: IRQ off and all pending causes cleared.
+
+Fences.  Eight slots, ids built as Apple does:
+(submission << 4) | (packet * 2 & 0xe) | core.  The 12-bit counter
+skips 0, which is the init message's fence.  A slot is armed before the
+push, signalled from the drain, and failed on panic or teardown.
+
+Ping.  `echo [0x83|0x84|0x85|0x80] > /sys/kernel/debug/apple-vxd/ping`
+pushes one message, waits up to 100 ms for 0x2028 to pass it, drains
+TO_HOST by hand (Apple's timeout path calls ProcessInterrupt manually),
+then gives a fence completion 20 ms.  The DEVA dispatcher sends
+0x83-0x85 straight back to its reader loop (jump table at fw 0x1000ad4),
+so "consumed, no completion" is the expected answer.  0x80 re-sends the
+init message, as Apple's recovery path does.  An empty write sends 0x83.
+Every step is a flushed STEP line, and the shell sees the errno.
+
+Debugfs mbox now decodes the geometry, both index pairs with the free
+count, the consumed word (0x0), the firmware PC (0x200c), the message
+counter (0x2010), IRQ status/enable, the state flags, the counters,
+the live fences, and the first 64 words of each ring.
+
+A protocol self-test runs at probe, before debugfs exists, and touches
+no MMIO.  It checks the free-slot formula, ring wrap, the consumption
+check, header packing, the init message and the GART entry arithmetic.
+If it fails, the firmware boot is refused.
+
+Decode jobs still fail: apple_vxd_submit() now says the mailbox is up
+and the command-stream generator (R3c) is missing.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ drivers/media/platform/apple/vxd/apple-vxd-core.c |  37 +-
+ drivers/media/platform/apple/vxd/apple-vxd-fw.c   |  60 +-
+ drivers/media/platform/apple/vxd/apple-vxd-h264.c |  19 +-
+ drivers/media/platform/apple/vxd/apple-vxd-mbox.c | 930 +++++++++++++++++++++-
+ drivers/media/platform/apple/vxd/apple-vxd-regs.h | 102 ++-
+ drivers/media/platform/apple/vxd/apple-vxd-v4l2.c |   4 +-
+ drivers/media/platform/apple/vxd/apple-vxd.h      | 124 ++-
+ 7 files changed, 1166 insertions(+), 110 deletions(-)
+
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-core.c b/drivers/media/platform/apple/vxd/apple-vxd-core.c
+index 95f5233448ff19d995eb176ffb8d1823f475daed..57a62924af32465da19497d7efa1bee76cd5a1a9 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-core.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-core.c
+@@ -110,21 +110,6 @@ void vxd_step_io(const struct device *dev, const char *fmt, ...)
+ 	va_end(args);
+ }
+ 
+-/*
+- * IRQ handling is deferred to R2: the line is level-triggered through the
+- * AIC and only deasserts once the TO_HOST ring is drained, which needs the
+- * message ABI.  The interrupt is requested here (rung R0 asks exactly for
+- * that) but kept disabled; nothing should raise it until firmware runs.
+- */
+-irqreturn_t apple_vxd_irq(int irq, void *data)
+-{
+-	struct apple_vxd_dev *vxd = data;
+-
+-	WARN_ON_ONCE(1);
+-	dev_warn_ratelimited(vxd->dev, "unexpected vxd interrupt (IRQ not armed)\n");
+-	return IRQ_NONE;
+-}
+-
+ void apple_vxd_watchdog(struct work_struct *work)
+ {
+ 	struct apple_vxd_dev *vxd = container_of(work, struct apple_vxd_dev,
+@@ -352,6 +337,8 @@ static int apple_vxd_probe(struct platform_device *pdev)
+ {
+ 	const struct apple_vxd_variant *variant;
+ 	struct apple_vxd_dev *vxd;
++	struct resource *res;
++	unsigned int i;
+ 	int ret, irq;
+ 
+ 	variant = of_device_get_match_data(&pdev->dev);
+@@ -370,13 +357,17 @@ static int apple_vxd_probe(struct platform_device *pdev)
+ 	mutex_init(&vxd->vdev_lock);
+ 	mutex_init(&vxd->power_lock);
+ 	spin_lock_init(&vxd->job_lock);
++	spin_lock_init(&vxd->mbox_lock);
++	for (i = 0; i < APPLE_VXD_NUM_FENCES; i++)
++		init_completion(&vxd->fences[i].done);
+ 	INIT_DELAYED_WORK(&vxd->watchdog_work, apple_vxd_watchdog);
+ 
+ 	vxd_step(&pdev->dev, "probe: map MMIO");
+-	vxd->regs = devm_platform_ioremap_resource(pdev, 0);
++	vxd->regs = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
+ 	if (IS_ERR(vxd->regs))
+ 		return dev_err_probe(&pdev->dev, PTR_ERR(vxd->regs),
+ 				     "failed to map the vxd registers\n");
++	vxd->regs_size = resource_size(res);
+ 
+ 	/* The block has no DART; DMA addresses are physical and the core's
+ 	 * own GART translates the low 32 bits into device address space.
+@@ -395,6 +386,10 @@ static int apple_vxd_probe(struct platform_device *pdev)
+ 		return irq;
+ 	vxd->irq = irq;
+ 
++	/*
++	 * Level IRQ 157.  Requested now (rung R0), enabled only once the
++	 * firmware has taken its init message (apple_vxd_mbox_start()).
++	 */
+ 	ret = devm_request_irq(&pdev->dev, irq, apple_vxd_irq, IRQF_NO_AUTOEN,
+ 			       dev_name(&pdev->dev), vxd);
+ 	if (ret) {
+@@ -423,6 +418,16 @@ static int apple_vxd_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		goto err_gart_fini;
+ 
++	/*
++	 * The protocol arithmetic (ring indices, headers, the init message,
++	 * GART entries) is checked before anything can reach the hardware;
++	 * a failure keeps the firmware boot off.
++	 */
++	vxd_step(&pdev->dev, "probe: mailbox protocol self-test");
++	vxd->selftest_failed = apple_vxd_mbox_selftest(vxd) != 0;
++	if (!vxd->selftest_failed)
++		dev_info(&pdev->dev, "mailbox self-test ok: ring arithmetic, headers, init message, GART entries\n");
++
+ 	/*
+ 	 * Debugfs (dumps + the boot trigger) first so a later step can be
+ 	 * re-run or inspected no matter how far probe got.  Nothing after
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-fw.c b/drivers/media/platform/apple/vxd/apple-vxd-fw.c
+index 63ff4502f5c091d4aa32c7c574295901a4dddc8e..dd59888de90bee4ffb51f65698f67809482f4f39 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-fw.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-fw.c
+@@ -126,9 +126,9 @@ static int vxd_known_state_v1(struct apple_vxd_dev *vxd, const char *which)
+ 		}
+ 	}
+ 
+-	/* Epilogue [E]. */
+-	vxd_write(vxd, VXD_REG_CMD_DESC_STATUS, 0);
+-	vxd_write(vxd, VXD_REG_CMD_DESC_SIZE, VXD_CMD_CTRL_RESET);
++	/* Epilogue [E]: host interrupt disabled, pending causes cleared. */
++	vxd_write(vxd, VXD_REG_IRQ_ENABLE, 0);
++	vxd_write(vxd, VXD_REG_IRQ_CLEAR, 0xffff0000);
+ 	return 0;
+ }
+ 
+@@ -171,7 +171,7 @@ static int vxd_known_state_v2(struct apple_vxd_dev *vxd)
+ 	}
+ 
+ 	vxd_read(vxd, VXD_REG_COMMS_STATE);
+-	vxd_write(vxd, VXD_REG_CMD_DESC_SIZE, 0xffffffff);
++	vxd_write(vxd, VXD_REG_IRQ_CLEAR, 0xffffffff);
+ 	return 0;
+ }
+ 
+@@ -248,7 +248,7 @@ static void vxd_processor_initialise(struct apple_vxd_dev *vxd)
+ 	vxd_step(vxd->dev, "ProcessorInitialise: comms rings");
+ 	vxd_write(vxd, VXD_REG_FW_READY_MAGIC, 0);
+ 	vxd_write(vxd, VXD_REG_COMMS_MSG_COUNT, 200);
+-	vxd_write(vxd, VXD_REG_COMMS_200C, 0);
++	vxd_write(vxd, VXD_REG_FW_PC, 0);
+ 	vxd_write(vxd, VXD_REG_TO_HOST_RD_INDEX, 0);
+ 	vxd_write(vxd, VXD_REG_TO_HOST_WR_INDEX, 0);
+ 	vxd_write(vxd, VXD_REG_TO_MTX_RD_INDEX, 0);
+@@ -323,8 +323,19 @@ int apple_vxd_boot_firmware(struct apple_vxd_dev *vxd)
+ 
+ 	mutex_lock(&vxd->power_lock);
+ 	if (vxd->fw_loaded) {
++		/* Up, but a mailbox that never took the init message stays an error. */
++		ret = vxd->hw_ready ? 0 : -EIO;
++		if (ret)
++			dev_err(vxd->dev,
++				"firmware is running but its mailbox did not start; unbind/bind to retry\n");
++		mutex_unlock(&vxd->power_lock);
++		return ret;
++	}
++
++	if (vxd->selftest_failed) {
++		dev_err(vxd->dev, "mailbox self-test failed at probe: not booting the firmware\n");
+ 		mutex_unlock(&vxd->power_lock);
+-		return 0;
++		return -EINVAL;
+ 	}
+ 
+ 	ret = pm_runtime_resume_and_get(vxd->dev);
+@@ -359,6 +370,7 @@ int apple_vxd_boot_firmware(struct apple_vxd_dev *vxd)
+ 		goto out_release;
+ 	}
+ 	fw_words = fw->size / sizeof(u32);
++	vxd->fw_blob_size = fw->size;
+ 
+ 	sha256(fw->data, fw->size, digest);
+ 	if (memcmp(digest, apple_vxd_deva_sha256, sizeof(digest))) {
+@@ -425,7 +437,7 @@ int apple_vxd_boot_firmware(struct apple_vxd_dev *vxd)
+ 	vxd_boot_mtx(vxd, fw_words);
+ 
+ 	vxd_step(vxd->dev, "boot: post-boot-init registers");
+-	vxd_write(vxd, VXD_REG_CMD_DESC_STATUS, 0x100000);
++	vxd_write(vxd, VXD_REG_IRQ_ENABLE, VXD_IRQ_FW_MSG);
+ 	vxd_post_boot_init(vxd);
+ 
+ 	vxd_step(vxd->dev, "boot: firmware ready poll (1 s)");
+@@ -438,16 +450,34 @@ int apple_vxd_boot_firmware(struct apple_vxd_dev *vxd)
+ 		goto out_unmap;
+ 	}
+ 
+-	vxd->fw_build_1 = vxd_read(vxd, VXD_REG_FW_BUILD_2);
+-	vxd->fw_build_2 = vxd_read(vxd, VXD_REG_FW_BUILD_1);
++	/*
++	 * 0x2024/0x2018 are the ring geometry the firmware publishes with the
++	 * magic (rounds 1-3 logged them as "build halves").
++	 */
++	vxd_step(vxd->dev, "boot: firmware alive, reading the ring geometry (0x2024/0x2018)");
++	ret = apple_vxd_mbox_open(vxd);
++	if (ret)
++		goto out_unmap;
++
++	/*
++	 * The MTX runs from here on: keep the image, its mapping and the PM
++	 * reference until apple_vxd_fw_cleanup(), whatever the mailbox does.
++	 */
+ 	vxd->fw_loaded = true;
+-	vxd->hw_ready = true;
+ 
+-	vxd_step(vxd->dev, "boot: firmware alive, reading build halves");
++	ret = apple_vxd_mbox_start(vxd);
++	if (ret) {
++		dev_err(vxd->dev,
++			"DEVA firmware is up but did not take the init message (%d): decode stays off, debugfs mbox/ping still work\n",
++			ret);
++		mutex_unlock(&vxd->power_lock);
++		return ret;
++	}
++
++	vxd->hw_ready = true;
+ 	dev_info(vxd->dev,
+-		 "DEVA firmware ready: build halves %#04x.%#04x / %#04x.%#04x\n",
+-		 vxd->fw_build_1 >> 16, vxd->fw_build_1 & 0xffff,
+-		 vxd->fw_build_2 >> 16, vxd->fw_build_2 & 0xffff);
++		 "DEVA firmware ready: mailbox up, init message consumed, IRQ %d armed\n",
++		 vxd->irq);
+ 	mutex_unlock(&vxd->power_lock);
+ 	return 0;
+ 
+@@ -470,6 +500,8 @@ void apple_vxd_fw_cleanup(struct apple_vxd_dev *vxd)
+ 
+ 	mutex_lock(&vxd->power_lock);
+ 	was_loaded = vxd->fw_loaded;
++	/* IRQ off and every fence waiter woken before the buffers go. */
++	apple_vxd_mbox_stop(vxd);
+ 	if (vxd->fw_vaddr) {
+ 		apple_vxd_gart_unmap(vxd, &vxd->fw_map);
+ 		dma_free_coherent(vxd->dev, vxd->fw_size, vxd->fw_vaddr,
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-h264.c b/drivers/media/platform/apple/vxd/apple-vxd-h264.c
+index 5fbfa366a9de198677e2dcc3d7ce4c2b0e40c618..6183682667d0947e40d6a3505c95b603a619f708 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-h264.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-h264.c
+@@ -4,12 +4,11 @@
+  *
+  * Userspace does the bitstream parsing (V4L2 stateless contract); this
+  * layer validates the parameters against what the silicon accepts and
+- * translates them into the firmware/hardware submission.  The translation
+- * structures mirror the kext's PicParams_H264 / VA_SliceInfo /
+- * H264CommandBufferParams naming; their exact binary ABI against the DEVA
+- * firmware is the open question the doc marks "decides everything"
+- * (section 6.1) and is only settled by the R2 ring dump.  Everything fed
+- * into apple_vxd_submit() carries that gate.
++ * translates them into the firmware/hardware submission.  The submission
++ * is an MSVDX register program in a command buffer plus one mailbox
++ * message per slice packet (docs/periph/ds-vxd-cmdstream.md); the
++ * generator for that program (R3c) is not written yet, so
++ * apple_vxd_submit() still fails every job.
+  */
+ #include <media/v4l2-h264.h>
+ 
+@@ -86,9 +85,7 @@ static int apple_vxd_h264_try_ctrl(struct apple_vxd_ctx *ctx,
+ 
+ static int apple_vxd_h264_start(struct apple_vxd_ctx *ctx)
+ {
+-	/* R3 allocates the per-context parameter/command buffers here once
+-	 * the message ABI is pinned down.
+-	 */
++	/* R3c allocates the per-context entropy/VLC table buffers here. */
+ 	return 0;
+ }
+ 
+@@ -113,9 +110,9 @@ static int apple_vxd_h264_run(struct apple_vxd_ctx *ctx)
+ 
+ 	apple_vxd_run_preamble(ctx, &run);
+ 
+-	if (!vxd->hw_ready) {
++	if (!vxd->hw_ready || vxd->fw_panicked) {
+ 		dev_dbg(vxd->dev,
+-			"decode job with no firmware running (boot_firmware disabled or R1 failed)\n");
++			"decode job with no usable firmware (not booted, init message not taken, or panicked)\n");
+ 		apple_vxd_run_postamble(ctx, &run);
+ 		return -EAGAIN;
+ 	}
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-mbox.c b/drivers/media/platform/apple/vxd/apple-vxd-mbox.c
+index dd10083fa1de2f747c4d38b5ece1745b4052a7ca..7818c7528e4e8b7a01269486a0ec6fd43e0558d6 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-mbox.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-mbox.c
+@@ -1,66 +1,671 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /*
+- * Apple VXD - host<->MTX message rings (R2 scaffolding)
++ * Apple VXD - host<->MTX mailbox (R3a)
+  *
+- * The comms bank (0x2000) holds the ring state; the four indices are
+- * confirmed by AppleD5500's recovery path [E]:
++ * docs/periph/ds-vxd-decode-protocol.md sections 2, 3 and 6.  The rings
++ * are word windows in the register file, not DMA queues: after the ready
++ * magic the DEVA firmware publishes each ring as (base << 16) | capacity
++ * in 0x2024 (TO_MTX) and 0x2018 (TO_HOST), and word i of a ring is the
++ * register at 0x2000 + base + 4 * i.
+  *
+- *   0x201c TO_HOST_RD_INDEX  0x2020 TO_HOST_WR_INDEX
+- *   0x2028 TO_MTX_RD_INDEX   0x2030 TO_MTX_WR_INDEX
++ *   push (0xfffffff0062990bc):  words, 0x2030 = wr, flush reads of
++ *                               0x2028/0x2030/0x201c/0x2020, 0x88 = 1,
++ *                               flush read of 0x2000
++ *   ISR  (0xfffffff00629a0ac):  read 0x410, 0x414 = 0x100000, then drain
++ *                               TO_HOST (0x201c host rd, 0x2020 fw wr)
++ *   init (0xfffffff006298d40):  one 0x80 message after the ready magic
+  *
+- * What is NOT known statically is how message bytes are moved: the kext
+- * uses LLDMA descriptors against the comms window (IMG/cmd_buf/LLDMA.c),
+- * and H264FW_NalPushSliceData puts bitstream bytes into firmware messages.
+- * Until one boot + one ring dump pins the message ABI down (test plan R2
+- * step), submission refuses jobs with a clear diagnostic instead of
+- * guessing.
++ * The firmware answers decode packets with a 0xc0 completion carrying the
++ * fence; it answers nothing else.  0x80 and the benign 0x83..0x85 are
++ * acknowledged only by TO_MTX_RD (0x2028) moving past them: the DEVA
++ * reader publishes the new read index before it dispatches (fw 0x1000a9c).
++ * That is what the boot and the debugfs ping wait for.
+  *
+- * The free-slot formula mirrors the kext's helper: free = rd - wr - 1 when
+- * rd > wr, otherwise rd - wr + capacity, with the capacity coming from the
+- * core object.  Our capacity constant is [U] until the first dump.
++ * Every ring access is bounded: indices are checked against the published
++ * capacity, the geometry against the MMIO window, message lengths against
++ * both sides' limits, and every wait has a timeout.
+  */
+-#include <linux/fs.h>
++#include <linux/bitfield.h>
+ #include <linux/debugfs.h>
++#include <linux/fs.h>
++#include <linux/interrupt.h>
++#include <linux/iopoll.h>
++#include <linux/kstrtox.h>
++#include <linux/ktime.h>
+ #include <linux/module.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/seq_file.h>
+ 
+ #include "apple-vxd.h"
+ 
+-static bool apple_vxd_mbox_wired;
+-static bool apple_vxd_mbox_announced;
++#define VXD_MSG_CONSUME_TIMEOUT_US	100000	/* init + ping */
++#define VXD_MSG_PUSH_TIMEOUT_US		100000	/* free-slot wait */
++#define VXD_PING_COMPLETION_MS		20
++#define VXD_DRAIN_MAX_MSGS		0x70	/* the kext's bound */
++#define VXD_RING_MAX_CAP		0x4000	/* sanity bound, words */
++#define VXD_RING_DUMP_MAX_WORDS		64
++#define VXD_PING_COOKIE			0x50494e47	/* "PING" */
++/*
++ * The firmware raises bit 20 only after posting a message, so an interrupt
++ * normally drains at least one.  This many in a row with nothing to drain
++ * means 0x414 does not clear the level line: stop taking it rather than
++ * livelock the CPU, and leave the hand drain (ping) working.
++ */
++#define VXD_IRQ_STORM_LIMIT		1000
++
++static bool apple_vxd_submit_announced;
++
++/* --- ring arithmetic: pure, shared with the self-test ------------------ */
++
++static u32 vxd_ring_next(u32 idx, u32 cap)
++{
++	return idx + 1 < cap ? idx + 1 : 0;
++}
++
++/* Words from @from forward to @to. */
++static u32 vxd_ring_dist(u32 from, u32 to, u32 cap)
++{
++	return to >= from ? to - from : to + cap - from;
++}
++
++/*
++ * Free TO_MTX words, AppleD5500's helper (0xfffffff0062996b4 [E]):
++ * rd + ~wr, plus the capacity unless wr < rd.  One word always stays free,
++ * so rd == wr means empty.
++ */
++static u32 vxd_ring_free(u32 rd, u32 wr, u32 cap)
++{
++	if (wr < rd)
++		return rd - wr - 1;
++	return rd - wr - 1 + cap;
++}
++
++/*
++ * The reader has taken the @t message once it moved at least nwords past
++ * its start without overtaking the writer.  A read index still behind the
++ * start (earlier messages pending) is "not yet".
++ */
++static bool vxd_ring_consumed(const struct apple_vxd_msg_ticket *t, u32 rd,
++			      u32 wr, u32 cap)
++{
++	u32 done = vxd_ring_dist(t->start, rd, cap);
++
++	return done >= t->nwords && done <= vxd_ring_dist(t->start, wr, cap);
++}
++
++/* Apple's fence: (submission << 4) | (packet * 2 & 0xe) | core, core 0. */
++static u16 vxd_fence_id(u16 seq, unsigned int packet)
++{
++	return (seq << 4) | ((packet * 2) & 0xe);
++}
++
++/*
++ * InitMessageBuffers [E]: w1 = firmware device address (the 0x6a00 value),
++ * w2 = (u8)seq << 16 | image size in 4 KiB pages (the blob, not the
++ * page-aligned allocation: 0x17e98 bytes -> 0x17), w3 = 0xffff0000.
++ */
++void apple_vxd_build_init_msg(u32 msg[VXD_INIT_MSG_WORDS], u32 fw_va,
++			      size_t fw_bytes, u16 seq)
++{
++	msg[0] = apple_vxd_msg_hdr(0, VXD_MSG_INIT, VXD_INIT_MSG_WORDS);
++	msg[1] = fw_va;
++	msg[2] = FIELD_PREP(VXD_INIT_SEQ, seq & 0xff) |
++		 FIELD_PREP(VXD_INIT_PAGES, fw_bytes >> 12);
++	msg[3] = VXD_INIT_SENTINEL;
++	msg[4] = 0;
++}
++
++/* --- geometry ---------------------------------------------------------- */
+ 
+-/* Free TO_MTX slots, mirroring AppleD5500's helper [E] (capacity [U]). */
+-static u32 apple_vxd_to_mtx_free(struct apple_vxd_dev *vxd)
++static int vxd_ring_parse(struct apple_vxd_dev *vxd, const char *name,
++			  u32 raw, struct apple_vxd_ring *ring)
++{
++	ring->base = FIELD_GET(VXD_RING_BASE, raw);
++	ring->cap = FIELD_GET(VXD_RING_CAP, raw);
++
++	if (ring->cap <= VXD_MSG_TO_MTX_MAX_WORDS ||
++	    ring->cap > VXD_RING_MAX_CAP || ring->base & 3 ||
++	    VXD_RING_WINDOW + ring->base + 4 * ring->cap > vxd->regs_size) {
++		dev_err(vxd->dev,
++			"%s ring geometry %#010x (base %#x, %u words) is not usable: needs %u < words <= %u, a 4-byte aligned base and the ring inside the %#llx-byte register window\n",
++			name, raw, ring->base, ring->cap,
++			VXD_MSG_TO_MTX_MAX_WORDS, VXD_RING_MAX_CAP,
++			(unsigned long long)vxd->regs_size);
++		return -EINVAL;
++	}
++	return 0;
++}
++
++static u32 vxd_ring_reg(const struct apple_vxd_ring *ring, u32 idx)
++{
++	return VXD_RING_WINDOW + ring->base + 4 * idx;
++}
++
++/*
++ * Read the geometry the firmware published with the ready magic, once per
++ * boot.  Called by the boot under power_lock.
++ */
++int apple_vxd_mbox_open(struct apple_vxd_dev *vxd)
++{
++	struct apple_vxd_ring to_mtx, to_host;
++	u32 raw_mtx, raw_host;
++	unsigned long flags;
++	unsigned int i;
++	int ret;
++
++	raw_mtx = vxd_read(vxd, VXD_REG_TO_MTX_RING);
++	raw_host = vxd_read(vxd, VXD_REG_TO_HOST_RING);
++	dev_info(vxd->dev,
++		 "ring geometry: TO_MTX (0x2024) %#010x, TO_HOST (0x2018) %#010x\n",
++		 raw_mtx, raw_host);
++
++	ret = vxd_ring_parse(vxd, "TO_MTX", raw_mtx, &to_mtx);
++	if (!ret)
++		ret = vxd_ring_parse(vxd, "TO_HOST", raw_host, &to_host);
++	if (ret)
++		return ret;
++
++	if (to_mtx.base < to_host.base + 4 * to_host.cap &&
++	    to_host.base < to_mtx.base + 4 * to_mtx.cap) {
++		dev_err(vxd->dev, "TO_MTX and TO_HOST rings overlap\n");
++		return -EINVAL;
++	}
++
++	spin_lock_irqsave(&vxd->mbox_lock, flags);
++	vxd->to_mtx = to_mtx;
++	vxd->to_host = to_host;
++	memset(&vxd->stats, 0, sizeof(vxd->stats));
++	for (i = 0; i < APPLE_VXD_NUM_FENCES; i++)
++		vxd->fences[i].state = APPLE_VXD_FENCE_FREE;
++	vxd->fw_panicked = false;
++	vxd->irq_storm = false;
++	vxd->irq_empty = 0;
++	vxd->mbox_ready = true;
++	spin_unlock_irqrestore(&vxd->mbox_lock, flags);
++
++	dev_info(vxd->dev,
++		 "mailbox: TO_MTX regs %#x..%#x (%u words), TO_HOST regs %#x..%#x (%u words)\n",
++		 vxd_ring_reg(&to_mtx, 0), vxd_ring_reg(&to_mtx, to_mtx.cap) - 1,
++		 to_mtx.cap, vxd_ring_reg(&to_host, 0),
++		 vxd_ring_reg(&to_host, to_host.cap) - 1, to_host.cap);
++	return 0;
++}
++
++/* --- push -------------------------------------------------------------- */
++
++/*
++ * Push one message to TO_MTX in AppleD5500's exact order, waiting (bounded)
++ * for room.  Process context only.  @ticket records where it went so the
++ * caller can wait for the firmware to take it.
++ */
++int apple_vxd_msg_push(struct apple_vxd_dev *vxd, const u32 *msg,
++		       struct apple_vxd_msg_ticket *ticket)
++{
++	u32 nwords = FIELD_GET(VXD_MSG_NWORDS, msg[0]);
++	u32 rd, wr, cap, i;
++	unsigned long flags;
++	ktime_t deadline;
++
++	might_sleep();
++	if (!nwords || nwords > VXD_MSG_TO_MTX_MAX_WORDS || msg[0] & BIT(7))
++		return -EINVAL;
++
++	deadline = ktime_add_us(ktime_get(), VXD_MSG_PUSH_TIMEOUT_US);
++	for (;;) {
++		spin_lock_irqsave(&vxd->mbox_lock, flags);
++		if (!vxd->mbox_ready) {
++			spin_unlock_irqrestore(&vxd->mbox_lock, flags);
++			return -ENODEV;
++		}
++
++		cap = vxd->to_mtx.cap;
++		rd = vxd_read(vxd, VXD_REG_TO_MTX_RD_INDEX);
++		wr = vxd_read(vxd, VXD_REG_TO_MTX_WR_INDEX);
++		if (rd >= cap || wr >= cap) {
++			vxd->stats.malformed++;
++			spin_unlock_irqrestore(&vxd->mbox_lock, flags);
++			dev_err(vxd->dev,
++				"TO_MTX indices out of range: rd %u wr %u (capacity %u)\n",
++				rd, wr, cap);
++			return -EIO;
++		}
++		if (vxd_ring_free(rd, wr, cap) >= nwords)
++			break;
++		spin_unlock_irqrestore(&vxd->mbox_lock, flags);
++
++		if (ktime_after(ktime_get(), deadline)) {
++			dev_err(vxd->dev,
++				"TO_MTX full for 100 ms: rd %u wr %u, %u words free, %u needed\n",
++				rd, wr, vxd_ring_free(rd, wr, cap), nwords);
++			return -EBUSY;
++		}
++		usleep_range(100, 200);
++	}
++
++	ticket->start = wr;
++	ticket->nwords = nwords;
++	for (i = 0; i < nwords; i++) {
++		vxd_write(vxd, vxd_ring_reg(&vxd->to_mtx, wr), msg[i]);
++		wr = vxd_ring_next(wr, cap);
++	}
++	ticket->end = wr;
++	vxd_write(vxd, VXD_REG_TO_MTX_WR_INDEX, wr);
++
++	/* APB flush reads, doorbell, final flush: the kext's sequence. */
++	vxd_read(vxd, VXD_REG_TO_MTX_RD_INDEX);
++	vxd_read(vxd, VXD_REG_TO_MTX_WR_INDEX);
++	vxd_read(vxd, VXD_REG_TO_HOST_RD_INDEX);
++	vxd_read(vxd, VXD_REG_TO_HOST_WR_INDEX);
++	vxd_write(vxd, VXD_REG_MTX_DOORBELL, 1);
++	vxd_read(vxd, VXD_REG_COMMS_STATE);
++	vxd->stats.sent++;
++	spin_unlock_irqrestore(&vxd->mbox_lock, flags);
++
++	return 0;
++}
++
++static bool vxd_msg_is_consumed(struct apple_vxd_dev *vxd,
++				const struct apple_vxd_msg_ticket *ticket)
+ {
+ 	u32 rd = vxd_read(vxd, VXD_REG_TO_MTX_RD_INDEX);
+ 	u32 wr = vxd_read(vxd, VXD_REG_TO_MTX_WR_INDEX);
+-	u32 capacity = 200;
+ 
+-	if (rd > wr)
+-		return rd - wr - 1;
+-	return rd - wr + capacity;
++	if (rd >= vxd->to_mtx.cap || wr >= vxd->to_mtx.cap)
++		return false;
++	return vxd_ring_consumed(ticket, rd, wr, vxd->to_mtx.cap);
+ }
+ 
+-int apple_vxd_submit(struct apple_vxd_ctx *ctx, struct apple_vxd_run *run)
++/* Poll 0x2028 until the firmware has taken the message (bounded). */
++int apple_vxd_msg_wait_consumed(struct apple_vxd_dev *vxd,
++				const struct apple_vxd_msg_ticket *ticket,
++				unsigned int timeout_us, unsigned int *waited_us)
+ {
+-	struct apple_vxd_dev *vxd = ctx->vxd;
++	ktime_t start = ktime_get();
++	bool done;
++	int ret;
+ 
+-	if (!apple_vxd_mbox_wired) {
+-		if (!apple_vxd_mbox_announced) {
+-			dev_info(vxd->dev,
+-				 "mailbox not wired: the host<->MTX message ABI needs the R2 ring dump (test plan); decode jobs fail until then\n");
+-			apple_vxd_mbox_announced = true;
++	ret = read_poll_timeout(vxd_msg_is_consumed, done, done, 50,
++				timeout_us, false, vxd, ticket);
++	if (waited_us)
++		*waited_us = ktime_us_delta(ktime_get(), start);
++	return ret;
++}
++
++/* --- fences ------------------------------------------------------------ */
++
++struct apple_vxd_fence *apple_vxd_fence_arm(struct apple_vxd_dev *vxd,
++					    unsigned int packet, u8 type)
++{
++	struct apple_vxd_fence *fence = NULL;
++	unsigned long flags;
++	unsigned int i;
++
++	spin_lock_irqsave(&vxd->mbox_lock, flags);
++	for (i = 0; i < APPLE_VXD_NUM_FENCES; i++) {
++		if (vxd->fences[i].state == APPLE_VXD_FENCE_FREE) {
++			fence = &vxd->fences[i];
++			break;
++		}
++	}
++	if (fence) {
++		/* 12-bit submission counter, never 0: fence 0 is the init message's. */
++		vxd->fence_seq = (vxd->fence_seq + 1) & 0xfff;
++		if (!vxd->fence_seq)
++			vxd->fence_seq = 1;
++		fence->id = vxd_fence_id(vxd->fence_seq, packet);
++		fence->type = type;
++		fence->status = 0;
++		fence->error = false;
++		fence->state = APPLE_VXD_FENCE_ARMED;
++		reinit_completion(&fence->done);
++	}
++	spin_unlock_irqrestore(&vxd->mbox_lock, flags);
++
++	return fence;
++}
++
++void apple_vxd_fence_release(struct apple_vxd_dev *vxd,
++			     struct apple_vxd_fence *fence)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&vxd->mbox_lock, flags);
++	fence->state = APPLE_VXD_FENCE_FREE;
++	spin_unlock_irqrestore(&vxd->mbox_lock, flags);
++}
++
++/* Called with mbox_lock held. */
++static void vxd_fence_complete(struct apple_vxd_fence *fence, u32 status,
++			       bool error)
++{
++	fence->status = status;
++	fence->error = error;
++	fence->state = APPLE_VXD_FENCE_SIGNALLED;
++	complete_all(&fence->done);
++}
++
++/* Called with mbox_lock held: wake every waiter with an error. */
++static void vxd_fences_fail_all(struct apple_vxd_dev *vxd)
++{
++	unsigned int i;
++
++	for (i = 0; i < APPLE_VXD_NUM_FENCES; i++)
++		if (vxd->fences[i].state == APPLE_VXD_FENCE_ARMED)
++			vxd_fence_complete(&vxd->fences[i], 0, true);
++}
++
++/* --- drain ------------------------------------------------------------- */
++
++/*
++ * Pop one TO_HOST message (the kext's 0xfffffff0062997b0, consuming mode).
++ * mbox_lock held.  Returns the word count, 0 if the ring is empty, or
++ * -EIO if it is corrupt.
++ */
++static int vxd_msg_pop(struct apple_vxd_dev *vxd, u32 *msg)
++{
++	u32 cap = vxd->to_host.cap;
++	u32 rd = vxd_read(vxd, VXD_REG_TO_HOST_RD_INDEX);
++	u32 wr = vxd_read(vxd, VXD_REG_TO_HOST_WR_INDEX);
++	u32 n, i;
++
++	if (rd >= cap || wr >= cap) {
++		vxd->stats.malformed++;
++		dev_err_ratelimited(vxd->dev,
++				    "TO_HOST indices out of range: rd %u wr %u (capacity %u)\n",
++				    rd, wr, cap);
++		return -EIO;
++	}
++	if (rd == wr)
++		return 0;
++
++	msg[0] = vxd_read(vxd, vxd_ring_reg(&vxd->to_host, rd));
++	n = FIELD_GET(VXD_MSG_NWORDS, msg[0]);
++	if (n > VXD_MSG_TO_HOST_MAX_WORDS || n > vxd_ring_dist(rd, wr, cap)) {
++		/*
++		 * The kext logs "received oversize fw->host msg" and stops;
++		 * resync to the writer so one bad header cannot pin the ring.
++		 */
++		vxd->stats.malformed++;
++		dev_err_ratelimited(vxd->dev,
++				    "TO_HOST message %#010x at %u claims %u words (%u queued); dropping the queue\n",
++				    msg[0], rd, n, vxd_ring_dist(rd, wr, cap));
++		vxd_write(vxd, VXD_REG_TO_HOST_RD_INDEX, wr);
++		return -EIO;
++	}
++	if (!n) {
++		/* The kext consumes a zero-length header as one word. */
++		vxd->stats.malformed++;
++		n = 1;
++	}
++
++	rd = vxd_ring_next(rd, cap);
++	for (i = 1; i < n; i++) {
++		msg[i] = vxd_read(vxd, vxd_ring_reg(&vxd->to_host, rd));
++		rd = vxd_ring_next(rd, cap);
++	}
++	vxd_write(vxd, VXD_REG_TO_HOST_RD_INDEX, rd);
++	vxd->stats.received++;
++	return n;
++}
++
++static void vxd_msg_completion(struct apple_vxd_dev *vxd, const u32 *msg,
++			       u32 n)
++{
++	u16 id = FIELD_GET(VXD_MSG_FENCE, msg[0]);
++	u32 status = n > 2 ? msg[2] : 0;
++	u32 w3 = n > 3 ? msg[3] : 0;
++	bool fault = status & VXD_COMPLETION_FAULT;
++	unsigned int i;
++
++	vxd->stats.completions++;
++	if (fault) {
++		vxd->stats.faults++;
++		if ((status & VXD_COMPLETION_AFTER_RESET) && !w3)
++			dev_warn_ratelimited(vxd->dev,
++					     "completion fence %#x after core reset (status %#x)\n",
++					     id, status);
++		else
++			dev_err_ratelimited(vxd->dev,
++					    "completion fence %#x with fault: status %#x, word1 %#x, word3 %#x\n",
++					    id, status, n > 1 ? msg[1] : 0, w3);
++	}
++	if (status & VXD_COMPLETION_REATTEMPT)
++		dev_warn_ratelimited(vxd->dev,
++				     "completion fence %#x asks for REATTEMPT_SINGLEPIPE (fw pc %#x)\n",
++				     id, vxd_read(vxd, VXD_REG_FW_PC));
++
++	for (i = 0; i < APPLE_VXD_NUM_FENCES; i++) {
++		struct apple_vxd_fence *fence = &vxd->fences[i];
++
++		if (fence->state == APPLE_VXD_FENCE_ARMED && fence->id == id) {
++			vxd_fence_complete(fence, status, fault);
++			return;
++		}
++	}
++
++	vxd->stats.unknown_fences++;
++	dev_warn_ratelimited(vxd->dev,
++			     "completion for unknown fence %#x (status %#x)\n",
++			     id, status);
++}
++
++/* ProcessFWMessages' type switch (0xfffffff006299bb4 [E]).  mbox_lock held. */
++static void vxd_msg_dispatch(struct apple_vxd_dev *vxd, const u32 *msg, u32 n)
++{
++	u8 type = FIELD_GET(VXD_MSG_TYPE, msg[0]);
++
++	switch (type) {
++	case VXD_MSG_COMPLETION:
++		vxd_msg_completion(vxd, msg, n);
++		break;
++	case VXD_MSG_CONTIGUITY:
++		vxd->stats.contiguity++;
++		dev_warn_ratelimited(vxd->dev,
++				     "firmware contiguity warning (%#x %#x)\n",
++				     n > 1 ? msg[1] : 0, n > 2 ? msg[2] : 0);
++		break;
++	case VXD_MSG_PANIC:
++		vxd->stats.panics++;
++		vxd->fw_panicked = true;
++		dev_err_ratelimited(vxd->dev,
++				    "FW_DEVA_PANIC: fence %#x, error int %#x; decode is off until the firmware is rebooted\n",
++				    (u32)FIELD_GET(VXD_MSG_FENCE, msg[0]),
++				    n > 1 ? msg[1] : 0);
++		vxd_fences_fail_all(vxd);
++		break;
++	default:
++		/* The kext drops 0xd1..0xd4 and 0xe1..0xe4 without a word. */
++		if ((type >= 0xd1 && type <= 0xd4) ||
++		    (type >= 0xe1 && type <= 0xe4)) {
++			dev_dbg(vxd->dev, "firmware message %#x ignored\n", type);
++			break;
+ 		}
+-		return -EAGAIN;
++		vxd->stats.unknown++;
++		dev_warn_ratelimited(vxd->dev,
++				     "unknown message %#010x from the DEVA firmware (%u words)\n",
++				     msg[0], n);
++		break;
++	}
++}
++
++/* mbox_lock held. */
++static unsigned int vxd_mbox_drain_locked(struct apple_vxd_dev *vxd)
++{
++	u32 msg[VXD_MSG_TO_HOST_MAX_WORDS];
++	unsigned int count;
++	int n;
++
++	for (count = 0; count < VXD_DRAIN_MAX_MSGS; count++) {
++		n = vxd_msg_pop(vxd, msg);
++		if (n <= 0)
++			return count;
++		vxd_msg_dispatch(vxd, msg, n);
+ 	}
+ 
+-	/* Reached only after R2 wires the push path; the job is one
+-	 * picture, completion comes back through TO_HOST.
+-	 */
+-	return -EAGAIN;
++	dev_warn_ratelimited(vxd->dev, "too many messages in the fw2host queue\n");
++	return count;
+ }
+ 
++/*
++ * Drain by hand: Apple's timeout path runs ProcessInterrupt manually, and
++ * the ping uses this to collect what an unarmed IRQ would have.
++ */
++unsigned int apple_vxd_mbox_drain(struct apple_vxd_dev *vxd)
++{
++	unsigned int count = 0;
++	unsigned long flags;
++
++	spin_lock_irqsave(&vxd->mbox_lock, flags);
++	if (vxd->mbox_ready)
++		count = vxd_mbox_drain_locked(vxd);
++	spin_unlock_irqrestore(&vxd->mbox_lock, flags);
++
++	return count;
++}
++
++/*
++ * IRQ 157, level.  Armed only while the firmware runs (the boot holds a
++ * runtime PM reference for that whole time, so the block is powered).
++ * Apple's order: status, clear, then drain.
++ */
++irqreturn_t apple_vxd_irq(int irq, void *data)
++{
++	struct apple_vxd_dev *vxd = data;
++	u32 status;
++
++	spin_lock(&vxd->mbox_lock);
++	if (!vxd->mbox_ready) {
++		spin_unlock(&vxd->mbox_lock);
++		return IRQ_NONE;
++	}
++
++	status = vxd_read(vxd, VXD_REG_IRQ_STATUS);
++	vxd->stats.last_irq_status = status;
++	if (!(status & VXD_IRQ_FW_MSG)) {
++		vxd->stats.spurious++;
++		spin_unlock(&vxd->mbox_lock);
++		return IRQ_NONE;
++	}
++
++	vxd_write(vxd, VXD_REG_IRQ_CLEAR, VXD_IRQ_FW_MSG);
++	vxd->stats.irqs++;
++	if (vxd_mbox_drain_locked(vxd)) {
++		vxd->irq_empty = 0;
++	} else if (++vxd->irq_empty == VXD_IRQ_STORM_LIMIT) {
++		disable_irq_nosync(irq);
++		vxd->irq_storm = true;
++		dev_err(vxd->dev,
++			"IRQ %d: %u interrupts in a row with nothing to drain (0x410 %#x): 0x414 does not clear the line; IRQ disabled, the debugfs ping still drains by hand\n",
++			irq, VXD_IRQ_STORM_LIMIT, status);
++	}
++	spin_unlock(&vxd->mbox_lock);
++
++	return IRQ_HANDLED;
++}
++
++/* --- start / stop ------------------------------------------------------- */
++
++static void vxd_mbox_log_state(struct apple_vxd_dev *vxd, const char *what)
++{
++	dev_info(vxd->dev,
++		 "%s: TO_MTX rd %u wr %u, TO_HOST rd %u wr %u, fw pc %#x, consumed word %#x, comms state %#x, irq status %#x\n",
++		 what, vxd_read(vxd, VXD_REG_TO_MTX_RD_INDEX),
++		 vxd_read(vxd, VXD_REG_TO_MTX_WR_INDEX),
++		 vxd_read(vxd, VXD_REG_TO_HOST_RD_INDEX),
++		 vxd_read(vxd, VXD_REG_TO_HOST_WR_INDEX),
++		 vxd_read(vxd, VXD_REG_FW_PC),
++		 vxd_read(vxd, VXD_REG_MTX_MSG_CONSUMED),
++		 vxd_read(vxd, VXD_REG_COMMS_STATE),
++		 vxd_read(vxd, VXD_REG_IRQ_STATUS));
++}
++
++/*
++ * The mandatory 0x80 init message, then the IRQ.  Without the init
++ * message the firmware has no picture of its own image and never
++ * schedules work (ds-vxd-decode-protocol.md section 3.1).  Boot path,
++ * power_lock held, mailbox open.
++ */
++int apple_vxd_mbox_start(struct apple_vxd_dev *vxd)
++{
++	struct apple_vxd_msg_ticket ticket;
++	u32 msg[VXD_INIT_MSG_WORDS];
++	unsigned int waited;
++	int ret;
++
++	apple_vxd_build_init_msg(msg, vxd->fw_dev_va, vxd->fw_blob_size,
++				 vxd->init_seq);
++	vxd_step(vxd->dev,
++		 "mbox: push the 0x80 init message {%#x %#x %#x %#x %#x}",
++		 msg[0], msg[1], msg[2], msg[3], msg[4]);
++	ret = apple_vxd_msg_push(vxd, msg, &ticket);
++	if (ret) {
++		dev_err(vxd->dev, "init message push failed: %d\n", ret);
++		return ret;
++	}
++	vxd->init_seq++;
++
++	vxd_step(vxd->dev,
++		 "mbox: wait for TO_MTX rd to reach %u (init message taken, 100 ms)",
++		 ticket.end);
++	ret = apple_vxd_msg_wait_consumed(vxd, &ticket,
++					  VXD_MSG_CONSUME_TIMEOUT_US, &waited);
++	if (ret) {
++		vxd_mbox_log_state(vxd, "init message NOT consumed after 100 ms");
++		return ret;
++	}
++	dev_info(vxd->dev, "init message consumed after %u us\n", waited);
++	vxd_mbox_log_state(vxd, "after init");
++
++	vxd_step(vxd->dev, "mbox: arm IRQ %d (0x418 = %#x)", vxd->irq,
++		 vxd_read(vxd, VXD_REG_IRQ_ENABLE));
++	enable_irq(vxd->irq);
++	vxd->irq_armed = true;
++	return 0;
++}
++
++/* Teardown, power_lock held: no IRQ, no pushes, every waiter woken. */
++void apple_vxd_mbox_stop(struct apple_vxd_dev *vxd)
++{
++	unsigned long flags;
++
++	if (vxd->irq_armed) {
++		/* The storm guard already disabled it from the handler. */
++		if (READ_ONCE(vxd->irq_storm))
++			synchronize_irq(vxd->irq);
++		else
++			disable_irq(vxd->irq);
++		vxd->irq_armed = false;
++	}
++
++	spin_lock_irqsave(&vxd->mbox_lock, flags);
++	if (vxd->mbox_ready) {
++		/* Quiesce the line the way known state does. */
++		vxd_write(vxd, VXD_REG_IRQ_ENABLE, 0);
++		vxd_write(vxd, VXD_REG_IRQ_CLEAR, 0xffffffff);
++	}
++	vxd->mbox_ready = false;
++	vxd_fences_fail_all(vxd);
++	spin_unlock_irqrestore(&vxd->mbox_lock, flags);
++}
++
++/*
++ * Decode submission.  The mailbox is live, but the H.264 command-stream
++ * generator (R3c) is not written yet, so a decode job still fails.
++ */
++int apple_vxd_submit(struct apple_vxd_ctx *ctx, struct apple_vxd_run *run)
++{
++	struct apple_vxd_dev *vxd = ctx->vxd;
++
++	if (!apple_vxd_submit_announced) {
++		dev_info(vxd->dev,
++			 "decode: the mailbox is up but the H.264 command-stream generator (R3c) is not implemented; decode jobs fail\n");
++		apple_vxd_submit_announced = true;
++	}
++	return -EOPNOTSUPP;
++}
++
++/* --- debugfs ------------------------------------------------------------- */
++
+ /*
+  * Debugfs boot trigger: write anything to trigger apple_vxd_boot_firmware
+  * (the R1 recipe) without an unbind/bind cycle.  Returns 0 (bytes written)
+@@ -88,6 +693,141 @@ static const struct file_operations apple_vxd_boot_trigger_fops = {
+ 	.llseek = default_llseek,
+ };
+ 
++/*
++ * One benign message through the whole mailbox: push, doorbell, wait for
++ * TO_MTX rd to pass it (bounded), drain TO_HOST by hand, then give a fence
++ * completion a short window.  0x83..0x85 are dropped by the DEVA
++ * dispatcher, so "consumed, no completion" is the expected answer; 0x80
++ * re-sends the init message (Apple's recovery path 0xfffffff00629964c
++ * does the same).
++ */
++static int apple_vxd_ping(struct apple_vxd_dev *vxd, u8 type)
++{
++	struct apple_vxd_fence *fence = NULL;
++	struct apple_vxd_msg_ticket ticket;
++	u32 msg[VXD_INIT_MSG_WORDS];
++	unsigned int waited, drained;
++	int ret;
++
++	if (type != VXD_MSG_INIT &&
++	    (type < VXD_MSG_NOP_FIRST || type > VXD_MSG_NOP_LAST))
++		return -EINVAL;
++
++	mutex_lock(&vxd->power_lock);
++	if (!vxd->mbox_ready) {
++		dev_err(vxd->dev, "ping: the firmware mailbox is not up (boot first)\n");
++		ret = -ENODEV;
++		goto out_unlock;
++	}
++
++	ret = pm_runtime_resume_and_get(vxd->dev);
++	if (ret)
++		goto out_unlock;
++
++	if (type == VXD_MSG_INIT) {
++		apple_vxd_build_init_msg(msg, vxd->fw_dev_va, vxd->fw_blob_size,
++					 vxd->init_seq);
++	} else {
++		fence = apple_vxd_fence_arm(vxd, 0, type);
++		if (!fence) {
++			ret = -EBUSY;
++			goto out_put;
++		}
++		msg[0] = apple_vxd_msg_hdr(fence->id, type, 2);
++		msg[1] = VXD_PING_COOKIE ^ fence->id;
++	}
++
++	vxd_step(vxd->dev, "ping: push type %#x, fence %#x, %u words",
++		 type, (u32)FIELD_GET(VXD_MSG_FENCE, msg[0]),
++		 (u32)FIELD_GET(VXD_MSG_NWORDS, msg[0]));
++	ret = apple_vxd_msg_push(vxd, msg, &ticket);
++	if (ret) {
++		dev_err(vxd->dev, "ping: push failed: %d\n", ret);
++		goto out_fence;
++	}
++	if (type == VXD_MSG_INIT)
++		vxd->init_seq++;
++
++	vxd_step(vxd->dev,
++		 "ping: pushed at TO_MTX [%u..%u), doorbell rung; wait for rd to reach %u (100 ms)",
++		 ticket.start, ticket.end, ticket.end);
++	ret = apple_vxd_msg_wait_consumed(vxd, &ticket,
++					  VXD_MSG_CONSUME_TIMEOUT_US, &waited);
++	if (ret)
++		vxd_mbox_log_state(vxd, "ping: NOT consumed after 100 ms");
++	else
++		dev_info(vxd->dev, "ping: type %#x consumed after %u us\n",
++			 type, waited);
++
++	drained = apple_vxd_mbox_drain(vxd);
++	if (fence && !ret) {
++		if (wait_for_completion_timeout(&fence->done,
++						msecs_to_jiffies(VXD_PING_COMPLETION_MS)))
++			dev_info(vxd->dev,
++				 "ping: completion for fence %#x, status %#x%s\n",
++				 fence->id, fence->status,
++				 fence->error ? " (error)" : "");
++		else
++			dev_info(vxd->dev,
++				 "ping: no completion for fence %#x within %u ms (expected: the DEVA dispatcher drops 0x83-0x85 without a reply)\n",
++				 fence->id, VXD_PING_COMPLETION_MS);
++	}
++	vxd_step(vxd->dev, "ping: done, rc %d, %u TO_HOST messages drained by hand",
++		 ret, drained);
++
++out_fence:
++	if (fence)
++		apple_vxd_fence_release(vxd, fence);
++out_put:
++	pm_runtime_put_autosuspend(vxd->dev);
++out_unlock:
++	mutex_unlock(&vxd->power_lock);
++	return ret;
++}
++
++/* `echo [0x83|0x84|0x85|0x80] > ping`; an empty write sends 0x83. */
++static ssize_t apple_vxd_ping_write(struct file *file, const char __user *ubuf,
++				    size_t count, loff_t *ppos)
++{
++	struct apple_vxd_dev *vxd = file->private_data;
++	u8 type = VXD_MSG_NOP_FIRST;
++	int ret;
++
++	if (count > 1) {
++		ret = kstrtou8_from_user(ubuf, count, 0, &type);
++		if (ret)
++			return ret;
++	}
++
++	ret = apple_vxd_ping(vxd, type);
++	return ret ? ret : count;
++}
++
++static const struct file_operations apple_vxd_ping_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = apple_vxd_ping_write,
++	.llseek = default_llseek,
++};
++
++static void vxd_dump_ring(struct seq_file *m, struct apple_vxd_dev *vxd,
++			  const char *name, const struct apple_vxd_ring *ring)
++{
++	u32 i, n = min_t(u32, ring->cap, VXD_RING_DUMP_MAX_WORDS);
++
++	seq_printf(m, "%s words (%u of %u):", name, n, ring->cap);
++	for (i = 0; i < n; i++)
++		seq_printf(m, "%s%08x", i % 8 ? " " : "\n  ",
++			   vxd_read(vxd, vxd_ring_reg(ring, i)));
++	seq_puts(m, "\n");
++}
++
++static const char *const vxd_fence_state_names[] = {
++	[APPLE_VXD_FENCE_FREE] = "free",
++	[APPLE_VXD_FENCE_ARMED] = "armed",
++	[APPLE_VXD_FENCE_SIGNALLED] = "signalled",
++};
++
+ /*
+  * The dumps read MMIO, and the block autosuspends 100 ms after probe (the
+  * ps_vdec genpd then cuts it): take a runtime PM reference around every
+@@ -96,27 +836,73 @@ static const struct file_operations apple_vxd_boot_trigger_fops = {
+ static int apple_vxd_mbox_dump_show(struct seq_file *m, void *v)
+ {
+ 	struct apple_vxd_dev *vxd = m->private;
++	struct apple_vxd_mbox_stats st;
++	struct apple_vxd_ring to_mtx, to_host;
++	struct apple_vxd_fence fences[APPLE_VXD_NUM_FENCES];
++	u32 raw_mtx, raw_host, rd, wr;
++	unsigned long flags;
++	bool ready;
++	unsigned int i;
+ 	int ret;
+ 
+ 	ret = pm_runtime_resume_and_get(vxd->dev);
+ 	if (ret)
+ 		return ret;
+ 
++	spin_lock_irqsave(&vxd->mbox_lock, flags);
++	ready = vxd->mbox_ready;
++	to_mtx = vxd->to_mtx;
++	to_host = vxd->to_host;
++	st = vxd->stats;
++	memcpy(fences, vxd->fences, sizeof(fences));
++	spin_unlock_irqrestore(&vxd->mbox_lock, flags);
++
++	raw_mtx = vxd_read(vxd, VXD_REG_TO_MTX_RING);
++	raw_host = vxd_read(vxd, VXD_REG_TO_HOST_RING);
++
+ 	seq_printf(m, "comms state      %#x\n", vxd_read(vxd, VXD_REG_COMMS_STATE));
++	seq_printf(m, "consumed (0x0)   %#x\n", vxd_read(vxd, VXD_REG_MTX_MSG_CONSUMED));
+ 	seq_printf(m, "comms 0x2008     %#x\n", vxd_read(vxd, VXD_REG_COMMS_2008));
++	seq_printf(m, "fw pc (200c)     %#x\n", vxd_read(vxd, VXD_REG_FW_PC));
+ 	seq_printf(m, "msg count (2010) %#x\n", vxd_read(vxd, VXD_REG_COMMS_MSG_COUNT));
+ 	seq_printf(m, "fw ready (2014)  %#x%s\n", vxd_read(vxd, VXD_REG_FW_READY_MAGIC),
+ 		   vxd->fw_loaded ? " (firmware alive)" : "");
+-	seq_printf(m, "fw build  2018   %#x\n", vxd_read(vxd, VXD_REG_FW_BUILD_1));
+-	seq_printf(m, "fw build  2024   %#x\n", vxd_read(vxd, VXD_REG_FW_BUILD_2));
++	seq_printf(m, "TO_MTX  (2024)   %#010x: base %#lx, %lu words\n", raw_mtx,
++		   FIELD_GET(VXD_RING_BASE, raw_mtx), FIELD_GET(VXD_RING_CAP, raw_mtx));
++	seq_printf(m, "TO_HOST (2018)   %#010x: base %#lx, %lu words\n", raw_host,
++		   FIELD_GET(VXD_RING_BASE, raw_host), FIELD_GET(VXD_RING_CAP, raw_host));
+ 	seq_printf(m, "to_host rd/wr    %#x/%#x\n",
+ 		   vxd_read(vxd, VXD_REG_TO_HOST_RD_INDEX),
+ 		   vxd_read(vxd, VXD_REG_TO_HOST_WR_INDEX));
+-	seq_printf(m, "to_mtx  rd/wr    %#x/%#x (free %u)\n",
+-		   vxd_read(vxd, VXD_REG_TO_MTX_RD_INDEX),
+-		   vxd_read(vxd, VXD_REG_TO_MTX_WR_INDEX),
+-		   apple_vxd_to_mtx_free(vxd));
++	rd = vxd_read(vxd, VXD_REG_TO_MTX_RD_INDEX);
++	wr = vxd_read(vxd, VXD_REG_TO_MTX_WR_INDEX);
++	seq_printf(m, "to_mtx  rd/wr    %#x/%#x", rd, wr);
++	if (ready && rd < to_mtx.cap && wr < to_mtx.cap)
++		seq_printf(m, " (free %u, %s)", vxd_ring_free(rd, wr, to_mtx.cap),
++			   rd == wr ? "all consumed" : "pending");
++	seq_puts(m, "\n");
+ 	seq_printf(m, "comms flags      %#x\n", vxd_read(vxd, VXD_REG_COMMS_FLAGS));
++	seq_printf(m, "irq status/enable %#x/%#x\n",
++		   vxd_read(vxd, VXD_REG_IRQ_STATUS),
++		   vxd_read(vxd, VXD_REG_IRQ_ENABLE));
++	seq_printf(m, "state            mbox_ready %d irq_armed %d irq_storm %d hw_ready %d fw_panicked %d init_seq %u fence_seq %#x\n",
++		   ready, vxd->irq_armed, vxd->irq_storm, vxd->hw_ready,
++		   vxd->fw_panicked, vxd->init_seq, vxd->fence_seq);
++	seq_printf(m, "stats            sent %u received %u irqs %u spurious %u completions %u unknown_fences %u faults %u contiguity %u panics %u unknown %u malformed %u last_irq_status %#x\n",
++		   st.sent, st.received, st.irqs, st.spurious, st.completions,
++		   st.unknown_fences, st.faults, st.contiguity, st.panics,
++		   st.unknown, st.malformed, st.last_irq_status);
++	for (i = 0; i < APPLE_VXD_NUM_FENCES; i++)
++		if (fences[i].state != APPLE_VXD_FENCE_FREE)
++			seq_printf(m, "fence[%u]         %s id %#x type %#x status %#x%s\n",
++				   i, vxd_fence_state_names[fences[i].state],
++				   fences[i].id, fences[i].type, fences[i].status,
++				   fences[i].error ? " error" : "");
++
++	if (ready) {
++		vxd_dump_ring(m, vxd, "TO_MTX", &to_mtx);
++		vxd_dump_ring(m, vxd, "TO_HOST", &to_host);
++	}
+ 
+ 	pm_runtime_put_autosuspend(vxd->dev);
+ 	return 0;
+@@ -132,9 +918,9 @@ static int apple_vxd_regs_dump_show(struct seq_file *m, void *v)
+ 		{ "entdec size (0x340)",	VXD_REG_ENTDEC_0_SIZE },
+ 		{ "entdec cfg (0x344)",		VXD_REG_ENTDEC_0_CFG },
+ 		{ "cmd ctrl (0x400)",		VXD_REG_CMD_CTRL },
+-		{ "cmd desc addr (0x410)",	VXD_REG_CMD_DESC_ADDR },
+-		{ "cmd desc size (0x414)",	VXD_REG_CMD_DESC_SIZE },
+-		{ "cmd desc status (0x418)",	VXD_REG_CMD_DESC_STATUS },
++		{ "irq status (0x410)",		VXD_REG_IRQ_STATUS },
++		{ "irq clear (0x414)",		VXD_REG_IRQ_CLEAR },
++		{ "irq enable (0x418)",		VXD_REG_IRQ_ENABLE },
+ 		{ "man clk enable (0x440)",	VXD_REG_CR_PVDEC_MAN_CLK_ENABLE },
+ 		{ "mtx mem cfg (0x500)",	VXD_REG_MTX_MEM_CFG },
+ 		{ "dmac status (0x504)",	VXD_REG_DMAC_STATUS },
+@@ -192,6 +978,7 @@ int apple_vxd_mbox_init(struct apple_vxd_dev *vxd)
+ 	debugfs_create_file("mbox", 0444, dir, vxd, &apple_vxd_mbox_dump_fops);
+ 	debugfs_create_file("regs", 0444, dir, vxd, &apple_vxd_regs_dump_fops);
+ 	debugfs_create_file("boot", 0200, dir, vxd, &apple_vxd_boot_trigger_fops);
++	debugfs_create_file("ping", 0200, dir, vxd, &apple_vxd_ping_fops);
+ 	return 0;
+ }
+ 
+@@ -200,3 +987,58 @@ void apple_vxd_mbox_fini(struct apple_vxd_dev *vxd)
+ 	debugfs_remove_recursive(vxd->debugfs_dir);
+ 	vxd->debugfs_dir = NULL;
+ }
++
++/* --- self-test: protocol arithmetic only, no MMIO ------------------------ */
++
++int apple_vxd_mbox_selftest(struct apple_vxd_dev *vxd)
++{
++	static const struct { u32 rd, wr, cap, free; } frees[] = {
++		{ 0, 0, 16, 15 }, { 5, 3, 16, 1 }, { 3, 5, 16, 13 },
++		{ 0, 15, 16, 0 }, { 7, 6, 16, 0 },
++	};
++	const struct apple_vxd_msg_ticket t = { .start = 14, .nwords = 4, .end = 2 };
++	u32 msg[VXD_INIT_MSG_WORDS];
++	const char *what;
++	unsigned int i;
++
++	what = "ring free-slot formula";
++	for (i = 0; i < ARRAY_SIZE(frees); i++)
++		if (vxd_ring_free(frees[i].rd, frees[i].wr, frees[i].cap) !=
++		    frees[i].free)
++			goto fail;
++
++	what = "ring wrap";
++	if (vxd_ring_next(15, 16) || vxd_ring_next(3, 16) != 4 ||
++	    vxd_ring_dist(14, 2, 16) != 4)
++		goto fail;
++
++	what = "consumption check";
++	if (vxd_ring_consumed(&t, 14, 2, 16) ||		/* untouched */
++	    vxd_ring_consumed(&t, 0, 2, 16) ||		/* half taken */
++	    vxd_ring_consumed(&t, 10, 2, 16) ||		/* older pending */
++	    !vxd_ring_consumed(&t, 2, 2, 16) ||		/* taken */
++	    !vxd_ring_consumed(&t, 4, 6, 16))		/* taken, more queued */
++		goto fail;
++
++	what = "message header";
++	if (apple_vxd_msg_hdr(0xabc0, VXD_MSG_NOP_FIRST, 2) != 0xabc08302 ||
++	    vxd_fence_id(0xabc, 1) != 0xabc2)
++		goto fail;
++
++	what = "init message";
++	apple_vxd_build_init_msg(msg, 0x12345000, 0x17e98, 0x1ff);
++	if (msg[0] != 0x8005 || msg[1] != 0x12345000 || msg[2] != 0xff0017 ||
++	    msg[3] != 0xffff0000 || msg[4])
++		goto fail;
++
++	what = "GART entry";
++	if (VXD_GART_PTE(0x803758000ULL) != 0x08037581 ||
++	    VXD_GART_PTE(0xfffffff000ULL) != 0xfffffff1)
++		goto fail;
++
++	return 0;
++
++fail:
++	dev_err(vxd->dev, "mailbox self-test FAILED at %s\n", what);
++	return -EINVAL;
++}
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-regs.h b/drivers/media/platform/apple/vxd/apple-vxd-regs.h
+index 6d681d83302eb7b9128774fc5f6a58214fd5816e..724b5bf4b58a1d3e8815d2abbc687d44295a1e7c 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-regs.h
++++ b/drivers/media/platform/apple/vxd/apple-vxd-regs.h
+@@ -75,14 +75,32 @@
+ #define VXD_REG_ENTDEC_0_CFG		0x0344
+ 
+ /*
+- * CMD block (picture command interface).  The reset value 0xffff0000 is
+- * written before and after firmware load (known state v1/v2 [E]).
++ * MTX -> host "message consumed" word: the firmware stores the word count
++ * of the message it last took from TO_MTX here (fw 0x1000a90 [E]).
++ */
++#define VXD_REG_MTX_MSG_CONSUMED	0x0000
++
++/* Host -> MTX doorbell, written 1 after every message push [E]. */
++#define VXD_REG_MTX_DOORBELL		0x0088
++
++/*
++ * CMD block control.  The reset value 0xffff0000 is written before and
++ * after firmware load (known state v1/v2 [E]).
+  */
+ #define VXD_REG_CMD_CTRL		0x0400
+ #define  VXD_CMD_CTRL_RESET		0xffff0000
+-#define VXD_REG_CMD_DESC_ADDR		0x0410
+-#define VXD_REG_CMD_DESC_SIZE		0x0414
+-#define VXD_REG_CMD_DESC_STATUS		0x0418
++
++/*
++ * Host interrupt: status / write-1-to-clear / enable.  The firmware raises
++ * bit 20 by writing it to 0x410 when it posts a TO_HOST message with the
++ * interrupt flag (fw 0x1000fe4 [E]); the kext ISR reads 0x410, clears with
++ * 0x414 = 0x100000 before draining (0xfffffff00629a0ac [E]).  Known state
++ * writes 0 to the enable and all-ones to the clear; boot enables bit 20.
++ */
++#define VXD_REG_IRQ_STATUS		0x0410
++#define VXD_REG_IRQ_CLEAR		0x0414
++#define VXD_REG_IRQ_ENABLE		0x0418
++#define  VXD_IRQ_FW_MSG			BIT(20)
+ 
+ /* DMAC */
+ #define VXD_REG_MTX_MEM_CFG		0x0500
+@@ -111,26 +129,82 @@
+ #define VXD_REG_PIPE_STATUS_2		0x40c4
+ 
+ /*
+- * Host<->MTX message rings (comms).  The four indices are confirmed by the
+- * kext recovery path and its free-slot helper:
+- *   0x201c TO_HOST_RD_INDEX   0x2020 TO_HOST_WR_INDEX
+- *   0x2028 TO_MTX_RD_INDEX    0x2030 TO_MTX_WR_INDEX
++ * Host<->MTX message rings (comms), docs/periph/ds-vxd-decode-protocol.md
++ * section 2.  The four indices are confirmed by the kext recovery path:
++ *   0x201c TO_HOST_RD_INDEX (host)   0x2020 TO_HOST_WR_INDEX (fw)
++ *   0x2028 TO_MTX_RD_INDEX  (fw)     0x2030 TO_MTX_WR_INDEX  (host)
+  * FW_READY_MAGIC is polled (0 = the kext clears it, 0xa5a5a5a5 = firmware
+- * alive) and FW_BUILD_1/2 return the firmware build halves after boot.
++ * alive).  After the magic the firmware has published each ring's geometry
++ * as (base_bytes << 16) | capacity_words: word i of a ring is the register
++ * at VXD_RING_WINDOW + base + 4 * i.  Rounds 1-3 called 0x2018/0x2024
++ * "build halves".
+  */
+ #define VXD_REG_COMMS_STATE		0x2000
+ #define VXD_REG_COMMS_2008		0x2008	/* cleared at ring setup [E] */
+-#define VXD_REG_COMMS_MSG_COUNT		0x2010
++#define VXD_REG_FW_PC			0x200c	/* fw stores its PC; host clears */
++#define VXD_REG_COMMS_MSG_COUNT		0x2010	/* fw->host messages posted */
+ #define VXD_REG_FW_READY_MAGIC		0x2014
+ #define  VXD_FW_READY_MAGIC		0xa5a5a5a5
+-#define VXD_REG_FW_BUILD_1		0x2018
++#define VXD_REG_TO_HOST_RING		0x2018
+ #define VXD_REG_TO_HOST_RD_INDEX	0x201c
+ #define VXD_REG_TO_HOST_WR_INDEX	0x2020
+-#define VXD_REG_FW_BUILD_2		0x2024
++#define VXD_REG_TO_MTX_RING		0x2024
+ #define VXD_REG_TO_MTX_RD_INDEX		0x2028
+ #define VXD_REG_COMMS_FLAGS		0x202c
+ #define VXD_REG_TO_MTX_WR_INDEX		0x2030
+-#define VXD_REG_COMMS_200C		0x200c	/* cleared at ring setup [E] */
++
++#define VXD_RING_WINDOW			0x2000
++#define  VXD_RING_BASE			GENMASK(31, 16)
++#define  VXD_RING_CAP			GENMASK(15, 0)
++
++/*
++ * Message header, both directions: (fence << 16) | (type << 8) | nwords,
++ * nwords counting the header.  The firmware drops TO_MTX messages longer
++ * than 0x14 words (fw 0x1000b80) and a zero-length header wedges its
++ * reader (fw 0x1000a4c: it re-publishes the same read index forever).
++ * The kext refuses TO_HOST messages of 0xf0 / 4 = 60 words or more.
++ */
++#define VXD_MSG_NWORDS			GENMASK(6, 0)
++#define VXD_MSG_TYPE			GENMASK(15, 8)
++#define VXD_MSG_FENCE			GENMASK(31, 16)
++#define VXD_MSG_TO_MTX_MAX_WORDS	0x14
++#define VXD_MSG_TO_HOST_MAX_WORDS	(0xf0 / 4 - 1)
++
++/*
++ * Host -> firmware types: the DEVA dispatcher (fw 0x1000ad4) handles
++ * 0x80..0x8b.  0x83..0x85 jump straight back to the reader loop: they are
++ * consumed and dropped, which makes them the benign ping.
++ */
++#define VXD_MSG_INIT			0x80
++#define VXD_MSG_DECODE			0x81
++#define VXD_MSG_NOP_FIRST		0x83
++#define VXD_MSG_NOP_LAST		0x85
++#define VXD_MSG_DEBLOCK			0x87
++#define VXD_MSG_RENDER_TARGET		0x88
++
++/* Firmware -> host types (ProcessFWMessages 0xfffffff006299bb4 [E]). */
++#define VXD_MSG_COMPLETION		0xc0
++#define VXD_MSG_CONTIGUITY		0xc6
++#define VXD_MSG_PANIC			0xc7
++
++/* 0xc0 word 2: fault class, "after core reset", REATTEMPT_SINGLEPIPE. */
++#define VXD_COMPLETION_FAULT		GENMASK(28, 27)
++#define VXD_COMPLETION_AFTER_RESET	BIT(28)
++#define VXD_COMPLETION_REATTEMPT	BIT(31)
++
++/* 0x80 init message (InitMessageBuffers 0xfffffff006298d40 [E]). */
++#define VXD_INIT_MSG_WORDS		5
++#define VXD_INIT_PAGES			GENMASK(15, 0)
++#define VXD_INIT_SEQ			GENMASK(23, 16)
++#define VXD_INIT_SENTINEL		0xffff0000
++
++/*
++ * Decode-family message w1 low-half flags (SubmitCommandBufferInternal
++ * 0xfffffff00628a8d4 [E]): last packet of a submission | interrupt the
++ * host on completion; more packets follow.
++ */
++#define VXD_MSG_FLAG_LAST		0x4004
++#define VXD_MSG_FLAG_MORE		0x2000
+ 
+ #define VXD_MMIO_SIZE			0x100000
+ 
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-v4l2.c b/drivers/media/platform/apple/vxd/apple-vxd-v4l2.c
+index 21c362eba265a8b3441b1eaab1ee1f35df6ab21e..90bab0b27aa12bf7d61b462c88e939c940202ed9 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-v4l2.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-v4l2.c
+@@ -6,8 +6,8 @@
+  * media controller entity, mplane m2m queues with the request API
+  * mandatory on the output queue, and the stateless H.264 control set.
+  * The hardware submission layer behind the H.264 backend refuses jobs
+- * until R2 wires the firmware mailbox; that failure path is part of the
+- * bring-up contract (test plan T6).
++ * until the command-stream generator (R3c) lands; that failure path is
++ * part of the bring-up contract (test plan T6).
+  *
+  * Round 3: every handler body takes the context, not the file, so the
+  * register-time self-test runs the same code as open(), the format ioctls
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd.h b/drivers/media/platform/apple/vxd/apple-vxd.h
+index 7f7ea3c6c8bdbfef9cd5178313cfe0ec1819e9f7..f6c7193cdfd7315a562d9d38b7d6745b6fc41a7c 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd.h
++++ b/drivers/media/platform/apple/vxd/apple-vxd.h
+@@ -9,12 +9,17 @@
+  *
+  *   R0  probe without firmware: power domain, MMIO, IRQ, core revision
+  *   R1  boot the resident DEVA image on the MTX
+- *   R2  host<->firmware message rings (registers wired, protocol pending)
+- *   R3+ V4L2 stateless H.264 submission skeleton (ABI pending R2)
++ *   R3a host<->firmware mailbox: ring geometry, 0x80 init message, push,
++ *       IRQ drain, fences, debugfs ping (ds-vxd-decode-protocol.md)
++ *   R3b command buffers: 8 x 64 KiB pool, packet container, command
++ *       emitters, GART-mapped V4L2 buffers (ds-vxd-cmdstream.md)
++ *   R3c+ H.264 command-stream generator and the decode submit (pending)
+  */
+ #ifndef __APPLE_VXD_H__
+ #define __APPLE_VXD_H__
+ 
++#include <linux/bitfield.h>
++#include <linux/completion.h>
+ #include <linux/delay.h>
+ #include <linux/device.h>
+ #include <linux/dma-mapping.h>
+@@ -136,10 +141,66 @@ struct apple_vxd_gart {
+ 	bool dirty;
+ };
+ 
++/*
++ * One message ring as published by the firmware after the ready magic:
++ * word i lives at VXD_RING_WINDOW + base + 4 * i.  Read once per boot,
++ * validated against the MMIO window, never trusted beyond it.
++ */
++struct apple_vxd_ring {
++	u32 base;			/* byte offset from VXD_RING_WINDOW */
++	u32 cap;			/* capacity in words */
++};
++
++/* Where a pushed message sits in TO_MTX, for the consumption check. */
++struct apple_vxd_msg_ticket {
++	u32 start;			/* write index before the push */
++	u32 nwords;
++	u32 end;			/* write index after the push */
++};
++
++/*
++ * Fence tracking.  The fence is the 16-bit tag in w0[31:16] of every
++ * message; the firmware echoes it in the 0xc0 completion.  Apple builds it
++ * as (submission << 4) | (packet * 2 & 0xe) | core (0xfffffff00628a8d4
++ * [E]), and routes completions to core (fence & 1).  A slot is armed
++ * before the push and signalled from the IRQ drain.
++ */
++#define APPLE_VXD_NUM_FENCES		8
++
++enum apple_vxd_fence_state {
++	APPLE_VXD_FENCE_FREE = 0,
++	APPLE_VXD_FENCE_ARMED,		/* message pushed, completion pending */
++	APPLE_VXD_FENCE_SIGNALLED,	/* 0xc0 seen (or failed by panic/teardown) */
++};
++
++struct apple_vxd_fence {
++	enum apple_vxd_fence_state state;
++	u16 id;				/* w0[31:16] */
++	u8 type;			/* message type it tagged */
++	bool error;			/* fault bits, panic or teardown */
++	u32 status;			/* 0xc0 word 2 */
++	struct completion done;
++};
++
++struct apple_vxd_mbox_stats {
++	u32 sent;			/* messages pushed to TO_MTX */
++	u32 received;			/* messages drained from TO_HOST */
++	u32 irqs;			/* handled interrupts */
++	u32 spurious;			/* interrupts without 0x410 bit 20 */
++	u32 completions;		/* 0xc0 */
++	u32 unknown_fences;		/* 0xc0 for no armed fence */
++	u32 faults;			/* 0xc0 with fault bits */
++	u32 contiguity;			/* 0xc6 */
++	u32 panics;			/* 0xc7 */
++	u32 unknown;			/* anything else */
++	u32 malformed;			/* bad length / index */
++	u32 last_irq_status;		/* 0x410 at the last interrupt */
++};
++
+ /*
+  * Active decode job.  Submission is one picture: one stateless request, one
+  * bitstream buffer, one capture surface.  Completion arrives from the
+- * firmware through the TO_HOST ring (R2).
++ * firmware through the TO_HOST ring as a 0xc0 message.
+  */
+ struct apple_vxd_run {
+ 	struct vb2_v4l2_buffer *src;
+@@ -151,11 +212,13 @@ struct apple_vxd_dev {
+ 	const struct apple_vxd_variant *variant;
+ 
+ 	void __iomem *regs;
++	resource_size_t regs_size;	/* bounds every ring access */
+ 	int irq;
+ 
+ 	/* Bring-up state (R0/R1). */
+ 	struct mutex power_lock;	/* boot vs. runtime suspend */
+-	bool hw_ready;			/* core up + firmware alive */
++	bool hw_ready;			/* firmware took its init message */
++	bool selftest_failed;		/* protocol self-test: no boot */
+ 	u32 core_id;
+ 	u32 core_rev;
+ 	u32 va_offset;			/* device-VA base offset (module param) */
+@@ -170,17 +233,36 @@ struct apple_vxd_dev {
+ 	u32 cfg_flags;			/* InitializeCoreConfig core[0x54] */
+ 
+ 	/* R1: firmware buffer + boot results. */
+-	bool fw_loaded;
++	bool fw_loaded;			/* MTX up: ready magic seen */
+ 	void *fw_vaddr;
+ 	dma_addr_t fw_dma;
+-	size_t fw_size;
++	size_t fw_size;			/* PAGE_ALIGNed allocation */
++	size_t fw_blob_size;		/* image bytes (init message pages) */
+ 	u32 fw_dev_va;
+-	u32 fw_build_1, fw_build_2;	/* raw register halves */
+ 	struct apple_vxd_mapping fw_map;	/* GART mapping of fw_dev_va */
+ 
+ 	struct apple_vxd_gart gart;
+ 
+-	/* Active job (R3+; submission currently refuses until R2 lands). */
++	/*
++	 * R3a: host<->MTX mailbox.  mbox_lock covers ring MMIO in both
++	 * directions, the fence table and the stats; it is taken from the
++	 * hard IRQ handler.  mbox_ready/hw_ready/irq_armed change only under
++	 * power_lock.
++	 */
++	spinlock_t mbox_lock;
++	struct apple_vxd_ring to_mtx;
++	struct apple_vxd_ring to_host;
++	bool mbox_ready;		/* geometry read and valid */
++	bool irq_armed;			/* IRQ line enabled */
++	bool irq_storm;			/* disabled by the storm guard */
++	u32 irq_empty;			/* consecutive IRQs with nothing to drain */
++	bool fw_panicked;		/* 0xc7 seen since boot */
++	u16 init_seq;			/* InitMessageBuffers core[0x70] */
++	u16 fence_seq;			/* submission counter, fence[15:4] */
++	struct apple_vxd_fence fences[APPLE_VXD_NUM_FENCES];
++	struct apple_vxd_mbox_stats stats;
++
++	/* Active job (R3d; decode jobs fail until the command stream lands). */
+ 	spinlock_t job_lock;
+ 	bool job_active;
+ 	struct delayed_work watchdog_work;
+@@ -200,7 +282,7 @@ struct apple_vxd_dev {
+ 	 */
+ 	const struct apple_vxd_coded_fmt_desc *coded_fmts;
+ 	unsigned int num_coded_fmts;
+-	struct dentry *debugfs_dir;	/* mbox/regs dumps + boot trigger (R2) */
++	struct dentry *debugfs_dir;	/* dumps, boot trigger, ping */
+ };
+ 
+ struct apple_vxd_ctx {
+@@ -247,6 +329,14 @@ struct apple_vxd_coded_fmt_desc {
+ 	const struct apple_vxd_decoded_fmt_desc *decoded_fmts;
+ };
+ 
++/* Message header word: (fence << 16) | (type << 8) | nwords. */
++static inline u32 apple_vxd_msg_hdr(u16 fence, u8 type, u32 nwords)
++{
++	return FIELD_PREP(VXD_MSG_FENCE, fence) |
++	       FIELD_PREP(VXD_MSG_TYPE, type) |
++	       FIELD_PREP(VXD_MSG_NWORDS, nwords);
++}
++
+ /* Register access (CPVDECCore::ReadReg/WriteReg [E], native endian). */
+ static inline void vxd_write(struct apple_vxd_dev *vxd, u32 off, u32 val)
+ {
+@@ -295,6 +385,22 @@ void apple_vxd_fw_cleanup(struct apple_vxd_dev *vxd);
+ /* mbox.c */
+ int apple_vxd_mbox_init(struct apple_vxd_dev *vxd);
+ void apple_vxd_mbox_fini(struct apple_vxd_dev *vxd);
++int apple_vxd_mbox_open(struct apple_vxd_dev *vxd);
++int apple_vxd_mbox_start(struct apple_vxd_dev *vxd);
++void apple_vxd_mbox_stop(struct apple_vxd_dev *vxd);
++int apple_vxd_msg_push(struct apple_vxd_dev *vxd, const u32 *msg,
++		       struct apple_vxd_msg_ticket *ticket);
++int apple_vxd_msg_wait_consumed(struct apple_vxd_dev *vxd,
++				const struct apple_vxd_msg_ticket *ticket,
++				unsigned int timeout_us, unsigned int *waited_us);
++unsigned int apple_vxd_mbox_drain(struct apple_vxd_dev *vxd);
++struct apple_vxd_fence *apple_vxd_fence_arm(struct apple_vxd_dev *vxd,
++					    unsigned int packet, u8 type);
++void apple_vxd_fence_release(struct apple_vxd_dev *vxd,
++			     struct apple_vxd_fence *fence);
++void apple_vxd_build_init_msg(u32 msg[VXD_INIT_MSG_WORDS], u32 fw_va,
++			      size_t fw_bytes, u16 seq);
++int apple_vxd_mbox_selftest(struct apple_vxd_dev *vxd);
+ int apple_vxd_submit(struct apple_vxd_ctx *ctx, struct apple_vxd_run *run);
+ 
+ /* v4l2.c */

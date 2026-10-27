@@ -1,0 +1,41 @@
+From 681cceb6e8c3cf00712c666d0116c64623040483 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 11:20:41 +0000
+Subject: [PATCH 42/55] arm64: dts: apple: connect J71t charger to Tristar VBUS
+ supplier
+
+Describe CBTL1610 at the ADT I2C0 address and connect it to the
+J71t-only charger. The source driver is read-only; a measured Mac
+current budget still requires explicit userspace authorization.
+---
+ arch/arm64/boot/dts/apple/s8003-j71t-periph.dtsi | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/boot/dts/apple/s8003-j71t-periph.dtsi b/arch/arm64/boot/dts/apple/s8003-j71t-periph.dtsi
+index 5ab7fbc4a3..a7f6f78d6b 100644
+--- a/arch/arm64/boot/dts/apple/s8003-j71t-periph.dtsi
++++ b/arch/arm64/boot/dts/apple/s8003-j71t-periph.dtsi
+@@ -76,10 +76,11 @@ periph_pmu_gpio: gpio {
+ 	};
+ 
+ 	charger@180 {
+-		/* Status only: J172 input-current policy must never run on J71t. */
++		/* Current policy is explicitly armed for the verified Mac source. */
+ 		compatible = "apple,j71t-d2365-charger";
+ 		reg = <0x180 0x1e>, <0xa00 0x0d>;
+ 		reg-names = "status", "control";
++		power-supplies = <&periph_tristar>;
+ 	};
+ };
+ 
+@@ -93,3 +94,10 @@ light-sensor@39 {
+ 		firmware-name = "apple/j71t-LSCI.bin";
+ 	};
+ };
++
++&i2c0 {
++	periph_tristar: power-controller@1a {
++		compatible = "apple,j71t-cbtl1610-power";
++		reg = <0x1a>;
++	};
++};

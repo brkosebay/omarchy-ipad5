@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 16:57:58 +0000
+Subject: [PATCH 02/21] arm64: dts: apple: s8000/s8003: add the VXD video decoder
+ node
+
+vxd@7F00000 from the ADT, translated to the Linux reg window
+(0x2_07f00000 + 1 MiB), AIC IRQ 157 and the ps_vdec power domain.  There
+is no DART and no separate clock provider node in this tree; the driver
+brings the block up through the genpd alone (study open question 7).
+The DEVA firmware is not described by DT; Linux requests it from the
+firmware loader as /lib/firmware/apple/vxd-deva.bin.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ arch/arm64/boot/dts/apple/s800-0-3.dtsi | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/apple/s800-0-3.dtsi b/arch/arm64/boot/dts/apple/s800-0-3.dtsi
+index fc7dc7c5ba3a4ff53b104b7f1b87d5a4766d8c9f..d811be30ad653fab952e14b68e6ecd75983953aa 100644
+--- a/arch/arm64/boot/dts/apple/s800-0-3.dtsi
++++ b/arch/arm64/boot/dts/apple/s800-0-3.dtsi
+@@ -76,6 +76,21 @@ cpufreq: performance-controller@202220000 {
+ 			#performance-domain-cells = <0>;
+ 		};
+ 
++		/*
++		 * Imagination PowerVR MSVDX ("VXD") hardware video decoder,
++		 * ADT node vxd@7F00000 (vxd-version 7, level 4.2 H.264).
++		 * No DART: the core carries its own two-level GART, which
++		 * the apple-vxd driver programs.  The DEVA firmware is not
++		 * in the DT (the iOS kext embeds it); Linux loads it from
++		 * /lib/firmware/apple/vxd-deva.bin.
++		 */
++		vxd@207f00000 {
++			compatible = "apple,s8000-vxd";
++			reg = <0x2 0x07f00000 0x0 0x100000>;
++			interrupts = <AIC_IRQ 157 IRQ_TYPE_LEVEL_HIGH>;
++			power-domains = <&ps_vdec>;
++		};
++
+ 		serial0: serial@20a0c0000 {
+ 			compatible = "apple,s5l-uart";
+ 			reg = <0x2 0x0a0c0000 0x0 0x4000>;

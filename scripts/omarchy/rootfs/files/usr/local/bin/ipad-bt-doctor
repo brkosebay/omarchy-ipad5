@@ -1,0 +1,276 @@
+#!/bin/bash
+# Why won't a Bluetooth keyboard (re)connect? What the iPad's controller is
+# really doing, read from the controller itself.
+#
+#   ipad-bt-doctor                    report (read-only)
+#   ipad-bt-doctor --ensure-pagescan  turn "connectable" on if it's off, so a
+#                                     keyboard's own reconnect (a key press)
+#                                     always reaches the controller (boot unit
+#                                     and timer: linux-a9-bt-pagescan)
+#   ipad-bt-doctor --probe            with the keyboard disconnected: does
+#                                     the kernel's accept list alone keep page
+#                                     scan on? Names the side that fails
+#   ipad-bt-doctor --trace-restart    restart bluetooth under btmon without
+#                                     the workaround: the boot sequence, with
+#                                     the kernel's and BlueZ's result
+#
+# Background (BlueZ 5.87 and Linux 7.3 sources): bluetoothd deliberately
+# turns the adapter's "connectable" setting off when the kernel manages
+# connections, and puts every bonded BR/EDR device on the kernel's accept
+# list instead (src/adapter.c, src/device.c btd_device_set_temporary). The
+# kernel page-scans whenever an accept-list device is disconnected
+# (net/bluetooth/hci_sync.c hci_update_scan_sync). So "connectable" missing
+# from `btmgmt info` is normal; what matters is the controller's Scan Enable,
+# which this reads over a raw HCI socket, with its address and page-scan
+# timing. A keyboard (HID "reconnect initiate") pages the host itself when a
+# key wakes it: the host must be page-scanning, at the address the keyboard
+# was paired with.
+#
+# Runs as root (re-executes with sudo). linux-a9: docs/omarchy/test-plan.md.
+# The Mac can run it on a live image that lacks it:
+#   scripts/omarchy/ssh.sh 'sudo bash -s' <scripts/omarchy/rootfs/files/usr/local/bin/ipad-bt-doctor
+set -uo pipefail
+
+if (( EUID != 0 )); then
+  exec sudo -- "$0" "$@"
+fi
+
+# Raw HCI: Read_BD_ADDR, Read_Scan_Enable, Read_Page_Scan_Activity,
+# Read_Page_Scan_Type. Prints key=value lines.
+hci_read() {
+  python3 - "$@" <<'EOF'
+import socket, struct, sys, time
+
+dev = 0
+cmds = {
+    "bdaddr": 0x1009,          # Informational: Read_BD_ADDR
+    "scan_enable": 0x0C19,     # Read_Scan_Enable
+    "page_scan_activity": 0x0C1B,
+    "page_scan_type": 0x0C46,
+}
+try:
+    s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_RAW, socket.BTPROTO_HCI)
+    s.bind((dev,))
+    # struct hci_ufilter: u32 type_mask, u32 event_mask[2], le16 opcode
+    s.setsockopt(socket.SOL_HCI, socket.HCI_FILTER,
+                 struct.pack("<IIIH2x", 1 << 4, 0xFFFFFFFF, 0xFFFFFFFF, 0))
+    s.settimeout(2)
+except OSError as e:
+    print(f"error=raw HCI socket: {e}")
+    sys.exit(0)
+
+def run(opcode):
+    s.send(struct.pack("<BHB", 1, opcode, 0))
+    end = time.time() + 2
+    while time.time() < end:
+        pkt = s.recv(260)
+        # event 0x0e Command Complete: ncmd, opcode, status, params
+        if len(pkt) >= 7 and pkt[0] == 4 and pkt[1] == 0x0E:
+            if struct.unpack_from("<H", pkt, 4)[0] == opcode:
+                return pkt[6], pkt[7:]
+    return None, b""
+
+for name, opcode in cmds.items():
+    try:
+        status, p = run(opcode)
+    except OSError as e:
+        print(f"{name}=error {e}")
+        continue
+    if status is None:
+        print(f"{name}=timeout")
+    elif status:
+        print(f"{name}=status 0x{status:02x}")
+    elif name == "bdaddr":
+        print("bdaddr=" + ":".join(f"{b:02X}" for b in reversed(p[:6])))
+    elif name == "scan_enable":
+        v = p[0]
+        print(f"scan_enable=0x{v:02x} page={'on' if v & 2 else 'off'} inquiry={'on' if v & 1 else 'off'}")
+    elif name == "page_scan_activity":
+        interval, window = struct.unpack_from("<HH", p)
+        print(f"page_scan_activity=interval {interval * 0.625:.1f} ms, window {window * 0.625:.2f} ms")
+    elif name == "page_scan_type":
+        print(f"page_scan_type={'interlaced' if p[0] else 'standard'}")
+EOF
+}
+
+field() { sed -n "s/^[[:space:]]*$2: //p" <<<"$1" | head -1; }
+
+bonded_disconnected() {
+  local mac info
+  while read -r _ mac _; do
+    info=$(bluetoothctl info "$mac" 2>/dev/null)
+    [[ $(field "$info" Bonded) == yes && $(field "$info" Connected) == no ]] && echo "$mac"
+  done < <(bluetoothctl devices Paired 2>/dev/null)
+}
+
+settings() { btmgmt info 2>/dev/null | sed -n 's/^[[:space:]]*current settings: //p' | head -1; }
+
+# Right after bluetoothd starts, wait up to 30 s for it to power the
+# controller (AutoEnable). Later (the timer) look once: powered off then is the
+# user's choice, not something to wait out.
+wait_powered() {
+  local i tries=1 since now
+  systemctl is-active -q bluetooth || { echo "bluetooth.service is not running"; return 1; }
+  since=$(systemctl show -p ActiveEnterTimestampMonotonic --value bluetooth)
+  now=$(cut -d. -f1 /proc/uptime)
+  (( now - ${since:-0} / 1000000 < 45 )) && tries=30
+  for (( i = 0; i < tries; i++ )); do
+    [[ " $(settings) " == *" powered "* ]] && return 0
+    (( tries > 1 )) && sleep 1
+  done
+  (( tries > 1 )) && echo "the controller is not powered"
+  return 1
+}
+
+# Connectable on, always, once the controller is powered. The accept list
+# alone should keep page scan on while a bonded device is disconnected, but on
+# this iPad the K2 never got through (device boots 4 and 5, and after it
+# dropped right after pairing: no Connect Request in btmon) until connectable
+# was turned on by hand; and bluetoothd turns connectable off again
+# whenever discoverable goes off (adapter.c, kernel connection control), so
+# this is re-asserted by linux-a9-bt-pagescan.timer too. Connectable only lets
+# a device page us: profiles still need a bond (bluetoothd rejects the rest),
+# which is what every phone does. Quiet when there's nothing to do (the timer);
+# when it acts, it logs the page scan it found first, which tells the two
+# causes apart in the journal (--probe tests it directly).
+ensure_pagescan() {
+  systemctl is-active -q bluetooth || return 0
+  wait_powered || return 0
+  [[ " $(settings) " == *" connectable "* ]] && return 0
+  echo "connectable was off; before: $(hci_read | sed -n 's/^scan_enable=//p')," \
+    "bonded and disconnected: $(bonded_disconnected | tr '\n' ' ')"
+  btmgmt connectable on >/dev/null
+  echo "connectable on; after: $(hci_read | sed -n 's/^scan_enable=//p')"
+}
+
+# Which side drops page scan: with connectable off, the kernel page-scans only
+# for disconnected accept-list devices. Turns connectable off for a moment,
+# reads the controller's Scan Enable and the kernel's accept list, then turns
+# connectable back on. Run it while the keyboard is disconnected.
+probe() {
+  local dbg=/sys/kernel/debug/bluetooth/hci0 list scan addr k
+  wait_powered || { echo "no powered controller (btmgmt info)"; return 1; }
+  [[ -d $dbg ]] || mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+  addr=$(hci_read | sed -n 's/^bdaddr=//p')
+  echo "controller $addr, stored adapters: $(ls /var/lib/bluetooth 2>/dev/null | tr '\n' ' ')"
+  local -a bonded
+  mapfile -t bonded < <(bonded_disconnected)
+  (( ${#bonded[@]} )) || { echo "no bonded device is disconnected: disconnect the keyboard first (bluetoothctl disconnect MAC)"; return 1; }
+  echo "bonded and disconnected: ${bonded[*]}"
+  btmgmt connectable off >/dev/null
+  # The kernel re-evaluates Scan Enable from its queue; give it a moment.
+  sleep 1
+  scan=$(hci_read | sed -n 's/^scan_enable=//p')
+  list=$(cat "$dbg/device_list" 2>/dev/null)
+  btmgmt connectable on >/dev/null
+  echo "with connectable off: scan_enable=$scan"
+  echo "kernel accept list (device_list):"
+  sed 's/^/  /' <<<"${list:-(empty or no debugfs)}"
+  echo "connectable is back on: $(hci_read | sed -n 's/^scan_enable=//p')"
+  echo "## verdict"
+  for k in "${bonded[@]}"; do
+    if ! grep -qi "^$k (type 0)" <<<"$list"; then
+      echo "$k is NOT on the kernel accept list: bluetoothd never added it (Add Device);"
+      echo "  journalctl -b -u bluetooth | grep -i 'accept list' (needs bluetoothd -d), btmon over 'systemctl restart bluetooth'"
+    elif [[ $scan == *"page=on"* ]]; then
+      echo "$k is on the accept list and the kernel page-scans for it now: the accept list works,"
+      echo "  so page scan was lost at power-on or later (a missed hci_update_scan_sync); connectable covers it"
+    else
+      echo "$k is on the accept list but page scan stayed OFF: the kernel's scan update isn't running"
+      echo "  (net/bluetooth/hci_sync.c hci_update_scan_sync: scanning_paused, or HCI_PSCAN out of step with the controller)"
+    fi
+  done
+}
+
+# The boot sequence again, recorded: bluetoothd stops (powers the controller
+# off), starts, loads the bonded devices (Add Device, while unpowered) and
+# powers on (kernel hci_powered_update_sync, which should write Scan Enable).
+# The pagescan unit and timer are held off meanwhile, so what's left is
+# BlueZ's and the kernel's own result; then connectable is restored. Drops the
+# keyboard's connection. Trace in /var/tmp/ipad-bt-restart.snoop (btmon -r).
+trace_restart() {
+  local snoop=/var/tmp/ipad-bt-restart.snoop dbg=/sys/kernel/debug/bluetooth/hci0 pid i
+  command -v btmon >/dev/null || { echo "no btmon"; return 1; }
+  [[ -d $dbg ]] || mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+  systemctl stop linux-a9-bt-pagescan.timer 2>/dev/null
+  systemctl mask --runtime -q linux-a9-bt-pagescan.service 2>/dev/null
+  btmon -w "$snoop" >/dev/null 2>&1 &
+  pid=$!
+  sleep 1
+  systemctl restart bluetooth
+  for (( i = 0; i < 30; i++ )); do
+    [[ " $(settings) " == *" powered "* ]] && break
+    sleep 1
+  done
+  # bluetoothd's own follow-up commands after power-on.
+  sleep 5
+  echo "## after a bluetooth restart, without linux-a9-bt-pagescan"
+  echo "settings: $(settings)"
+  hci_read | grep -E '^(bdaddr|scan_enable)='
+  echo "kernel accept list:"; sed 's/^/  /' "$dbg/device_list" 2>/dev/null
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  systemctl unmask --runtime -q linux-a9-bt-pagescan.service 2>/dev/null
+  # One line per packet: its header, the command a completion is for, and
+  # the fields that matter here.
+  btmon -r "$snoop" 2>/dev/null | awk '
+    function flush() { if (h != "") print h (sub_ ? " | " sub_ : "") f; h = ""; sub_ = ""; f = "" }
+    /^[<>@] / { flush(); h = $0; sub(/ +#[0-9]+ .*$/, "", h); sub(/ +\[hci0\].*$/, "", h); first = 1; next }
+    h != "" && first { first = 0; if ($0 ~ /\(0x[0-9a-f|]+\)/) { sub_ = $0; gsub(/^ +| +ncmd.*$| +plen.*$/, "", sub_) } }
+    h != "" && /Status:|Scan enable|Address:|Action:|Current settings|Page scan/ { x = $0; gsub(/^ +/, "", x); f = f " | " x }
+    END { flush() }' >"$snoop.txt"
+  echo "## btmon: management and scan steps (full trace: btmon -r $snoop)"
+  grep -E "Add Device|Remove Device|Set Powered|Set Connectable|Set Discoverable|Fast Connectable|Write Scan Enable|Reset \(" "$snoop.txt" |
+    grep -v "^> HCI Event: Command Status" | head -40
+  echo "## btmon: everything that did not succeed"
+  grep "Status:" "$snoop.txt" | grep -v "Status: Success" | head -20
+  ensure_pagescan
+  systemctl start linux-a9-bt-pagescan.timer 2>/dev/null
+}
+
+report() {
+  local mac info dbg=/sys/kernel/debug/bluetooth/hci0
+  echo "## versions"
+  echo "kernel $(uname -r), $(bluetoothctl --version 2>/dev/null)"
+  echo "## bluetooth.service"
+  systemctl show bluetooth -p ActiveState -p ActiveEnterTimestamp -p NRestarts | tr '\n' ' '; echo
+  echo "## controller (kernel/BlueZ view)"
+  btmgmt info 2>/dev/null | grep -E "addr|current settings" | sed 's/^[[:space:]]*//'
+  echo "## controller (raw HCI)"
+  hci_read
+  echo "## stored adapters (/var/lib/bluetooth): pairings live under the address they were made with"
+  ls /var/lib/bluetooth 2>/dev/null
+  echo "## kernel accept list (type 0 = BR/EDR; page scan runs while one of these is disconnected)"
+  [[ -d $dbg ]] || mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+  cat "$dbg/device_list" 2>/dev/null || echo "(no debugfs)"
+  echo "## paired devices"
+  while read -r _ mac _; do
+    info=$(bluetoothctl info "$mac" 2>/dev/null)
+    printf '%s %-22s bonded=%s trusted=%s connected=%s blocked=%s wake=%s\n' "$mac" "$(field "$info" Name)" \
+      "$(field "$info" Bonded)" "$(field "$info" Trusted)" "$(field "$info" Connected)" \
+      "$(field "$info" Blocked)" "$(field "$info" WakeAllowed)"
+  done < <(bluetoothctl devices Paired 2>/dev/null)
+  echo "## bluetoothd log (this boot)"
+  journalctl -b -u bluetooth --no-pager -o short-monotonic 2>/dev/null | tail -25
+  echo "## kernel"
+  dmesg | grep -iE "bluetooth|hci0|btbcm|hci_bcm" | tail -15
+  echo "## verdict"
+  local scan
+  scan=$(hci_read | sed -n 's/^scan_enable=//p')
+  if [[ -z $(bonded_disconnected) ]]; then
+    echo "every bonded device is connected (or none is bonded)"
+  elif [[ $scan == *"page=on"* ]]; then
+    echo "page scan ON: a disconnected bonded keyboard reconnects when a key wakes it,"
+    echo "provided it pages this controller's address (compare bdaddr with the stored adapter above)"
+  else
+    echo "page scan OFF (${scan:-unknown}) with bonded devices disconnected: they cannot reconnect."
+    echo "Fix now: ipad-bt-doctor --ensure-pagescan (linux-a9-bt-pagescan.timer does it); why: --probe"
+  fi
+}
+
+case ${1:-} in
+  --ensure-pagescan) ensure_pagescan ;;
+  --probe) probe ;;
+  --trace-restart) trace_restart ;;
+  -h | --help) awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0" ;;
+  *) report ;;
+esac

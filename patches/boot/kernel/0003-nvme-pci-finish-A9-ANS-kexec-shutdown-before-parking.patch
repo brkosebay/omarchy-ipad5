@@ -1,0 +1,193 @@
+From 76caa84ff291b32a08410ba8fca4e536384ba660 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 00:30:41 +0000
+Subject: [PATCH 3/4] nvme-pci: finish A9 ANS kexec shutdown before parking
+ PCIe
+
+---
+ drivers/nvme/host/pci-apple-ans.c       | 34 +++++++++++++++++++++-
+ drivers/nvme/host/pci-internal.h        |  2 ++
+ drivers/nvme/host/pci.c                 | 10 ++++++-
+ drivers/pci/controller/pcie-apple-h9p.c | 38 +++++++++++++++++++++++++
+ 4 files changed, 82 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/nvme/host/pci-apple-ans.c b/drivers/nvme/host/pci-apple-ans.c
+index 70aad15e87..ebfbc17a00 100644
+--- a/drivers/nvme/host/pci-apple-ans.c
++++ b/drivers/nvme/host/pci-apple-ans.c
+@@ -736,7 +736,7 @@ static int nvme_pci_apple_ans_write_cc(struct nvme_dev *dev, u32 cc)
+ 		}
+ 	} while (us < apple_ans_watch_ms * USEC_PER_MSEC);
+ 
+-	ans_dbg(dev->dev,
++	dev_info(dev->dev,
+ 		 "Apple ANS: %ums after CC.EN, no host-side fault; polling CSTS\n",
+ 		 apple_ans_watch_ms);
+ 	if (apple_ans_debug)
+@@ -776,6 +776,37 @@ static int nvme_pci_apple_ans_read_csts(struct nvme_dev *dev, u32 *csts)
+ 	return 0;
+ }
+ 
++/* A9 is a PCI S3E endpoint, not the later platform/RTKit ANS controller.
++ * Finish the standard controller reset while its old DART/NVMMU mappings
++ * still exist. SHN alone leaves EN set and is insufficient for kexec.
++ */
++static void nvme_pci_apple_ans_shutdown(struct nvme_dev *dev, int shutdown_ret)
++{
++	struct apple_ans_nvme *ans = nvme_pci_apple_ans(dev);
++	struct pci_dev *pdev = to_pci_dev(dev->dev);
++	u32 csts = ~0U;
++	int ret, err = 0;
++
++	dev_info(dev->dev, "Apple ANS: kexec shutdown: SHN result %d, clearing CC.EN\n", shutdown_ret);
++	if (ans->host_fault || nvme_pci_apple_ans_check_link(dev, "kexec CC=0"))
++		goto block_dma;
++	dev->ctrl.ctrl_config &= ~(NVME_CC_ENABLE | NVME_CC_SHN_MASK);
++	writel(dev->ctrl.ctrl_config, dev->bar + NVME_REG_CC);
++	ret = read_poll_timeout(nvme_pci_apple_ans_read_csts, err,
++			       err || !(csts & NVME_CSTS_RDY), 1000,
++			       2000000, false, dev, &csts);
++	if (!ret)
++		ret = err;
++	if (ret)
++		dev_warn(dev->dev, "Apple ANS: CC=0 failed (%d, CSTS %#x); host PERST will isolate the endpoint\n",
++			 ret, csts);
++	else
++		dev_info(dev->dev, "Apple ANS: kexec shutdown: RDY=0 (CSTS %#x)\n", csts);
++block_dma:
++	/* PCI core does this too; make the ordering explicit before host teardown. */
++	pci_clear_master(pdev);
++}
++
+ static blk_status_t nvme_pci_apple_ans_alloc_req(struct nvme_dev *dev,
+ 						 struct apple_ans_nvme_req **req,
+ 						 unsigned int *tag)
+@@ -1014,6 +1045,7 @@ const struct nvme_pci_dma_ops nvme_pci_apple_ans_ops = {
+ 	.exit		= nvme_pci_apple_ans_exit,
+ 	.preinit	= nvme_pci_apple_ans_preinit,
+ 	.prepare_enable = nvme_pci_apple_ans_prepare_enable,
++	.shutdown	= nvme_pci_apple_ans_shutdown,
+ 	.write_cc	= nvme_pci_apple_ans_write_cc,
+ 	.read_csts	= nvme_pci_apple_ans_read_csts,
+ 	.cmd_allowed	= nvme_pci_apple_ans_cmd_allowed,
+diff --git a/drivers/nvme/host/pci-internal.h b/drivers/nvme/host/pci-internal.h
+index 71c4dd3c3b..887847bc70 100644
+--- a/drivers/nvme/host/pci-internal.h
++++ b/drivers/nvme/host/pci-internal.h
+@@ -37,6 +37,8 @@ struct nvme_pci_dma_ops {
+ 	void (*exit)(struct nvme_dev *dev);
+ 	int (*preinit)(struct nvme_dev *dev);
+ 	int (*prepare_enable)(struct nvme_dev *dev);
++	/* After SHST complete, before IRQ/DMA mappings are dismantled. */
++	void (*shutdown)(struct nvme_dev *dev, int shutdown_ret);
+ 	/* Optional: replace the CC write and the CSTS read (bring-up checks) */
+ 	int (*write_cc)(struct nvme_dev *dev, u32 cc);
+ 	int (*read_csts)(struct nvme_dev *dev, u32 *csts);
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 012cccc4a9..fbce887177 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -17,6 +17,7 @@
+ #include <linux/memremap.h>
+ #include <linux/mm.h>
+ #include <linux/module.h>
++#include <linux/kexec.h>
+ #include <linux/mutex.h>
+ #include <linux/nodemask.h>
+ #include <linux/once.h>
+@@ -3319,6 +3320,7 @@ static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
+ 	enum nvme_ctrl_state state = nvme_ctrl_state(&dev->ctrl);
+ 	struct pci_dev *pdev = to_pci_dev(dev->dev);
+ 	bool dead;
++	int ret;
+ 
+ 	mutex_lock(&dev->shutdown_lock);
+ 	dead = nvme_pci_ctrl_is_dead(dev);
+@@ -3337,7 +3339,13 @@ static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
+ 
+ 	if (!dead && dev->ctrl.queue_count > 0) {
+ 		nvme_delete_io_queues(dev);
+-		nvme_disable_ctrl(&dev->ctrl, shutdown);
++		if (shutdown && kexec_in_progress && dev->dma_ops &&
++		    dev->dma_ops->shutdown)
++			dev_info(dev->dev, "Apple ANS: kexec shutdown: starting NVMe SHN\n");
++		ret = nvme_disable_ctrl(&dev->ctrl, shutdown);
++		if (shutdown && kexec_in_progress && dev->dma_ops &&
++		    dev->dma_ops->shutdown)
++			dev->dma_ops->shutdown(dev, ret);
+ 		nvme_poll_irqdisable(&dev->queues[0]);
+ 	}
+ 	nvme_suspend_io_queues(dev);
+diff --git a/drivers/pci/controller/pcie-apple-h9p.c b/drivers/pci/controller/pcie-apple-h9p.c
+index 4367412f87..304e81fb69 100644
+--- a/drivers/pci/controller/pcie-apple-h9p.c
++++ b/drivers/pci/controller/pcie-apple-h9p.c
+@@ -26,6 +26,7 @@
+ #include <linux/kernel.h>
+ #include <linux/mm.h>
+ #include <linux/module.h>
++#include <linux/kexec.h>
+ #include <linux/msi.h>
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+@@ -1727,6 +1728,13 @@ static void apple_s8003_port_sleep(struct apple_h9p_pcie *pcie,
+ 			 port, l2);
+ 
+ 	gpiod_direction_output(pcie->perst[port], 1);
++	/* Isolate the endpoint before retiring its HMB aperture, while the
++	 * port register block is still powered. Normal suspend is unchanged.
++	 */
++	if (kexec_in_progress && !port && pcie->nvmmu.ready) {
++		h9p_writel_flush(0, pcie->nvmmu.base + H9P_NVMMU_SART_CTRL);
++		pcie->nvmmu.ready = false;
++	}
+ 	writel(S8003_PORT_IRQSTAT_LINK_DOWN, pb + H9P_PORT_IRQSTAT);
+ 	udelay(S8003_PERST_TO_REFCLK_US);
+ 	apple_s8003_port_off(pcie, port);
+@@ -2475,6 +2483,35 @@ static int apple_h9p_pcie_resume_noirq(struct device *dev)
+ 	return 0;
+ }
+ 
++/* device_shutdown visits PCI children before this platform parent. Keep
++ * their translations alive until NVMe has completed SHN and CC.EN=0.
++ * Use the existing iOS-derived S8003 port sequence, never an invented ANS
++ * PMGR/ASC reset (the A9 S3E is external PCIe storage).
++ */
++static void apple_h9p_pcie_shutdown(struct platform_device *pdev)
++{
++	struct apple_h9p_pcie *pcie = apple_h9p_pcie_lookup(&pdev->dev);
++	unsigned long ports;
++	unsigned int port;
++
++	if (!kexec_in_progress || !pcie ||
++	    !of_device_is_compatible(pdev->dev.of_node, "apple,s8003-pcie"))
++		return;
++	cancel_delayed_work_sync(&pcie->late_work);
++	ports = pcie->enabled_ports;
++	dev_info(&pdev->dev, "kexec: parking PCIe ports %#lx before retiring NVMMU/SART\n", ports);
++	for_each_set_bit(port, &ports, H9P_NUM_PORTS) {
++		WRITE_ONCE(pcie->down_ports, pcie->down_ports | BIT(port));
++		apple_s8003_port_sleep(pcie, port);
++		pcie->enabled_ports &= ~BIT(port);
++	}
++	/* port_sleep retired SART after PERST and before port power-off.
++	 * Leave DART programming to its owner. The incoming DART probe
++	 * resets it before the new PCI domain attaches.
++	 */
++	dev_info(&pdev->dev, "kexec: PCIe PERST asserted, ports off, NVMMU SART disabled\n");
++}
++
+ static const struct dev_pm_ops apple_h9p_pcie_pm_ops = {
+ 	.prepare = apple_h9p_pcie_prepare,
+ 	.complete = apple_h9p_pcie_complete,
+@@ -2514,6 +2551,7 @@ MODULE_DEVICE_TABLE(of, apple_h9p_pcie_of_match);
+ 
+ static struct platform_driver apple_h9p_pcie_driver = {
+ 	.probe = apple_h9p_pcie_probe,
++	.shutdown = apple_h9p_pcie_shutdown,
+ 	.driver = {
+ 		.name = "pcie-apple-h9p",
+ 		.of_match_table = apple_h9p_pcie_of_match,
+-- 
+2.56.0
+

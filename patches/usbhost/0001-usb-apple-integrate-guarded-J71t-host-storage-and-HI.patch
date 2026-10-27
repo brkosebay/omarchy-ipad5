@@ -1,0 +1,216 @@
+From 0cfbadcd4fb413faa0a9601d43a1b9cc0e24bf9b Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sun, 25 Oct 2026 21:48:30 +0000
+Subject: [PATCH] usb: apple: integrate guarded J71t host storage and HID
+ support
+
+Keep charger ADC routing away from the shared host PHY. Retain digital
+device-mode current grants, enforce the ADT 100 mA host budget, and build
+storage, filesystems and HID into the trial kernel.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ .../supply/apple,j71t-cbtl1610-power.yaml     |  7 +++++
+ .../boot/dts/apple/s8003-j71t-periph.dtsi     |  1 +
+ arch/arm64/configs/apple_a9_usb_host.config   | 28 +++++++++++++++++
+ drivers/phy/apple/ausb.c                      |  1 +
+ drivers/power/supply/apple_tristar_power.c    | 31 ++++++++++++++++++-
+ drivers/usb/host/ehci-platform.c              |  6 ++++
+ drivers/usb/host/ohci-platform.c              |  6 ++++
+ 7 files changed, 79 insertions(+), 1 deletion(-)
+ create mode 100644 arch/arm64/configs/apple_a9_usb_host.config
+
+diff --git a/Documentation/devicetree/bindings/power/supply/apple,j71t-cbtl1610-power.yaml b/Documentation/devicetree/bindings/power/supply/apple,j71t-cbtl1610-power.yaml
+index 1b4b1d601b..7d95e83d22 100644
+--- a/Documentation/devicetree/bindings/power/supply/apple,j71t-cbtl1610-power.yaml
++++ b/Documentation/devicetree/bindings/power/supply/apple,j71t-cbtl1610-power.yaml
+@@ -25,6 +25,13 @@ properties:
+     $ref: /schemas/types.yaml#/definitions/phandle
+     description: USB device controller reporting host current allowances.
+ 
++  apple,usb-role-switch:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description: |
++      Shared Lightning USB role switch. With this link, analog charger
++      classification is disabled to avoid rerouting host data pins, and
++      host mode reports no input current allowance.
++
+   apple,pmic:
+     $ref: /schemas/types.yaml#/definitions/phandle
+     description: D2365 PMIC providing the brick-ID ADC input.
+diff --git a/arch/arm64/boot/dts/apple/s8003-j71t-periph.dtsi b/arch/arm64/boot/dts/apple/s8003-j71t-periph.dtsi
+index ccfb30d542..67d47c2893 100644
+--- a/arch/arm64/boot/dts/apple/s8003-j71t-periph.dtsi
++++ b/arch/arm64/boot/dts/apple/s8003-j71t-periph.dtsi
+@@ -112,6 +112,7 @@ light-sensor@39 {
+ 
+ &i2c0 {
+ 	periph_tristar: power-controller@1a {
++		apple,usb-role-switch = <&usb_role>;
+ 		compatible = "apple,j71t-cbtl1610-power";
+ 		usb-controller = <&usbdev>;
+ 		apple,pmic = <&{/soc/i2c@20a110000/pmic@3c}>;
+diff --git a/arch/arm64/configs/apple_a9_usb_host.config b/arch/arm64/configs/apple_a9_usb_host.config
+new file mode 100644
+index 0000000000..b7611d4d73
+--- /dev/null
++++ b/arch/arm64/configs/apple_a9_usb_host.config
+@@ -0,0 +1,28 @@
++# All built in: the test entry does not need a matching /lib/modules tree.
++CONFIG_USB=y
++CONFIG_USB_ROLE_SWITCH=y
++CONFIG_USB_ROLES_APPLE_S8000=y
++CONFIG_PHY_APPLE_AUSB=y
++CONFIG_USB_EHCI_HCD=y
++CONFIG_USB_EHCI_HCD_PLATFORM=y
++CONFIG_USB_OHCI_HCD=y
++CONFIG_USB_OHCI_HCD_PLATFORM=y
++CONFIG_SCSI=y
++CONFIG_BLK_DEV_SD=y
++CONFIG_USB_STORAGE=y
++CONFIG_USB_UAS=y
++CONFIG_HID=y
++CONFIG_HID_GENERIC=y
++CONFIG_USB_HID=y
++CONFIG_INPUT_EVDEV=y
++CONFIG_MSDOS_PARTITION=y
++CONFIG_EFI_PARTITION=y
++CONFIG_FAT_FS=y
++CONFIG_VFAT_FS=y
++CONFIG_EXFAT_FS=y
++CONFIG_NTFS3_FS=y
++CONFIG_EXT4_FS=y
++CONFIG_NLS_CODEPAGE_437=y
++CONFIG_NLS_ISO8859_1=y
++CONFIG_NLS_UTF8=y
++CONFIG_DEBUG_INFO_NONE=y
+diff --git a/drivers/phy/apple/ausb.c b/drivers/phy/apple/ausb.c
+index 15629d15da..69057cecde 100644
+--- a/drivers/phy/apple/ausb.c
++++ b/drivers/phy/apple/ausb.c
+@@ -178,6 +178,7 @@ static const struct phy_ops ausb_phy_usb2_ops = {
+  * it owns the link. No cable/traffic heuristic or connected-gadget suspend.
+  */
+ static const struct phy_ops ausb_pm_phy_ops = {
++	.set_mode = ausb_phy_usb2_set_mode,
+ 	.owner = THIS_MODULE,
+ };
+ 
+diff --git a/drivers/power/supply/apple_tristar_power.c b/drivers/power/supply/apple_tristar_power.c
+index e429431b33..c44a4bebe2 100644
+--- a/drivers/power/supply/apple_tristar_power.c
++++ b/drivers/power/supply/apple_tristar_power.c
+@@ -16,6 +16,7 @@
+ #include <linux/power_supply.h>
+ #include <linux/regmap.h>
+ #include <linux/usb/gadget.h>
++#include <linux/usb/role.h>
+ 
+ #define TRISTAR_VBUS 0x0c
+ #define TRISTAR_REVISION 0x0f
+@@ -30,6 +31,7 @@ struct apple_tristar {
+ 	struct power_supply *psy;
+ 	struct regmap *pmic;
+ 	struct device_node *usb_node;
++	struct usb_role_switch *role_sw;
+ 	struct notifier_block usb_notifier;
+ 	atomic_t reset_generation;
+ 	int seen_generation;
+@@ -182,6 +184,13 @@ static void apple_tristar_classify(struct apple_tristar *ts)
+ 	struct usb_gadget_current_budget budget;
+ 	int dp, dm, ret;
+ 
++	/* The shared host PHY must never be diverted to the analog ADC.
++	 * Disable analog classification on this dual-controller board, even
++	 * in device mode, to close the race with a userspace role change.
++	 * Digital gadget current grants remain available in device mode.
++	 */
++	if (ts->role_sw)
++		return;
+ 	if (ts->brick_sampled || ts->adc_poisoned || !ts->online || ts->error ||
+ 	    time_before(jiffies, ts->classify_after))
+ 		return;
+@@ -247,6 +256,9 @@ static int apple_tristar_update(struct apple_tristar *ts)
+ 	int value, error, online, current_ua = 0, type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
+ 	int generation, old_current, old_type;
+ 	bool changed;
++	/* Query before taking ts->lock: role changes unbind the gadget. */
++	bool host = ts->role_sw &&
++		usb_role_switch_get_role(ts->role_sw) == USB_ROLE_HOST;
+ 
+ 	mutex_lock(&ts->lock);
+ 	if (ts->sleeping || ts->stopping) {
+@@ -270,7 +282,8 @@ static int apple_tristar_update(struct apple_tristar *ts)
+ 			error = value;
+ 	}
+ 	/* IC getVBUSDetect(strict=1): both low bits, never orientation bits. */
+-	online = !error && (value & 3) == 3;
++	/* A powered adapter is not a grant to charge from our host port. */
++	online = !host && !error && (value & 3) == 3;
+ 	if (!online) {
+ 		ts->brick_sampled = false;
+ 		ts->brick_ua = 0;
+@@ -465,6 +478,11 @@ static const struct power_supply_desc apple_tristar_desc = {
+ 	.get_property = apple_tristar_get_property,
+ };
+ 
++static void apple_tristar_put_role(void *data)
++{
++	usb_role_switch_put(data);
++}
++
+ static int apple_tristar_probe(struct i2c_client *client)
+ {
+ 	struct power_supply_config config = {};
+@@ -482,6 +500,17 @@ static int apple_tristar_probe(struct i2c_client *client)
+ 		return -ENOMEM;
+ 	ts->client = client;
+ 	i2c_set_clientdata(client, ts);
++	node = of_parse_phandle(client->dev.of_node, "apple,usb-role-switch", 0);
++	if (node) {
++		ts->role_sw = usb_role_switch_find_by_fwnode(of_fwnode_handle(node));
++		of_node_put(node);
++		if (!ts->role_sw)
++			return -EPROBE_DEFER;
++		ret = devm_add_action_or_reset(&client->dev, apple_tristar_put_role,
++					       ts->role_sw);
++		if (ret)
++			return ret;
++	}
+ 	ts->usb_node = of_parse_phandle(client->dev.of_node, "usb-controller", 0);
+ 	if (!ts->usb_node)
+ 		return -EINVAL;
+diff --git a/drivers/usb/host/ehci-platform.c b/drivers/usb/host/ehci-platform.c
+index f61f095ced..7b1fbd3e6c 100644
+--- a/drivers/usb/host/ehci-platform.c
++++ b/drivers/usb/host/ehci-platform.c
+@@ -377,6 +377,12 @@ static int ehci_platform_probe(struct platform_device *dev)
+ 	hcd->rsrc_start = res_mem->start;
+ 	hcd->rsrc_len = resource_size(res_mem);
+ 
++	/* J71t ADT port-current-limit = 50 units of 2 mA.
++	 * Accessory LDO5 is not a general-purpose 5 V supply.
++	 */
++	if (of_device_is_compatible(dev->dev.of_node, "apple,s8000-ehci"))
++		hcd->power_budget = 100;
++
+ 	hcd->tpl_support = of_usb_host_tpl_support(dev->dev.of_node);
+ 
+ 	err = usb_add_hcd(hcd, irq, IRQF_SHARED);
+diff --git a/drivers/usb/host/ohci-platform.c b/drivers/usb/host/ohci-platform.c
+index c801527d5b..53728ee4d5 100644
+--- a/drivers/usb/host/ohci-platform.c
++++ b/drivers/usb/host/ohci-platform.c
+@@ -207,6 +207,12 @@ static int ohci_platform_probe(struct platform_device *dev)
+ 	hcd->rsrc_start = res_mem->start;
+ 	hcd->rsrc_len = resource_size(res_mem);
+ 
++	/* J71t ADT port-current-limit = 50 units of 2 mA.
++	 * Accessory LDO5 is not a general-purpose 5 V supply.
++	 */
++	if (of_device_is_compatible(dev->dev.of_node, "apple,s8000-ohci"))
++		hcd->power_budget = 100;
++
+ 	hcd->tpl_support = of_usb_host_tpl_support(dev->dev.of_node);
+ 
+ 	err = usb_add_hcd(hcd, irq, IRQF_SHARED);

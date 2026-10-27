@@ -1,0 +1,250 @@
+From c4a1c8f7b21c21efde4c0078dc745169e463197e Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 23:51:23 +0000
+Subject: [PATCH] cpufreq: apple: bound decoded S8003 core and buck7 voltage
+ offsets
+
+---
+ drivers/cpufreq/Kconfig.arm       |   6 +-
+ drivers/cpufreq/apple-a9-tuning.h | 110 ++++++++++++++++++++++++------
+ 2 files changed, 92 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/cpufreq/Kconfig.arm b/drivers/cpufreq/Kconfig.arm
+index c95a44aed3..705b15ca1e 100644
+--- a/drivers/cpufreq/Kconfig.arm
++++ b/drivers/cpufreq/Kconfig.arm
+@@ -281,6 +281,6 @@ config APPLE_A9_TUNING
+     depends on !THERMAL_EMULATION
+     help
+       Root-only, default-off, heartbeat-protected S8003 stock boost and
+-      experimental clocks. No voltage increase is supported until the DAC
+-      transfer function is independently verified. Compile-time ceiling is
+-      stock maximum +50000 uV. Enable with apple_soc_cpufreq.a9_tuning=1.
++      experimental clocks with decoded CPU core/buck7 DAC offsets.
++      Exact 3125 uV increments, bounded per rail to the cloned stock state
++      plus 50000 uV. No PMIC or factory-calibration writes are exposed. Enable with apple_soc_cpufreq.a9_tuning=1.
+diff --git a/drivers/cpufreq/apple-a9-tuning.h b/drivers/cpufreq/apple-a9-tuning.h
+index f2336e5936..5a68f419db 100644
+--- a/drivers/cpufreq/apple-a9-tuning.h
++++ b/drivers/cpufreq/apple-a9-tuning.h
+@@ -4,6 +4,9 @@
+ #define A9_STOCK_KHZ 1800000U
+ #define A9_BOOST_KHZ 1848000U
+ #define A9_OVERVOLT_LIMIT_UV 50000U /* Owner ceiling: never a module parameter. */
++#define A9_DAC_STEP_UV 3125U
++#define A9_CORE_BASE_UV 450000U
++#define A9_AUX_BASE_UV 600000U
+ #define A9_HEARTBEAT_MS 2000
+ #define A9_POLL_MS 100
+ 
+@@ -26,8 +29,9 @@ struct a9_guard {
+ 	struct mutex control;
+ 	struct freq_qos_request qos;
+ 	struct dentry *directory;
++	void __iomem *voltage_base;
+ 	u64 stock1[16], stock2[16];
+-	unsigned int limit, configured, dirty;
++	unsigned int limit, configured, dirty, delta_uv;
+ 	u32 trip_generation;
+ 	unsigned long heartbeat;
+ 	bool armed, ready, latched;
+@@ -45,8 +49,42 @@ static unsigned int a9_psinfo1_offset(unsigned int state)
+ 
+ static unsigned int a9_psinfo_khz(u64 word)
+ {
+-	return 24000 * FIELD_GET(GENMASK_ULL(11, 4), word) /
+-		(FIELD_GET(GENMASK_ULL(3, 0), word) + 1);
++	unsigned int prediv = FIELD_GET(GENMASK_ULL(17, 13), word);
++
++	/* Matching j71t iBoot 20H350 at 0x87001c35c. Zero prediv means one. */
++	return 24000 * FIELD_GET(GENMASK_ULL(12, 4), word) /
++		max(prediv, 1U) / (FIELD_GET(GENMASK_ULL(3, 0), word) + 1);
++}
++
++/* LLB 0x180396138 converts logical rails 0/7 through the PMIC table before
++ * placing them in PSINFO1[63:56]/PSINFO2[39:32]. iBoot independently exports
++ * core mV from that byte using base 450 and step 3125 uV. Buck7 has base 600.
++ * Apply equal exact DAC increments to both rails; retain the boot separation.
++ * See docs/power/overclock-round3.md in the workspace for hashes and evidence.
++ */
++static int a9_voltage_words(u64 stock1, u64 stock2, unsigned int delta_uv,
++			    u64 *word1, u64 *word2)
++{
++	unsigned int core = FIELD_GET(GENMASK_ULL(63, 56), stock1);
++	unsigned int aux = FIELD_GET(GENMASK_ULL(39, 32), stock2);
++	unsigned int steps;
++
++	if (delta_uv > A9_OVERVOLT_LIMIT_UV)
++		return -ERANGE;
++	/* Refuse fractional codes, including rounding that could exceed +50 mV. */
++	if (delta_uv % A9_DAC_STEP_UV)
++		return -EINVAL;
++	steps = delta_uv / A9_DAC_STEP_UV;
++	if (core + steps > 255 || aux + steps > 255)
++		return -ERANGE;
++	if (A9_CORE_BASE_UV + (core + steps) * A9_DAC_STEP_UV > 1296000 ||
++	    A9_AUX_BASE_UV + (aux + steps) * A9_DAC_STEP_UV > 1396000)
++		return -ERANGE;
++	*word1 = (stock1 & ~GENMASK_ULL(63, 56)) |
++		FIELD_PREP(GENMASK_ULL(63, 56), core + steps);
++	*word2 = (stock2 & ~GENMASK_ULL(39, 32)) |
++		FIELD_PREP(GENMASK_ULL(39, 32), aux + steps);
++	return 0;
+ }
+ 
+ static int a9_temperatures(int *hottest)
+@@ -104,6 +142,7 @@ static int a9_restore_locked(struct a9_guard *g)
+ 		g->dirty &= ~BIT(state);
+ 	}
+ 	g->configured = 0;
++	g->delta_uv = 0;
+ 	return 0;
+ }
+ 
+@@ -179,7 +218,8 @@ static void a9_guard_work(struct work_struct *work)
+ 	ret = a9_temperatures(&hottest);
+ 	g->hottest = ret ? INT_MIN : hottest;
+ 	if (g->armed) {
+-		fault = a9_guard_fault(ret, hottest,
++		fault = readl(g->voltage_base) != 1 || readl(g->voltage_base + 4) != 0x1782 ?
++			"voltage-mode" : a9_guard_fault(ret, hottest,
+ 			 time_after(jiffies, g->heartbeat + msecs_to_jiffies(A9_HEARTBEAT_MS)));
+ 		if (fault)
+ 			a9_revert(g, fault);
+@@ -193,6 +233,8 @@ static void a9_guard_work(struct work_struct *work)
+ static int a9_check_stock(struct a9_guard *g)
+ {
+ 	struct cpufreq_frequency_table *p;
++	static const u8 core_code[] = { 0, 0, 31, 40, 61, 80, 104, 116, 116 };
++	static const u8 aux_code[] = { 0, 0, 64, 64, 64, 64, 77, 101, 101 };
+ 	unsigned int n;
+ 
+ 	/* All published stock clocks must match this chip's boot PSINFO words. */
+@@ -203,6 +245,11 @@ static int a9_check_stock(struct a9_guard *g)
+ 		if (n <= 8 && a9_psinfo_khz(g->stock1[n]) != p->frequency)
+ 			return -EINVAL;
+ 	}
++	/* This decoder is for the saved S8003 j71t calibration, not arbitrary A9s. */
++	for (n = 1; n <= 8; n++)
++		if (FIELD_GET(GENMASK_ULL(63, 56), g->stock1[n]) != core_code[n] ||
++		    FIELD_GET(GENMASK_ULL(39, 32), g->stock2[n]) != aux_code[n])
++			return -EINVAL;
+ 	if (a9_psinfo_khz(g->stock1[8]) != A9_BOOST_KHZ ||
+ 	    (g->stock1[8] >> 56) != (g->stock1[7] >> 56) ||
+ 	    FIELD_GET(GENMASK_ULL(39, 32), g->stock2[8]) !=
+@@ -224,6 +271,11 @@ static int a9_arm(struct a9_guard *g)
+ 
+ 	if (!a9_tuning || !g->ready)
+ 		return -EPERM;
++	/* m1n1 selects automatic voltage mode=1; matching LLB sets routing=1782.
++	 * Never compensate for a different handoff by programming DWI/PMIC here.
++	 */
++	if (readl(g->voltage_base) != 1 || readl(g->voltage_base + 4) != 0x1782)
++		return -EOPNOTSUPP;
+ 	ret = a9_check_stock(g);
+ 	if (ret)
+ 		return ret;
+@@ -260,14 +312,14 @@ static int a9_configure(struct a9_guard *g, unsigned int khz, unsigned int delta
+ 	/* Validate the ceiling before rounding, conversion or any hardware store. */
+ 	if (delta_uv > A9_OVERVOLT_LIMIT_UV)
+ 		return -ERANGE;
+-	/* The 450000+3125*code fit is not an independently verified DAC transfer
+-	 * function. Fail closed: no nonzero voltage change is currently supported.
+-	 */
+-	if (delta_uv)
+-		return -EOPNOTSUPP;
++	ret = a9_voltage_words(g->stock1[7], g->stock2[7], delta_uv, &word1, &word2);
++	if (ret)
++		return ret;
+ 	if (!a9_tuning || !g->armed ||
+ 	    time_after(jiffies, g->heartbeat + msecs_to_jiffies(A9_HEARTBEAT_MS)))
+ 		return -EPERM;
++	if (readl(g->voltage_base) != 1 || readl(g->voltage_base + 4) != 0x1782)
++		return -EOPNOTSUPP;
+ 	ret = a9_temperatures(&hottest);
+ 	if (ret || hottest >= 75000)
+ 		return ret ?: -EBUSY;
+@@ -286,13 +338,12 @@ static int a9_configure(struct a9_guard *g, unsigned int khz, unsigned int delta
+ 	ret = a9_restore_locked(g);
+ 	if (ret)
+ 		goto unlock;
+-	/* Clone the stock all-load 1800 MHz state. Only PLL multiplier changes;
+-	 * voltage, sequencer timing and max-load bytes stay exactly stock.
++	/* Clone the stock all-load 1800 MHz state. Change the PLL multiplier and
++	 * both voltage bytes by a bounded equal delta. Timing/load stay stock.
+ 	 * State 8, its load=2 restriction and all Apple states 0..8 are untouched.
+ 	 */
+-	word1 = (g->stock1[7] & ~GENMASK_ULL(11, 4)) |
+-		FIELD_PREP(GENMASK_ULL(11, 4), khz / 24000);
+-	word2 = g->stock2[7];
++	word1 = (word1 & ~GENMASK_ULL(12, 4)) |
++		FIELD_PREP(GENMASK_ULL(12, 4), khz / 24000);
+ 	g->dirty |= BIT(state);
+ 	writeq(word2, priv->reg_base + 0x868 + state * 8);
+ 	writeq(word1, priv->reg_base + a9_psinfo1_offset(state));
+@@ -302,6 +353,7 @@ static int a9_configure(struct a9_guard *g, unsigned int khz, unsigned int delta
+ 		goto unlock;
+ 	}
+ 	g->configured = BIT(state);
++	g->delta_uv = delta_uv;
+ 	g->limit = khz;
+ 	g->heartbeat = jiffies;
+ unlock:
+@@ -322,17 +374,27 @@ static int a9_status_show(struct seq_file *s, void *unused)
+ 	unsigned int n;
+ 
+ 	mutex_lock(&g->control);
+-	seq_printf(s, "format=1 enable=%u armed=%u latched=%u reason=%s limit_khz=%u configured=%x dirty=%x revert_error=%d hottest_millic=%d heartbeat_ms=%u ceiling_delta_uv=%u voltage_writes=unsupported\n",
++	seq_printf(s, "format=2 enable=%u armed=%u latched=%u reason=%s limit_khz=%u configured=%x dirty=%x revert_error=%d hottest_millic=%d heartbeat_ms=%u ceiling_delta_uv=%u voltage_writes=psinfo dac_step_uv=%u delta_uv=%u\n",
+ 		   a9_tuning, g->armed, g->latched, g->reason, g->limit,
+ 		   g->configured, g->dirty, g->revert_error, g->hottest,
+-		   jiffies_to_msecs(jiffies - g->heartbeat), A9_OVERVOLT_LIMIT_UV);
+-	seq_printf(s, "cmd=%016llx status=%08x actual_khz=%u\n",
++		   jiffies_to_msecs(jiffies - g->heartbeat), A9_OVERVOLT_LIMIT_UV,
++		   A9_DAC_STEP_UV, g->delta_uv);
++	seq_printf(s, "cmd=%016llx status=%08x actual_khz=%u voltage_ctl=%08x voltage_routes=%08x\n",
+ 		   readq(g->priv->reg_base + APPLE_DVFS_CMD),
+ 		   readl(g->priv->reg_base + APPLE_DVFS_STATUS),
+-		   apple_soc_cpufreq_get_rate(g->policy->cpu));
+-	for (n = 1; n < 16; n++)
+-		seq_printf(s, "state=%u boot_psinfo1=%016llx boot_psinfo2=%016llx boot_khz=%u\n",
+-			   n, g->stock1[n], g->stock2[n], a9_psinfo_khz(g->stock1[n]));
++		   apple_soc_cpufreq_get_rate(g->policy->cpu),
++		   readl(g->voltage_base), readl(g->voltage_base + 4));
++	for (n = 1; n < 16; n++) {
++		u64 live1 = readq(g->priv->reg_base + a9_psinfo1_offset(n));
++		u64 live2 = readq(g->priv->reg_base + 0x868 + n * 8);
++		unsigned int core = FIELD_GET(GENMASK_ULL(63, 56), live1);
++		unsigned int aux = FIELD_GET(GENMASK_ULL(39, 32), live2);
++
++		seq_printf(s, "state=%u boot_psinfo1=%016llx boot_psinfo2=%016llx boot_khz=%u psinfo1=%016llx psinfo2=%016llx core_code=%u aux_code=%u core_nominal_uv=%u aux_nominal_uv=%u rail_measured=0\n",
++			   n, g->stock1[n], g->stock2[n], a9_psinfo_khz(g->stock1[n]),
++			   live1, live2, core, aux, A9_CORE_BASE_UV + A9_DAC_STEP_UV * core,
++			   A9_AUX_BASE_UV + A9_DAC_STEP_UV * aux);
++	}
+ 	mutex_unlock(&g->control);
+ 	return 0;
+ }
+@@ -397,6 +459,11 @@ static int a9_guard_init(struct cpufreq_policy *policy)
+ 	g = kzalloc_obj(*g);
+ 	if (!g)
+ 		return -ENOMEM;
++	g->voltage_base = ioremap(0x20e0a0000, 0x20);
++	if (!g->voltage_base) {
++		kfree(g);
++		return -ENOMEM;
++	}
+ 	g->priv = priv;
+ 	g->policy = policy;
+ 	g->limit = A9_STOCK_KHZ;
+@@ -446,6 +513,7 @@ static void a9_guard_exit(struct apple_cpu_priv *priv)
+ 	a9_revert(g, "driver-exit");
+ 	if (g->ready)
+ 		freq_qos_remove_request(&g->qos);
++	iounmap(g->voltage_base);
+ 	kfree(g);
+ }
+ 
+-- 
+2.56.0
+

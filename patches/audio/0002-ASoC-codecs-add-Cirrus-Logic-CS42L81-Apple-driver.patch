@@ -1,0 +1,794 @@
+From ce134b9fc399c0b99b1c0f40c4bb4474cb380a26 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 11:46:07 +0000
+Subject: [PATCH 02/17] ASoC: codecs: add Cirrus Logic CS42L81 (Apple) driver
+
+The CS42L81 has no public datasheet. The control protocol and the
+playback sequences were reconstructed from iOS 16.7.10's
+AppleCS42L81Audio/AppleCSSPIv2Audio:
+
+ - SPI framing: write 6C page reg 00 val, read 6D page reg 00 xx with
+   the value in the 5th byte; device ID 42 A8 1x at 0x01..0x03.
+ - Power up (enableAudio), sample-rate programming, the ASP slot map
+   with the codec as BCLK/LRCK provider, the speaker-only routing state,
+   the speaker volume (CS35L33-style 0.5 dB code, +0x34 offset) and the
+   power down with a bounded PDN_DONE poll.
+
+Only the speaker playback path is implemented. Register names are
+descriptive guesses.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ sound/soc/codecs/Kconfig   |   8 +
+ sound/soc/codecs/Makefile  |   2 +
+ sound/soc/codecs/cs42l81.c | 722 +++++++++++++++++++++++++++++++++++++
+ 3 files changed, 732 insertions(+)
+ create mode 100644 sound/soc/codecs/cs42l81.c
+
+diff --git a/sound/soc/codecs/Kconfig b/sound/soc/codecs/Kconfig
+index f9a47e262a..0c5db937c6 100644
+--- a/sound/soc/codecs/Kconfig
++++ b/sound/soc/codecs/Kconfig
+@@ -1032,6 +1032,14 @@ config SND_SOC_CS42L73
+ 	tristate "Cirrus Logic CS42L73 CODEC"
+ 	depends on I2C
+ 
++config SND_SOC_CS42L81
++	tristate "Cirrus Logic CS42L81 CODEC (Apple)"
++	depends on SPI_MASTER
++	select REGMAP
++	help
++	  Apple-specific Cirrus Logic CS42L81 codec with integrated speaker
++	  drivers, controlled over SPI (A9 iPad 5).
++
+ config SND_SOC_CS42L83
+ 	tristate "Cirrus Logic CS42L83 CODEC"
+ 	depends on I2C
+diff --git a/sound/soc/codecs/Makefile b/sound/soc/codecs/Makefile
+index 3d122ace75..a23e9144d0 100644
+--- a/sound/soc/codecs/Makefile
++++ b/sound/soc/codecs/Makefile
+@@ -94,6 +94,7 @@ snd-soc-cs42l51-i2c-y := cs42l51-i2c.o
+ snd-soc-cs42l52-y := cs42l52.o
+ snd-soc-cs42l56-y := cs42l56.o
+ snd-soc-cs42l73-y := cs42l73.o
++snd-soc-cs42l81-y := cs42l81.o
+ snd-soc-cs42l83-i2c-y := cs42l83-i2c.o
+ snd-soc-cs42l84-y := cs42l84.o
+ snd-soc-cs4234-y := cs4234.o
+@@ -538,6 +539,7 @@ obj-$(CONFIG_SND_SOC_CS42L51_I2C)	+= snd-soc-cs42l51-i2c.o
+ obj-$(CONFIG_SND_SOC_CS42L52)	+= snd-soc-cs42l52.o
+ obj-$(CONFIG_SND_SOC_CS42L56)	+= snd-soc-cs42l56.o
+ obj-$(CONFIG_SND_SOC_CS42L73)	+= snd-soc-cs42l73.o
++obj-$(CONFIG_SND_SOC_CS42L81)	+= snd-soc-cs42l81.o
+ obj-$(CONFIG_SND_SOC_CS42L83)	+= snd-soc-cs42l83-i2c.o
+ obj-$(CONFIG_SND_SOC_CS42L84)	+= snd-soc-cs42l84.o
+ obj-$(CONFIG_SND_SOC_CS4234)	+= snd-soc-cs4234.o
+diff --git a/sound/soc/codecs/cs42l81.c b/sound/soc/codecs/cs42l81.c
+new file mode 100644
+index 0000000000..3bec71e6df
+--- /dev/null
++++ b/sound/soc/codecs/cs42l81.c
+@@ -0,0 +1,722 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++/*
++ * Cirrus Logic CS42L81 (Apple 338S-series) codec, speaker playback path.
++ *
++ * The CS42L81 is an Apple-specific Cirrus codec with integrated speaker
++ * drivers, used on the A9 iPad 5 (J71t). There is no public datasheet; the
++ * register sequences below were reconstructed from iOS 16.7.10's
++ * AppleCS42L81Audio driver (see docs/audio/playback-path.md in linux-a9).
++ * Register names are descriptive guesses.
++ *
++ * Control port: SPI, 16-bit register address (page << 8 | reg), 8-bit
++ * data, framed as   write: 6C page reg 00 val
++ *                   read:  6D page reg 00 xx  (value in the 5th byte)
++ */
++
++#include <linux/bitfield.h>
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/regmap.h>
++#include <linux/slab.h>
++#include <linux/spi/spi.h>
++#include <sound/pcm.h>
++#include <sound/pcm_params.h>
++#include <sound/soc.h>
++#include <sound/tlv.h>
++
++#define CS42L81_SPI_WRITE	0x6c
++#define CS42L81_SPI_READ	0x6d
++
++#define CS42L81_DEVID_AB	0x0001	/* reads 0x42 */
++#define CS42L81_DEVID_CD	0x0002	/* reads 0xa8 */
++#define CS42L81_DEVID_E		0x0003	/* reads 0x1x */
++#define CS42L81_REVID		0x0005
++#define CS42L81_PWR_CTL1	0x0006
++#define CS42L81_PWR_CTL1_PDN		BIT(0)
++#define CS42L81_PWR_CTL1_BIT2		BIT(2)
++#define CS42L81_PWR_CTL1_FREEZE		BIT(6)	/* set after PDN_DONE */
++#define CS42L81_PWR_CTL1_REVA0		BIT(7)
++#define CS42L81_PWR_CTL2	0x0007
++#define CS42L81_ADC_PWR		0x000d
++#define CS42L81_PATH_PWR	0x000e	/* bit 7 DAC PDN, 6 ADC PDN, 5 ? */
++#define CS42L81_CLK_CTL		0x000f	/* [3:0] rate code */
++#define CS42L81_ASP_PWR		0x0011	/* bit 7 ASP RX PDN, 6 ASP TX PDN */
++#define CS42L81_ASP_CLK		0x0012	/* bit 7 ASP clock master, [3:0] rate */
++#define CS42L81_ASP_RX_SLOT(n)	(0x0022 + (n))	/* n = 0..9 */
++#define CS42L81_INT_STATUS1	0x002e
++#define CS42L81_INT_STATUS2	0x002f
++#define CS42L81_INT_STATUS2_PDN_DONE	BIT(7)
++#define CS42L81_INT_STATUS3	0x0033
++#define CS42L81_INT_STATUS4	0x007b
++#define CS42L81_INT_STATUS5	0x007c
++#define CS42L81_INT_STATUS6	0x0106
++#define CS42L81_SRC_RATE_A	0x0123
++#define CS42L81_ASP_PAIR_RATE(p)	(0x0129 + (p))	/* channel pair p = 0..4 */
++#define CS42L81_ASP_TX_RATE	0x012e
++#define CS42L81_ASP_RX_RATE	0x012f
++#define CS42L81_ASP_CTL		0x0131
++#define CS42L81_OUT_CTL		0x0201
++#define CS42L81_ADC_ROUTE	0x0203
++#define CS42L81_ADC_CTL_A	0x0204
++#define CS42L81_ADC_RATE_A	0x0205
++#define CS42L81_ADC_CTL_B	0x020f
++#define CS42L81_ADC_CTL_C	0x0210
++#define CS42L81_ADC_RATE_B	0x0211
++#define CS42L81_HPCP_CTL	0x0219
++#define CS42L81_DRV_PDN		0x0220	/* bit 5 HP PDN, bit 3 line PDN */
++#define CS42L81_DRV_PDN_HP		BIT(5)
++#define CS42L81_DRV_PDN_LINE		BIT(3)
++#define CS42L81_DRV_CTL1	0x0221
++#define CS42L81_DAC_RATE	0x0222
++#define CS42L81_DRV_CTL2	0x0223
++#define CS42L81_DRV_CTL3	0x0224
++#define CS42L81_SPK_VOL_A	0x0225
++#define CS42L81_SPK_VOL_B	0x0226
++#define CS42L81_HP_VOL_A	0x0227
++#define CS42L81_HP_VOL_B	0x0228
++#define CS42L81_LINE_VOL_A	0x0229
++#define CS42L81_LINE_VOL_B	0x022a
++#define CS42L81_SPK_PDN		0x022e	/* bit 4 speaker B PDN, bit 3 speaker A PDN */
++#define CS42L81_SPK_PDN_A		BIT(3)
++#define CS42L81_SPK_PDN_B		BIT(4)
++#define CS42L81_SPK_RATE	0x022f
++#define CS42L81_DRV_CTL4	0x0230
++#define CS42L81_SPK_MODE	0x0231	/* [5:4] */
++#define CS42L81_SPK_MODE_MASK		GENMASK(5, 4)
++#define CS42L81_MAIN_VOL	0x0232
++#define CS42L81_INT_STATUS7	0x0528
++#define CS42L81_TRIM1		0xc81f
++#define CS42L81_TRIM2		0xc85f
++#define CS42L81_TRIM3		0xc96f
++#define CS42L81_UNLOCK		0x9901
++
++#define CS42L81_VOL_MUTE	0x19	/* digital volume "mute" code */
++#define CS42L81_VOL_OFFSET	0x34	/* control 0 = -102 dB */
++#define CS42L81_VOL_MAX_CTL	228	/* +12 dB */
++#define CS42L81_HP_MUTE		0x40
++
++#define CS42L81_PDN_POLL_US	10000
++#define CS42L81_PDN_TIMEOUT_US	1000000	/* iOS: 100 x 10 ms */
++
++struct cs42l81 {
++	struct device *dev;
++	struct spi_device *spi;
++	struct regmap *regmap;
++	struct clk *mclk;
++	struct gpio_desc *mute_gpio;
++	u8 *xfer_buf;		/* 2 x 5 bytes, DMA-safe */
++
++	unsigned int rate_code;
++	unsigned int slot_bytes;
++	unsigned int spk_vol;	/* control value, 0..vol_max */
++	unsigned int vol_max;
++	bool spk_switch;
++	bool spk_on;
++	bool core_on;
++	u32 spk_mode;		/* 2 = stereo speakers (both outputs) */
++};
++
++/* --- SPI regmap bus ------------------------------------------------------ */
++
++static int cs42l81_bus_write(void *context, unsigned int reg, unsigned int val)
++{
++	struct cs42l81 *cs = context;
++	u8 *tx = cs->xfer_buf;
++
++	tx[0] = CS42L81_SPI_WRITE;
++	tx[1] = reg >> 8;
++	tx[2] = reg & 0x7f;
++	tx[3] = 0;
++	tx[4] = val;
++
++	return spi_write(cs->spi, tx, 5);
++}
++
++static int cs42l81_bus_read(void *context, unsigned int reg, unsigned int *val)
++{
++	struct cs42l81 *cs = context;
++	u8 *tx = cs->xfer_buf, *rx = cs->xfer_buf + 5;
++	struct spi_transfer t = {
++		.tx_buf = tx,
++		.rx_buf = rx,
++		.len = 5,
++	};
++	int ret;
++
++	tx[0] = CS42L81_SPI_READ;
++	tx[1] = reg >> 8;
++	tx[2] = reg & 0x7f;
++	tx[3] = 0;
++	tx[4] = 0;
++	memset(rx, 0, 5);
++
++	ret = spi_sync_transfer(cs->spi, &t, 1);
++	if (ret)
++		return ret;
++
++	*val = rx[4];
++	return 0;
++}
++
++static const struct regmap_bus cs42l81_bus = {
++	.reg_write = cs42l81_bus_write,
++	.reg_read = cs42l81_bus_read,
++};
++
++static bool cs42l81_valid_reg(struct device *dev, unsigned int reg)
++{
++	/* The register byte is 7 bits wide on the wire. */
++	return !(reg & 0x80);
++}
++
++static const struct regmap_config cs42l81_regmap = {
++	.reg_bits = 16,
++	.val_bits = 8,
++	.max_register = 0xffff,
++	.readable_reg = cs42l81_valid_reg,
++	.writeable_reg = cs42l81_valid_reg,
++	.cache_type = REGCACHE_NONE,
++};
++
++/* --- helpers -------------------------------------------------------------- */
++
++static int cs42l81_rate_code(unsigned int rate)
++{
++	switch (rate) {
++	case 8000:	return 0x1;
++	case 11025:	return 0x2;
++	case 12000:	return 0x4;
++	case 16000:	return 0x5;
++	case 22050:	return 0x6;
++	case 24000:	return 0x8;
++	case 32000:	return 0x9;
++	case 44100:	return 0xa;
++	case 48000:	return 0xc;
++	default:	return -EINVAL;
++	}
++}
++
++static void cs42l81_set_rate(struct cs42l81 *cs)
++{
++	struct regmap *map = cs->regmap;
++	unsigned int c = cs->rate_code;
++
++	/* iOS setSampleRate (vtable +0x650) */
++	regmap_update_bits(map, CS42L81_CLK_CTL, 0x0f, c);
++	regmap_write(map, CS42L81_ASP_TX_RATE, c | c << 4);
++	regmap_write(map, CS42L81_ASP_RX_RATE, c | c << 4);
++	regmap_write(map, CS42L81_SRC_RATE_A, c);
++	regmap_write(map, CS42L81_DAC_RATE, c);
++	regmap_update_bits(map, CS42L81_ADC_RATE_A, 0x0f, c);
++	regmap_update_bits(map, CS42L81_ADC_RATE_B, 0x0f, c);
++	regmap_write(map, CS42L81_SPK_RATE, c);
++}
++
++static void cs42l81_set_asp(struct cs42l81 *cs)
++{
++	struct regmap *map = cs->regmap;
++	unsigned int c = cs->rate_code, b = cs->slot_bytes, n;
++
++	/* Codec drives BCLK/LRCK (MCA0 is the clock consumer). */
++	regmap_write(map, CS42L81_ASP_CLK, 0x80 | c);
++
++	/* ASP RX slot n: byte offset n*b, width b bytes */
++	for (n = 0; n < 10; n++)
++		regmap_write(map, CS42L81_ASP_RX_SLOT(n),
++			     ((n * b) | ((b - 1) << 5)) & 0xff);
++	for (n = 0; n < 5; n++)
++		regmap_write(map, CS42L81_ASP_PAIR_RATE(n), c | c << 4);
++}
++
++static void cs42l81_apply_spk_volume(struct cs42l81 *cs)
++{
++	unsigned int v = CS42L81_VOL_MUTE;
++
++	if (cs->spk_switch)
++		v = (cs->spk_vol + CS42L81_VOL_OFFSET) & 0xff;
++
++	/* Speaker-only state, as iOS: per-speaker volume, main volume muted */
++	regmap_write(cs->regmap, CS42L81_SPK_VOL_A, v);
++	regmap_write(cs->regmap, CS42L81_SPK_VOL_B, v);
++	regmap_write(cs->regmap, CS42L81_MAIN_VOL, CS42L81_VOL_MUTE);
++}
++
++/* --- power sequences (DAPM) ---------------------------------------------- */
++
++static int cs42l81_core_power_up(struct cs42l81 *cs)
++{
++	struct regmap *map = cs->regmap;
++	unsigned int rev, val;
++	int ret;
++
++	ret = clk_prepare_enable(cs->mclk);
++	if (ret) {
++		dev_err(cs->dev, "could not enable MCLK: %d\n", ret);
++		return ret;
++	}
++
++	/* iOS enableAudio (vtable +0x600), cold path */
++	regmap_write(map, CS42L81_UNLOCK, 0xa5);
++	msleep(10);
++	regmap_write(map, CS42L81_UNLOCK, 0x00);
++
++	/* read to clear latched status */
++	regmap_read(map, CS42L81_INT_STATUS1, &val);
++	regmap_read(map, CS42L81_INT_STATUS2, &val);
++	regmap_read(map, CS42L81_INT_STATUS3, &val);
++	regmap_read(map, CS42L81_INT_STATUS4, &val);
++	regmap_read(map, CS42L81_INT_STATUS5, &val);
++	regmap_read(map, CS42L81_INT_STATUS6, &val);
++	regmap_read(map, CS42L81_INT_STATUS7, &val);
++
++	ret = regmap_read(map, CS42L81_REVID, &rev);
++	if (ret)
++		goto err;
++	if (rev == 0xa0)
++		regmap_set_bits(map, CS42L81_PWR_CTL1, CS42L81_PWR_CTL1_REVA0);
++
++	regmap_clear_bits(map, CS42L81_PWR_CTL2, 0x80);
++	regmap_update_bits(map, CS42L81_CLK_CTL, 0xcf, 0x0c);
++	regmap_clear_bits(map, CS42L81_ASP_CLK, 0xc0);
++	regmap_clear_bits(map, CS42L81_ASP_PWR, 0x10);
++
++	regmap_update_bits(map, CS42L81_PWR_CTL1,
++			   CS42L81_PWR_CTL1_PDN | CS42L81_PWR_CTL1_BIT2,
++			   CS42L81_PWR_CTL1_BIT2);
++
++	regmap_write(map, CS42L81_OUT_CTL, 0xe0);
++	regmap_write(map, CS42L81_HPCP_CTL, 0x00);
++	regmap_write(map, CS42L81_TRIM1, 0xff);
++	regmap_write(map, CS42L81_TRIM2, 0x0f);
++	regmap_write(map, CS42L81_TRIM3, 0x0e);
++	regmap_set_bits(map, CS42L81_DRV_CTL1, 0x20);
++	regmap_write(map, CS42L81_DRV_CTL2, 0x08);
++	regmap_write(map, CS42L81_DRV_CTL3, 0x09);
++	regmap_set_bits(map, CS42L81_ADC_CTL_A, 0x04);
++	regmap_set_bits(map, CS42L81_ADC_CTL_C, 0x04);
++	regmap_write(map, CS42L81_DRV_CTL4, 0x0c);
++
++	cs42l81_set_rate(cs);
++
++	/* updateRouting: playback-only state */
++	cs42l81_set_asp(cs);
++	regmap_update_bits(map, CS42L81_ADC_PWR, 0x3f, 0);
++	regmap_write(map, CS42L81_ADC_ROUTE, 0xc4);
++	regmap_write(map, CS42L81_ADC_CTL_B, 0x04);
++	regmap_write(map, CS42L81_DRV_CTL2, 0x08);
++	regmap_write(map, CS42L81_DRV_CTL3, 0x09);
++	regmap_update_bits(map, CS42L81_PWR_CTL1, CS42L81_PWR_CTL1_BIT2,
++			   CS42L81_PWR_CTL1_BIT2);
++	regmap_update_bits(map, CS42L81_ASP_PWR, 0xc0, 0x40);
++	regmap_set_bits(map, CS42L81_ASP_CTL, 0x01);
++	regmap_clear_bits(map, CS42L81_PATH_PWR, 0xa0);
++	regmap_set_bits(map, CS42L81_PATH_PWR, 0x40);
++
++	cs->core_on = true;
++	dev_dbg(cs->dev, "core powered up (rev %#x, rate code %#x)\n",
++		rev, cs->rate_code);
++	return 0;
++
++err:
++	clk_disable_unprepare(cs->mclk);
++	return ret;
++}
++
++static void cs42l81_core_power_down(struct cs42l81 *cs)
++{
++	struct regmap *map = cs->regmap;
++	unsigned int val;
++	int ret;
++
++	/* iOS disableAudio (vtable +0x608) */
++	cs->core_on = false;
++	regmap_write(map, CS42L81_HP_VOL_A, CS42L81_HP_MUTE);
++	regmap_write(map, CS42L81_HP_VOL_B, CS42L81_HP_MUTE);
++	regmap_write(map, CS42L81_LINE_VOL_A, CS42L81_HP_MUTE);
++	regmap_write(map, CS42L81_LINE_VOL_B, CS42L81_HP_MUTE);
++	regmap_write(map, CS42L81_SPK_VOL_A, CS42L81_VOL_MUTE);
++	regmap_write(map, CS42L81_SPK_VOL_B, CS42L81_VOL_MUTE);
++	regmap_write(map, CS42L81_MAIN_VOL, CS42L81_VOL_MUTE);
++	regmap_write(map, CS42L81_DRV_PDN, 0x28);
++	regmap_write(map, CS42L81_SPK_PDN, 0x18);
++
++	regmap_read(map, CS42L81_INT_STATUS2, &val);
++	if (val & CS42L81_INT_STATUS2_PDN_DONE)
++		dev_dbg(cs->dev, "PDN_DONE already set before power down\n");
++
++	regmap_update_bits(map, CS42L81_PWR_CTL1,
++			   CS42L81_PWR_CTL1_PDN | CS42L81_PWR_CTL1_BIT2,
++			   CS42L81_PWR_CTL1_PDN | CS42L81_PWR_CTL1_BIT2);
++
++	ret = regmap_read_poll_timeout(map, CS42L81_INT_STATUS2, val,
++				       val & CS42L81_INT_STATUS2_PDN_DONE,
++				       CS42L81_PDN_POLL_US,
++				       CS42L81_PDN_TIMEOUT_US);
++	if (ret)
++		dev_warn(cs->dev, "timed out waiting for codec shutdown\n");
++
++	regmap_set_bits(map, CS42L81_PWR_CTL1, CS42L81_PWR_CTL1_FREEZE);
++	msleep(10);
++	regmap_write(map, CS42L81_UNLOCK, 0xa5);
++
++	clk_disable_unprepare(cs->mclk);
++}
++
++static int cs42l81_core_event(struct snd_soc_dapm_widget *w,
++			      struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *component =
++		snd_soc_dapm_to_component(w->dapm);
++	struct cs42l81 *cs = snd_soc_component_get_drvdata(component);
++
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		return cs42l81_core_power_up(cs);
++	case SND_SOC_DAPM_POST_PMD:
++		cs42l81_core_power_down(cs);
++		break;
++	}
++
++	return 0;
++}
++
++static int cs42l81_spk_event(struct snd_soc_dapm_widget *w,
++			     struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *component =
++		snd_soc_dapm_to_component(w->dapm);
++	struct cs42l81 *cs = snd_soc_component_get_drvdata(component);
++	struct regmap *map = cs->regmap;
++	unsigned int pdn = CS42L81_SPK_PDN_A | CS42L81_SPK_PDN_B;
++
++	switch (event) {
++	case SND_SOC_DAPM_PRE_PMU:
++		gpiod_set_value_cansleep(cs->mute_gpio, 1);
++		regmap_update_bits(map, CS42L81_SPK_MODE, CS42L81_SPK_MODE_MASK,
++				   cs->spk_mode == 2 ? 0 : 0x10);
++		regmap_write(map, CS42L81_OUT_CTL, 0xe0);
++		regmap_update_bits(map, CS42L81_DRV_PDN,
++				   CS42L81_DRV_PDN_HP | CS42L81_DRV_PDN_LINE,
++				   CS42L81_DRV_PDN_HP | CS42L81_DRV_PDN_LINE);
++		regmap_update_bits(map, CS42L81_SPK_PDN, pdn,
++				   cs->spk_mode == 2 ? 0 : CS42L81_SPK_PDN_B);
++		msleep(50);
++		cs->spk_on = true;
++		cs42l81_apply_spk_volume(cs);
++		/* iOS waits for the volume ramp: (v + 27) / 2 ms */
++		msleep((cs->spk_vol + 27) / 2);
++		break;
++	case SND_SOC_DAPM_POST_PMU:
++		gpiod_set_value_cansleep(cs->mute_gpio, 0);
++		break;
++	case SND_SOC_DAPM_PRE_PMD:
++		gpiod_set_value_cansleep(cs->mute_gpio, 1);
++		cs->spk_on = false;
++		regmap_write(map, CS42L81_SPK_VOL_A, CS42L81_VOL_MUTE);
++		regmap_write(map, CS42L81_SPK_VOL_B, CS42L81_VOL_MUTE);
++		regmap_update_bits(map, CS42L81_SPK_PDN, pdn, pdn);
++		msleep(20);
++		break;
++	}
++
++	return 0;
++}
++
++/* --- controls ------------------------------------------------------------- */
++
++/* 0.5 dB steps; control 0 = -102 dB. Max is limited by spkr-gain-db. */
++static const DECLARE_TLV_DB_SCALE(cs42l81_spk_tlv, -10200, 50, 0);
++
++static int cs42l81_spk_vol_info(struct snd_kcontrol *kcontrol,
++				struct snd_ctl_elem_info *uinfo)
++{
++	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
++	struct cs42l81 *cs = snd_soc_component_get_drvdata(component);
++
++	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
++	uinfo->count = 1;
++	uinfo->value.integer.min = 0;
++	uinfo->value.integer.max = cs->vol_max;
++	return 0;
++}
++
++static int cs42l81_spk_vol_get(struct snd_kcontrol *kcontrol,
++			       struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
++	struct cs42l81 *cs = snd_soc_component_get_drvdata(component);
++
++	ucontrol->value.integer.value[0] = cs->spk_vol;
++	return 0;
++}
++
++static int cs42l81_spk_vol_put(struct snd_kcontrol *kcontrol,
++			       struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
++	struct cs42l81 *cs = snd_soc_component_get_drvdata(component);
++	long v = ucontrol->value.integer.value[0];
++
++	if (v < 0 || v > cs->vol_max)
++		return -EINVAL;
++	if (v == cs->spk_vol)
++		return 0;
++
++	cs->spk_vol = v;
++	if (cs->spk_on)
++		cs42l81_apply_spk_volume(cs);
++	return 1;
++}
++
++static int cs42l81_spk_sw_get(struct snd_kcontrol *kcontrol,
++			      struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
++	struct cs42l81 *cs = snd_soc_component_get_drvdata(component);
++
++	ucontrol->value.integer.value[0] = cs->spk_switch;
++	return 0;
++}
++
++static int cs42l81_spk_sw_put(struct snd_kcontrol *kcontrol,
++			      struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
++	struct cs42l81 *cs = snd_soc_component_get_drvdata(component);
++	bool on = !!ucontrol->value.integer.value[0];
++
++	if (on == cs->spk_switch)
++		return 0;
++
++	cs->spk_switch = on;
++	if (cs->spk_on)
++		cs42l81_apply_spk_volume(cs);
++	return 1;
++}
++
++static const struct snd_kcontrol_new cs42l81_controls[] = {
++	{
++		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
++		.name = "Speaker Playback Volume",
++		.access = SNDRV_CTL_ELEM_ACCESS_READWRITE |
++			  SNDRV_CTL_ELEM_ACCESS_TLV_READ,
++		.tlv.p = cs42l81_spk_tlv,
++		.info = cs42l81_spk_vol_info,
++		.get = cs42l81_spk_vol_get,
++		.put = cs42l81_spk_vol_put,
++	},
++	SOC_SINGLE_BOOL_EXT("Speaker Playback Switch", 0,
++			    cs42l81_spk_sw_get, cs42l81_spk_sw_put),
++};
++
++static const struct snd_soc_dapm_widget cs42l81_widgets[] = {
++	SND_SOC_DAPM_SUPPLY("Core", SND_SOC_NOPM, 0, 0, cs42l81_core_event,
++			    SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
++	SND_SOC_DAPM_AIF_IN("ASPRX", "ASP Playback", 0, SND_SOC_NOPM, 0, 0),
++	SND_SOC_DAPM_OUT_DRV_E("Speaker Amp", SND_SOC_NOPM, 0, 0, NULL, 0,
++			       cs42l81_spk_event,
++			       SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMU |
++			       SND_SOC_DAPM_PRE_PMD),
++	SND_SOC_DAPM_OUTPUT("SPKOUT"),
++};
++
++static const struct snd_soc_dapm_route cs42l81_routes[] = {
++	{ "ASPRX", NULL, "Core" },
++	{ "Speaker Amp", NULL, "ASPRX" },
++	{ "SPKOUT", NULL, "Speaker Amp" },
++};
++
++/* --- DAI ------------------------------------------------------------------ */
++
++static int cs42l81_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
++{
++	/* The codec provides BCLK and LRCK; MCA0 is the consumer (iOS). */
++	if ((fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) != SND_SOC_DAIFMT_CBP_CFP)
++		return -EINVAL;
++	if ((fmt & SND_SOC_DAIFMT_FORMAT_MASK) != SND_SOC_DAIFMT_I2S)
++		return -EINVAL;
++	if ((fmt & SND_SOC_DAIFMT_INV_MASK) != SND_SOC_DAIFMT_NB_NF)
++		return -EINVAL;
++	return 0;
++}
++
++static int cs42l81_hw_params(struct snd_pcm_substream *substream,
++			     struct snd_pcm_hw_params *params,
++			     struct snd_soc_dai *dai)
++{
++	struct cs42l81 *cs = snd_soc_component_get_drvdata(dai->component);
++	int code = cs42l81_rate_code(params_rate(params));
++	unsigned int width = params_physical_width(params);
++
++	if (code < 0)
++		return code;
++	if (width != 16 && width != 32)
++		return -EINVAL;
++
++	if (code == cs->rate_code && width / 8 == cs->slot_bytes)
++		return 0;
++
++	cs->rate_code = code;
++	cs->slot_bytes = width / 8;
++
++	/* DAPM keeps the core up for pmdown_time after a stream: reapply. */
++	if (cs->core_on) {
++		cs42l81_set_rate(cs);
++		cs42l81_set_asp(cs);
++	}
++	return 0;
++}
++
++static const struct snd_soc_dai_ops cs42l81_dai_ops = {
++	.set_fmt = cs42l81_set_fmt,
++	.hw_params = cs42l81_hw_params,
++};
++
++static struct snd_soc_dai_driver cs42l81_dai = {
++	.name = "cs42l81-asp",
++	.playback = {
++		.stream_name = "ASP Playback",
++		.channels_min = 2,
++		.channels_max = 2,
++		.rates = SNDRV_PCM_RATE_8000 | SNDRV_PCM_RATE_11025 |
++			 SNDRV_PCM_RATE_16000 | SNDRV_PCM_RATE_22050 |
++			 SNDRV_PCM_RATE_32000 | SNDRV_PCM_RATE_44100 |
++			 SNDRV_PCM_RATE_48000,
++		.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S32_LE,
++	},
++	.ops = &cs42l81_dai_ops,
++};
++
++static const struct snd_soc_component_driver cs42l81_component = {
++	.controls = cs42l81_controls,
++	.num_controls = ARRAY_SIZE(cs42l81_controls),
++	.dapm_widgets = cs42l81_widgets,
++	.num_dapm_widgets = ARRAY_SIZE(cs42l81_widgets),
++	.dapm_routes = cs42l81_routes,
++	.num_dapm_routes = ARRAY_SIZE(cs42l81_routes),
++	.endianness = 1,
++};
++
++/* --- probe ---------------------------------------------------------------- */
++
++static int cs42l81_check_id(struct cs42l81 *cs)
++{
++	unsigned int id[3] = {}, rev = 0;
++	int ret, i;
++
++	/* MCLK is not known to be needed for the control port; keep it on
++	 * anyway while probing so a negative result is meaningful. */
++	ret = clk_prepare_enable(cs->mclk);
++	if (ret)
++		return dev_err_probe(cs->dev, ret, "could not enable MCLK\n");
++
++	for (i = 0; i < 3; i++) {
++		ret = regmap_read(cs->regmap, CS42L81_DEVID_AB + i, &id[i]);
++		if (ret)
++			break;
++	}
++	if (!ret)
++		ret = regmap_read(cs->regmap, CS42L81_REVID, &rev);
++	clk_disable_unprepare(cs->mclk);
++
++	if (ret)
++		return dev_err_probe(cs->dev, ret, "SPI read failed\n");
++
++	if (id[0] != 0x42 || id[1] != 0xa8 || (id[2] & 0xf0) != 0x10)
++		return dev_err_probe(cs->dev, -ENODEV,
++				     "unexpected ID %02x %02x %02x (want 42 a8 1x)\n",
++				     id[0], id[1], id[2]);
++
++	dev_info(cs->dev, "CS42L81 ID %02x%02x%02x rev %#x\n",
++		 id[0], id[1], id[2], rev);
++	return 0;
++}
++
++static int cs42l81_spi_probe(struct spi_device *spi)
++{
++	struct device *dev = &spi->dev;
++	struct cs42l81 *cs;
++	u32 max_db_q8 = 0;
++	int ret;
++
++	cs = devm_kzalloc(dev, sizeof(*cs), GFP_KERNEL);
++	if (!cs)
++		return -ENOMEM;
++
++	cs->dev = dev;
++	cs->spi = spi;
++	cs->xfer_buf = devm_kzalloc(dev, 10, GFP_KERNEL);
++	if (!cs->xfer_buf)
++		return -ENOMEM;
++	spi_set_drvdata(spi, cs);
++
++	cs->regmap = devm_regmap_init(dev, &cs42l81_bus, cs, &cs42l81_regmap);
++	if (IS_ERR(cs->regmap))
++		return dev_err_probe(dev, PTR_ERR(cs->regmap), "regmap init failed\n");
++
++	cs->mclk = devm_clk_get_optional(dev, "mclk");
++	if (IS_ERR(cs->mclk))
++		return dev_err_probe(dev, PTR_ERR(cs->mclk), "failed to get MCLK\n");
++
++	/* logical 1 = muted; the line itself is active low (inferred) */
++	cs->mute_gpio = devm_gpiod_get_optional(dev, "mute", GPIOD_OUT_HIGH);
++	if (IS_ERR(cs->mute_gpio))
++		return dev_err_probe(dev, PTR_ERR(cs->mute_gpio),
++				     "failed to get mute GPIO\n");
++
++	cs->spk_mode = 2;
++	of_property_read_u32(dev->of_node, "apple,speaker-mode", &cs->spk_mode);
++
++	/*
++	 * apple,max-speaker-gain-db-q8: max speaker gain in 1/256 dB (iOS ADT
++	 * spkr-gain-db is -3.0 dB). Clamp the control there.
++	 */
++	cs->vol_max = CS42L81_VOL_MAX_CTL;
++	if (!of_property_read_u32(dev->of_node, "apple,max-speaker-gain-db-q8",
++				  &max_db_q8)) {
++		int db_x2 = (int)max_db_q8 * 2 / 256;	/* 0.5 dB units */
++		int max = 204 + db_x2;			/* 204 = 0 dB */
++
++		cs->vol_max = clamp(max, 0, CS42L81_VOL_MAX_CTL);
++	}
++	/* Default: -24 dB, quiet but audible */
++	cs->spk_vol = min_t(unsigned int, 204 - 48, cs->vol_max);
++	cs->spk_switch = true;
++	cs->rate_code = 0xc;
++	cs->slot_bytes = 2;
++
++	ret = cs42l81_check_id(cs);
++	if (ret)
++		return ret;
++
++	return devm_snd_soc_register_component(dev, &cs42l81_component,
++					       &cs42l81_dai, 1);
++}
++
++static const struct of_device_id cs42l81_of_match[] = {
++	{ .compatible = "cirrus,cs42l81" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, cs42l81_of_match);
++
++static const struct spi_device_id cs42l81_spi_ids[] = {
++	{ "cs42l81" },
++	{ }
++};
++MODULE_DEVICE_TABLE(spi, cs42l81_spi_ids);
++
++static struct spi_driver cs42l81_spi_driver = {
++	.driver = {
++		.name = "cs42l81",
++		.of_match_table = cs42l81_of_match,
++	},
++	.probe = cs42l81_spi_probe,
++	.id_table = cs42l81_spi_ids,
++};
++module_spi_driver(cs42l81_spi_driver);
++
++MODULE_DESCRIPTION("Cirrus Logic CS42L81 codec (Apple iPad 5) driver");
++MODULE_LICENSE("Dual MIT/GPL");

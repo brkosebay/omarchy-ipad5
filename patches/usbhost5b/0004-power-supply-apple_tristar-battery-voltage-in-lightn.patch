@@ -1,0 +1,28 @@
+From 2801e838fc9a26e418b987aea173909db1d254ea Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Tue, 27 Oct 2026 10:27:17 +0000
+Subject: [PATCH 4/4] power: supply: apple_tristar: battery voltage in
+ lightning_state
+
+The charging cut-outs near full depend on the battery voltage; show it
+with the battery status and current.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ drivers/power/supply/apple_tristar_power.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/drivers/power/supply/apple_tristar_power.c b/drivers/power/supply/apple_tristar_power.c
+index aa43bca440..730f91e81d 100644
+--- a/drivers/power/supply/apple_tristar_power.c
++++ b/drivers/power/supply/apple_tristar_power.c
+@@ -1304,6 +1304,8 @@ static ssize_t lightning_state_show(struct device *dev, struct device_attribute
+ 	len = apple_tristar_emit_psy(buf, len, "battery", POWER_SUPPLY_PROP_STATUS, "status");
+ 	len = apple_tristar_emit_psy(buf, len, "battery", POWER_SUPPLY_PROP_CURRENT_NOW,
+ 				     "current_now_ua");
++	len = apple_tristar_emit_psy(buf, len, "battery", POWER_SUPPLY_PROP_VOLTAGE_NOW,
++				     "voltage_now_uv");
+ 	len = apple_tristar_emit_psy(buf, len, "battery", POWER_SUPPLY_PROP_CAPACITY, "capacity");
+ 	len += sysfs_emit_at(buf, len,
+ 			     "\ncounters: probes %u probe_errors %u host_entries %u detaches %u inhibits %u role_errors %u\n",

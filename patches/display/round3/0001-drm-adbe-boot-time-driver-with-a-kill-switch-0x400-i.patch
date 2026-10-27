@@ -1,0 +1,599 @@
+From 1b83789aa87469552a06d46e70b48e9dccf2b71e Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 12:43:11 +0000
+Subject: [PATCH] drm/adbe: boot-time driver with a kill switch; 0x400 is the
+ completion
+
+Make the driver suitable for building in, so it replaces simpledrm
+during boot, before any display manager. A probe that runs before
+simpledrm binds (built-in order or a deferred simpledrm probe) also
+unregisters the still-unbound simple-framebuffer device, so simpledrm
+cannot take the boot framebuffer back. apple_adbe_drm.enable=0 on the
+kernel command line makes probe return -ENODEV before touching
+anything, leaving the display to simpledrm.
+
+Round 2b showed that the FIFO holds a packet (ParmSt 3, 0x1040 = 1)
+until the next frame boundary and applies it there, raising 0x400
+together with VBI; 0x8 never appeared. Make 0x400 the documented
+completion: the vblank interrupt mask is now VBI | 0x400, and 0x8 is
+only counted. A flip completes once its boundary's vblank has been
+counted, so the event carries that frame's sequence and timestamp even
+if 0x400 interrupts a moment before VBI.
+
+Clear the latched VBI bit before unmasking it: it stays set while
+vblank is off, so enabling vblank reported a stale boundary as a
+vblank at once (round 2b counted 64 VBI interrupts for 63 frames),
+skewing the flip's sequence and timestamp after every idle period.
+
+Count every completion exactly once, wherever the status is read (the
+interrupt handler, the clear before a push, the park poll). The park
+poll used to ack 0x400 without counting it, which is the "36 kicks,
+35 completions" seen after DPMS. debugfs now shows completions, the
+packet still in flight, and a push-to-completion latency histogram in
+frames and microseconds.
+
+The probe drops MODULE_DEVICE_TABLE: it is loaded by hand only, so it
+can never be auto-loaded in place of the KMS driver.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ drivers/gpu/drm/adbe/Kconfig      |   3 +
+ drivers/gpu/drm/adbe/adbe_drv.c   | 208 ++++++++++++++++++++++++------
+ drivers/gpu/drm/adbe/adbe_hw.h    |  17 ++-
+ drivers/gpu/drm/adbe/adbe_probe.c |  35 ++---
+ 4 files changed, 203 insertions(+), 60 deletions(-)
+
+diff --git a/drivers/gpu/drm/adbe/Kconfig b/drivers/gpu/drm/adbe/Kconfig
+index 952bbab8fb..c28a53cce7 100644
+--- a/drivers/gpu/drm/adbe/Kconfig
++++ b/drivers/gpu/drm/adbe/Kconfig
+@@ -14,6 +14,9 @@ config DRM_APPLE_ADBE
+ 	  and vblank interrupts. It never programs timings, clocks, power or
+ 	  the eDP link. Scanout buffers are DMA (CMA) allocations.
+ 
++	  Built in, it replaces simpledrm during boot. Booting with
++	  apple_adbe_drm.enable=0 keeps simpledrm instead.
++
+ 	  If M is selected, the module is called apple_adbe_drm.
+ 
+ config APPLE_ADBE_PROBE
+diff --git a/drivers/gpu/drm/adbe/adbe_drv.c b/drivers/gpu/drm/adbe/adbe_drv.c
+index beb23b424c..304b4fee45 100644
+--- a/drivers/gpu/drm/adbe/adbe_drv.c
++++ b/drivers/gpu/drm/adbe/adbe_drv.c
+@@ -5,15 +5,19 @@
+  * iBoot leaves the eDP link, the panel and the timing generator running.
+  * This driver adopts that 1536x2048 mode and never programs timings,
+  * clocks, power or the link. It offers one XRGB8888 primary plane; a new
+- * framebuffer reaches the pipe through the ADP parameter FIFO and is applied
+- * at the next frame boundary. Vblank comes from the pipe's VBI status bit
+- * on interrupt 0; a flip completes on the next VBI that shows a packet
+- * completion bit (0x8 synced, or 0x400). The packet's token is the next
+- * frame number, because the pipe loads it into its frame counter.
++ * framebuffer reaches the pipe through the ADP parameter FIFO, which holds
++ * the packet until the next frame boundary and applies it there. Interrupt
++ * 0 carries both events used here: VBI (vblank) and 0x400 (packet applied),
++ * which completes the page flip, so a flip event never arrives before the
++ * new buffer is being scanned out. The packet's token is the next frame
++ * number, because the pipe loads it into its frame counter.
+  * Disabling the CRTC scans out a black buffer (the former boot framebuffer)
+  * instead of clearing the layer enable or touching the link, which the
+  * reverse engineering has not verified.
+  *
++ * Built in, it replaces simpledrm during boot; apple_adbe_drm.enable=0 on
++ * the kernel command line keeps simpledrm instead.
++ *
+  * The pipe bus is 32 bits wide with DRAM at bus 0 (bus = CPU - offset, the
+  * offset taken from the live scanout). Buffers are ordinary DMA allocations,
+  * so probe requires the display DART to pass the scanout through without
+@@ -26,6 +30,7 @@
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/of_address.h>
++#include <linux/of_platform.h>
+ #include <linux/of_reserved_mem.h>
+ #include <linux/platform_device.h>
+ #include <linux/seq_file.h>
+@@ -55,9 +60,17 @@
+ #define ADBE_HEIGHT		2048
+ #define ADBE_PITCH		(ADBE_WIDTH * 4)
+ #define ADBE_KICK_WAIT_MS	20	/* pre-kick gate; iOS allows 1000 */
+-#define ADBE_FLIP_VBLANKS	3	/* complete on VBI if synced never comes */
++#define ADBE_FLIP_VBLANKS	3	/* complete on VBI if 0x400 never comes */
+ #define ADBE_FLIP_TIMEOUT_MS	100	/* complete anyway if no interrupt */
+ #define ADBE_PARK_WAIT_MS	100
++#define ADBE_LAT_BUCKETS	4	/* flip latency 0, 1, 2, 3+ frames */
++/* Interrupt sources while vblank is on (added to iBoot's mask). */
++#define ADBE_INTEN_VBLANK	(ADP_ST_VBI | ADP_ST_APPLIED)
++
++/* Kill switch: apple_adbe_drm.enable=0 leaves the display to simpledrm. */
++static bool enable = true;
++module_param(enable, bool, 0400);
++MODULE_PARM_DESC(enable, "Drive disp0 (default); 0 keeps simpledrm on the boot framebuffer");
+ 
+ /* Writable; read once per bind, so a rebind picks up new values. */
+ static char *commit = "base";
+@@ -77,6 +90,7 @@ struct adbe {
+ 	void __iomem *adp;
+ 	void __iomem *boot_va;
+ 	struct resource boot;
++	struct device_node *boot_np;	/* the simple-framebuffer node */
+ 	u64 bus_offset;
+ 	u32 boot_base;
+ 	u32 boot_stride;
+@@ -99,18 +113,31 @@ struct adbe {
+ 	/* Protected by drm.event_lock. */
+ 	struct drm_pending_vblank_event *event;
+ 	unsigned int event_vbls;
++	bool event_applied;	/* 0x400 seen for the pending flip */
+ 	u32 pending_base;
++	u64 kick_seq;		/* vblank count when the flip was pushed */
++	ktime_t kick_time;
++	int kick_done;		/* completions counted before the push */
+ 	struct timer_list flip_timer;
+-	/* Statistics for debugfs. */
++	/*
++	 * Statistics for debugfs. Every status read that shows a completion
++	 * bit counts once, wherever it happens, so that kicks equals
++	 * completions plus the packet still in the FIFO.
++	 */
+ 	atomic_t kicks;
+-	atomic_t synced;	/* completions with 0x8 */
+-	atomic_t stops;		/* completions with 0x400 and no 0x8 */
++	atomic_t completions;
++	atomic_t applied;	/* reads with 0x400 */
++	atomic_t synced;	/* reads with 0x8 (iOS's bit, never seen yet) */
+ 	atomic_t busy;
+ 	atomic_t vbl_fallbacks;
+ 	atomic_t timeouts;
+ 	atomic_t latch_mismatch;	/* base readback != pushed at completion */
+ 	atomic_t frame_jumps;		/* counter moved by != 1 between VBIs */
+ 	atomic_t errors;
++	atomic_t lat_frames[ADBE_LAT_BUCKETS];	/* push to completion */
++	u32 lat_us_max;
++	u64 lat_us_sum;
++	u32 lat_count;
+ };
+ 
+ static struct adbe *to_adbe(struct drm_device *drm)
+@@ -143,10 +170,37 @@ static void adbe_send_event(struct adbe *adbe, struct drm_pending_vblank_event *
+ 	drm_crtc_vblank_put(&adbe->crtc);
+ }
+ 
++/* Account one status read's completion bits (any context). */
++static void adbe_count_done(struct adbe *adbe, u32 status)
++{
++	if (!(status & ADP_ST_DONE))
++		return;
++	atomic_inc(&adbe->completions);
++	if (status & ADP_ST_APPLIED)
++		atomic_inc(&adbe->applied);
++	if (status & ADP_ST_SYNCED)
++		atomic_inc(&adbe->synced);
++}
++
++/* Push-to-completion latency of one flip, after the vblank was counted. */
++static void adbe_count_latency(struct adbe *adbe, u64 seq, ktime_t start)
++{
++	u64 frames = drm_crtc_vblank_count(&adbe->crtc) - seq;
++	u32 us = ktime_us_delta(ktime_get(), start);
++
++	atomic_inc(&adbe->lat_frames[min_t(u64, frames, ADBE_LAT_BUCKETS - 1)]);
++	WRITE_ONCE(adbe->lat_us_max, max(adbe->lat_us_max, us));
++	WRITE_ONCE(adbe->lat_us_sum, adbe->lat_us_sum + us);
++	WRITE_ONCE(adbe->lat_count, adbe->lat_count + 1);
++}
++
+ static irqreturn_t adbe_irq(int irq, void *data)
+ {
+ 	struct adbe *adbe = data;
+ 	struct drm_pending_vblank_event *done = NULL;
++	bool applied = false;
++	ktime_t start = 0;
++	u64 seq = 0;
+ 	u32 status;
+ 
+ 	/*
+@@ -157,13 +211,26 @@ static irqreturn_t adbe_irq(int irq, void *data)
+ 	status = readl(adbe->adp + ADP_STATUS);
+ 	if (status)
+ 		writel(status, adbe->adp + ADP_STATUS);	/* W1C, level line */
++	adbe_count_done(adbe, status);
+ 	if (adbe->event) {
+-		if (status & ADP_ST_DONE) {
++		if (status & ADP_ST_DONE)
++			adbe->event_applied = true;
++		/*
++		 * Complete once the boundary's vblank is counted (VBI here, or
++		 * already handled), so the event carries that frame's sequence
++		 * and timestamp even if 0x400 interrupts a moment before VBI.
++		 */
++		if (adbe->event_applied &&
++		    ((status & ADP_ST_VBI) ||
++		     drm_crtc_vblank_count(&adbe->crtc) != adbe->kick_seq)) {
+ 			done = adbe_take_event(adbe);
++			applied = true;
++			seq = adbe->kick_seq;
++			start = adbe->kick_time;
+ 			/* Camera-free cross-check: the plane holds the pushed base. */
+ 			if (readl(adbe->adp + ADP_BASE) != adbe->pending_base)
+ 				atomic_inc(&adbe->latch_mismatch);
+-		} else if ((status & ADP_ST_VBI) &&
++		} else if (!adbe->event_applied && (status & ADP_ST_VBI) &&
+ 			   ++adbe->event_vbls >= ADBE_FLIP_VBLANKS) {
+ 			done = adbe_take_event(adbe);
+ 			atomic_inc(&adbe->vbl_fallbacks);
+@@ -172,10 +239,6 @@ static irqreturn_t adbe_irq(int irq, void *data)
+ 	spin_unlock(&adbe->drm.event_lock);
+ 	if (!status)
+ 		return IRQ_NONE;
+-	if (status & ADP_ST_SYNCED)
+-		atomic_inc(&adbe->synced);
+-	else if (status & ADP_ST_STOP)
+-		atomic_inc(&adbe->stops);
+ 	if (status & ADP_ST_ERRORS) {
+ 		atomic_or(status & ADP_ST_ERRORS, &adbe->errors);
+ 		dev_warn_ratelimited(adbe->drm.dev, "pipe error bits %#x\n",
+@@ -192,6 +255,9 @@ static irqreturn_t adbe_irq(int irq, void *data)
+ 		adbe->frame_valid = true;
+ 		drm_crtc_handle_vblank(&adbe->crtc);
+ 	}
++	/* The event carries this boundary's vblank sequence and timestamp. */
++	if (applied)
++		adbe_count_latency(adbe, seq, start);
+ 	adbe_send_event(adbe, done);
+ 	return IRQ_HANDLED;
+ }
+@@ -224,7 +290,7 @@ static int adbe_kick(struct adbe *adbe, u32 base, u32 stride,
+ 		     struct drm_pending_vblank_event **event)
+ {
+ 	struct adbe_pkt pkt;
+-	u32 parmst, ptr;
++	u32 parmst, ptr, status;
+ 	unsigned long flags;
+ 	bool armed = false;
+ 	int ret;
+@@ -244,17 +310,27 @@ static int adbe_kick(struct adbe *adbe, u32 base, u32 stride,
+ 		armed = true;
+ 	spin_lock_irqsave(&adbe->drm.event_lock, flags);
+ 	/* Completions before this push belong to an earlier packet. */
+-	writel(ADP_ST_DONE, adbe->adp + ADP_STATUS);
++	status = readl(adbe->adp + ADP_STATUS) & ADP_ST_DONE;
++	if (status) {
++		adbe_count_done(adbe, status);
++		writel(status, adbe->adp + ADP_STATUS);
++	}
+ 	if (adbe->commit == ADBE_COMMIT_SYNC) {
+ 		if (readl(adbe->adp + ADP_STRIDE) != stride)
+ 			writel(stride, adbe->adp + ADP_STRIDE);
+ 		writel(base, adbe->adp + ADP_BASE);
+ 	}
+ 	adbe->pending_base = base;
++	/* From here on, a new completion can only be this packet's. */
++	adbe->kick_done = atomic_read(&adbe->completions);
+ 	adbe_pkt_push(adbe->adp, &pkt, adbe->token, ++adbe->serial, true);
++	atomic_inc(&adbe->kicks);
+ 	if (armed) {
+ 		adbe->event = *event;
+ 		adbe->event_vbls = 0;
++		adbe->event_applied = false;
++		adbe->kick_seq = drm_crtc_vblank_count(&adbe->crtc);
++		adbe->kick_time = ktime_get();
+ 		*event = NULL;
+ 	}
+ 	spin_unlock_irqrestore(&adbe->drm.event_lock, flags);
+@@ -262,21 +338,19 @@ static int adbe_kick(struct adbe *adbe, u32 base, u32 stride,
+ 		mod_timer(&adbe->flip_timer,
+ 			  jiffies + msecs_to_jiffies(ADBE_FLIP_TIMEOUT_MS));
+ 	adbe->cur_base = base;
+-	atomic_inc(&adbe->kicks);
+ 	return 0;
+ }
+ 
+ /*
+  * Scan out the boot framebuffer, cleared to black: "off" for the CRTC and
+- * the state left behind on unbind, shutdown and kexec. Polls for a
+- * completion bit, 0x8 or 0x400 (the vblank interrupt is off by now); if
+- * the packet is not confirmed, falls back to a direct store plus an empty
+- * packet.
++ * the state left behind on unbind, shutdown and kexec. Polls for the
++ * completion (the vblank interrupt is off by now, and the completion is
++ * counted like any other); if the packet is not confirmed, falls back to
++ * a direct store plus an empty packet.
+  */
+ static void adbe_park(struct adbe *adbe)
+ {
+ 	struct adbe_pkt empty = { .count = 0 };
+-	int done = atomic_read(&adbe->synced) + atomic_read(&adbe->stops);
+ 	u32 parmst, ptr;
+ 	unsigned int ms;
+ 
+@@ -290,11 +364,18 @@ static void adbe_park(struct adbe *adbe)
+ 		return;
+ 	if (!adbe_kick(adbe, adbe->boot_base, adbe->boot_stride, NULL)) {
+ 		for (ms = 0; ms < ADBE_PARK_WAIT_MS; ms++) {
+-			u32 status = readl(adbe->adp + ADP_STATUS);
+-
+-			if ((status & ADP_ST_DONE) ||
+-			    atomic_read(&adbe->synced) + atomic_read(&adbe->stops) != done) {
+-				writel(status & ADP_ST_DONE, adbe->adp + ADP_STATUS);
++			unsigned long flags;
++			u32 status;
++
++			/* Same lock as the interrupt handler: count it once. */
++			spin_lock_irqsave(&adbe->drm.event_lock, flags);
++			status = readl(adbe->adp + ADP_STATUS) & ADP_ST_DONE;
++			if (status) {
++				adbe_count_done(adbe, status);
++				writel(status, adbe->adp + ADP_STATUS);
++			}
++			spin_unlock_irqrestore(&adbe->drm.event_lock, flags);
++			if (atomic_read(&adbe->completions) != adbe->kick_done) {
+ 				if (readl(adbe->adp + ADP_BASE) == adbe->boot_base)
+ 					return;
+ 				break;
+@@ -460,9 +541,14 @@ static int adbe_enable_vblank(struct drm_crtc *crtc)
+ 	struct adbe *adbe = to_adbe(crtc->dev);
+ 
+ 	adbe->frame_valid = false;	/* no jump across a vblank-off gap */
++	/*
++	 * VBI stays latched while vblank is off; unmasking it would report a
++	 * stale boundary as a vblank now. Clear it first (round 2b: 64 VBI
++	 * interrupts for 63 frames).
++	 */
++	writel(ADP_ST_VBI, adbe->adp + ADP_STATUS);
+ 	WRITE_ONCE(adbe->vbl_enabled, true);
+-	writel(adbe->saved_inten | ADP_ST_VBI | ADP_ST_SYNCED,
+-	       adbe->adp + ADP_INTEN);
++	writel(adbe->saved_inten | ADBE_INTEN_VBLANK, adbe->adp + ADP_INTEN);
+ 	return 0;
+ }
+ 
+@@ -531,14 +617,23 @@ static int adbe_state_show(struct seq_file *m, void *data)
+ {
+ 	struct drm_debugfs_entry *entry = m->private;
+ 	struct adbe *adbe = to_adbe(entry->dev);
++	u32 count = READ_ONCE(adbe->lat_count);
++	/* A packet not yet applied: the FIFO still holds it. */
++	bool in_flight = readl(adbe->adp + ADP_FIFO_PTR) & ADP_FIFO_PTR_BUSY;
+ 
+-	seq_printf(m, "commit=%s token=%s kicks=%d synced=%d stop-0x400=%d busy=%d vbl-fallbacks=%d timeouts=%d latch-mismatch=%d frame-jumps=%d errors=%#x\n",
++	seq_printf(m, "commit=%s token=%s kicks=%d completions=%d in-flight=%u applied-0x400=%d synced-0x8=%d busy=%d vbl-fallbacks=%d timeouts=%d latch-mismatch=%d frame-jumps=%d errors=%#x\n",
+ 		   adbe_commit_names[adbe->commit], adbe_token_names[adbe->token],
+-		   atomic_read(&adbe->kicks), atomic_read(&adbe->synced),
+-		   atomic_read(&adbe->stops), atomic_read(&adbe->busy),
++		   atomic_read(&adbe->kicks), atomic_read(&adbe->completions),
++		   in_flight, atomic_read(&adbe->applied),
++		   atomic_read(&adbe->synced), atomic_read(&adbe->busy),
+ 		   atomic_read(&adbe->vbl_fallbacks), atomic_read(&adbe->timeouts),
+ 		   atomic_read(&adbe->latch_mismatch),
+ 		   atomic_read(&adbe->frame_jumps), atomic_read(&adbe->errors));
++	seq_printf(m, "flip-latency frames 0:%d 1:%d 2:%d 3+:%d; us avg=%llu max=%u (n=%u)\n",
++		   atomic_read(&adbe->lat_frames[0]), atomic_read(&adbe->lat_frames[1]),
++		   atomic_read(&adbe->lat_frames[2]), atomic_read(&adbe->lat_frames[3]),
++		   count ? READ_ONCE(adbe->lat_us_sum) / count : 0,
++		   READ_ONCE(adbe->lat_us_max), count);
+ 	seq_printf(m, "base=%#x stride=%#x boot-base=%#x bus-offset=%#llx inten=%#x saved-inten=%#x\n",
+ 		   readl(adbe->adp + ADP_BASE), readl(adbe->adp + ADP_STRIDE),
+ 		   adbe->boot_base, adbe->bus_offset,
+@@ -563,6 +658,11 @@ static const struct drm_driver adbe_drm_driver = {
+ 	.minor = 0,
+ };
+ 
++static void adbe_put_node(void *np)
++{
++	of_node_put(np);
++}
++
+ /* The simple-framebuffer iBoot set up: CPU address and geometry. */
+ static int adbe_boot_framebuffer(struct adbe *adbe)
+ {
+@@ -589,8 +689,38 @@ static int adbe_boot_framebuffer(struct adbe *adbe)
+ 			ret = -EINVAL;
+ 		break;
+ 	}
++	if (!ret)
++		adbe->boot_np = of_node_get(np);
+ 	of_node_put(np);
+-	return ret;
++	if (ret)
++		return ret;
++	return devm_add_action_or_reset(adbe->drm.dev, adbe_put_node, adbe->boot_np);
++}
++
++/*
++ * Retire the firmware framebuffer device: the aperture helpers unplug
++ * simpledrm if it is bound, and a device simpledrm has not bound yet (a
++ * built-in probe order, or a deferred probe) is unregistered so that it
++ * cannot take the boot framebuffer back later.
++ */
++static int adbe_take_boot_fb(struct adbe *adbe)
++{
++	struct platform_device *fb;
++	int ret;
++
++	ret = aperture_remove_conflicting_devices(adbe->boot.start,
++						  resource_size(&adbe->boot),
++						  adbe_drm_driver.name);
++	if (ret)
++		return ret;
++	fb = of_find_device_by_node(adbe->boot_np);
++	if (fb) {
++		dev_info(adbe->drm.dev, "retiring %s before simpledrm binds it\n",
++			 dev_name(&fb->dev));
++		platform_device_unregister(fb);
++		put_device(&fb->dev);
++	}
++	return 0;
+ }
+ 
+ /* Everything is read-only until the aperture is taken over. */
+@@ -709,6 +839,10 @@ static int adbe_probe(struct platform_device *pdev)
+ 	struct adbe *adbe;
+ 	int ret;
+ 
++	if (!enable) {
++		dev_info(dev, "disabled by apple_adbe_drm.enable=0; simpledrm keeps the display\n");
++		return -ENODEV;
++	}
+ 	adbe = devm_drm_dev_alloc(dev, &adbe_drm_driver, struct adbe, drm);
+ 	if (IS_ERR(adbe))
+ 		return PTR_ERR(adbe);
+@@ -743,15 +877,15 @@ static int adbe_probe(struct platform_device *pdev)
+ 	adbe->irq = platform_get_irq(pdev, 0);
+ 	if (adbe->irq < 0)
+ 		return adbe->irq;
++	/* No packet of ours yet: a latched completion is not one to count. */
++	writel(ADP_ST_DONE, adbe->adp + ADP_STATUS);
+ 	/* After vblank init; iBoot's mask (OutUnder only) until vblank is on. */
+ 	ret = devm_request_irq(dev, adbe->irq, adbe_irq, 0, dev_name(dev), adbe);
+ 	if (ret)
+ 		return ret;
+ 
+ 	/* Past this point simpledrm is gone; the pipe still shows its buffer. */
+-	ret = aperture_remove_conflicting_devices(adbe->boot.start,
+-						  resource_size(&adbe->boot),
+-						  adbe_drm_driver.name);
++	ret = adbe_take_boot_fb(adbe);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "cannot take over the boot framebuffer\n");
+ 	ret = drm_dev_register(&adbe->drm, 0);
+diff --git a/drivers/gpu/drm/adbe/adbe_hw.h b/drivers/gpu/drm/adbe/adbe_hw.h
+index 2d54a2c9d2..3cdefddd31 100644
+--- a/drivers/gpu/drm/adbe/adbe_hw.h
++++ b/drivers/gpu/drm/adbe/adbe_hw.h
+@@ -44,15 +44,18 @@
+ 
+ #define ADP_ST_VBI		BIT(0)
+ #define ADP_ST_OUTUNDER		BIT(1)
+-#define ADP_ST_SYNCED		BIT(3)	/* parameter packet applied (iOS) */
+ /*
+- * iOS stops waiting on 0x400 too, taking its error path when 0x8 is
+- * absent. In round 2 every packet with a serial token raised 0x400 and
+- * never 0x8, while the plane registers took the new values: a per-packet
+- * completion of some kind. Both end a flip here and are counted apart.
++ * Packet completion. On this pipe every parameter packet raises 0x400 at
++ * the frame boundary where it is applied: the FIFO holds it (ParmSt 3,
++ * 0x1040 = 1) until that boundary, then ParmSt returns to 1, 0x1040 to 0
++ * and 0x400 sets together with VBI (round 2b phase C trace; 0x10 also
++ * sets). 0x400 is the primary completion. 0x8 is iOS's "packet synced"
++ * (iOS waits on 0x408); it never appeared here, with any token, and is
++ * only counted.
+  */
+-#define ADP_ST_STOP		BIT(10)
+-#define ADP_ST_DONE		(ADP_ST_SYNCED | ADP_ST_STOP)
++#define ADP_ST_SYNCED		BIT(3)
++#define ADP_ST_APPLIED		BIT(10)
++#define ADP_ST_DONE		(ADP_ST_SYNCED | ADP_ST_APPLIED)
+ #define ADP_ST_ERRORS		0xa42	/* OutUnder, PFAlign, PFOver, RdErr */
+ 
+ #define ADP_SPDS_VERSION	0x13
+diff --git a/drivers/gpu/drm/adbe/adbe_probe.c b/drivers/gpu/drm/adbe/adbe_probe.c
+index 0c6c531a1f..5a33a2dc87 100644
+--- a/drivers/gpu/drm/adbe/adbe_probe.c
++++ b/drivers/gpu/drm/adbe/adbe_probe.c
+@@ -179,9 +179,9 @@ struct adbe_kick {
+ 	u16 frame_before;
+ 	u16 frame_next;		/* first counter value after the push */
+ 	u32 synced;
+-	u32 stops;
++	u32 applied;
+ 	u32 first_sync_us;
+-	u32 first_stop_us;
++	u32 first_applied_us;
+ 	u32 status_or;
+ 	u32 errors;
+ 	u32 base_after;
+@@ -458,7 +458,7 @@ static void adbe_dart_snapshot(struct adbe_probe *p)
+  * One parameter FIFO kick with the measurements of study §13.9: ParmSt and
+  * the FIFO pointer before and after, a short microsecond burst, then a
+  * ~1 ms poll for three frames counting completion events (0x8 synced,
+- * 0x400 stop) and frame-counter jumps. Every wait is bounded; a busy FIFO
++ * 0x400 applied) and frame-counter jumps. Every wait is bounded; a busy FIFO
+  * is reported and nothing is written. *@pushed tells whether anything
+  * reached the pipe. Success: a completion, no error bits, base read back.
+  */
+@@ -537,11 +537,11 @@ static int adbe_kick(struct adbe_probe *p, const char *what, u32 base,
+ 				k->first_sync_us = max_t(s64, us, 1);
+ 			writel(ADP_ST_SYNCED, p->adp + ADP_STATUS);
+ 		}
+-		if (status & ADP_ST_STOP) {
+-			k->stops++;
+-			if (!k->first_stop_us)
+-				k->first_stop_us = max_t(s64, us, 1);
+-			writel(ADP_ST_STOP, p->adp + ADP_STATUS);
++		if (status & ADP_ST_APPLIED) {
++			k->applied++;
++			if (!k->first_applied_us)
++				k->first_applied_us = max_t(s64, us, 1);
++			writel(ADP_ST_APPLIED, p->adp + ADP_STATUS);
+ 		}
+ 		if (frame != previous && frames.changes == 0)
+ 			k->frame_next = frame;
+@@ -564,20 +564,20 @@ static int adbe_kick(struct adbe_probe *p, const char *what, u32 base,
+ 	k->base_after = adbe_read(p, ADP_BASE);
+ 	if (k->errors)
+ 		ret = -EIO;
+-	else if (!k->synced && !k->stops)
++	else if (!k->synced && !k->applied)
+ 		ret = -ETIMEDOUT;
+ 	else if (k->base_after != base)
+ 		ret = -EREMOTEIO;
+ out:
+ 	k->result = ret;
+-	dev_info(p->dev, "%s: packet=%s token=%s/%#x armed=%u words=%u base %#x; ParmSt %lu->%lu 0x1040 %#x->%#x; burst busy=%u max=%#x; poll %u samples %u frames ptr-busy=%u ParmSt-seen=%#x synced=%u@%uus stop=%u@%uus errors=%#x status-or=%#x; frame %u->%u jumps=%u; readback %#x; result %d\n",
++	dev_info(p->dev, "%s: packet=%s token=%s/%#x armed=%u words=%u base %#x; ParmSt %lu->%lu 0x1040 %#x->%#x; burst busy=%u max=%#x; poll %u samples %u frames ptr-busy=%u ParmSt-seen=%#x synced=%u@%uus applied=%u@%uus errors=%#x status-or=%#x; frame %u->%u jumps=%u; readback %#x; result %d\n",
+ 		 what, adbe_commit_names[p->opt.commit],
+ 		 adbe_token_names[p->opt.token], k->token, p->opt.arm, k->words,
+ 		 base, FIELD_GET(ADP_PARMST_STATE, k->parmst_before),
+ 		 FIELD_GET(ADP_PARMST_STATE, k->parmst_after),
+ 		 k->ptr_before, k->ptr_after, k->burst_busy, k->burst_ptr_max,
+ 		 k->samples, k->frames, k->ptr_busy, k->parmst_seen, k->synced,
+-		 k->first_sync_us, k->stops, k->first_stop_us, k->errors,
++		 k->first_sync_us, k->applied, k->first_applied_us, k->errors,
+ 		 k->status_or, k->frame_before, k->frame_next, k->jumps,
+ 		 k->base_after, ret);
+ 	return ret;
+@@ -607,7 +607,7 @@ static void adbe_phase_c(struct adbe_probe *p)
+ 	/* The exact live words: nothing on screen may change. */
+ 	p->phase_result = adbe_kick(p, "C re-send", base,
+ 				    adbe_read(p, ADP_STRIDE), &pushed);
+-	dev_info(p->dev, "phase C %s: one kick, expect one completion (synced or stop), no jump, an unchanged picture\n",
++	dev_info(p->dev, "phase C %s: one kick, expect one completion (0x400 applied), no jump, an unchanged picture\n",
+ 		 p->phase_result ? "FAILED" : "done");
+ }
+ 
+@@ -886,10 +886,10 @@ static int adbe_state_show(struct seq_file *s, void *unused)
+ 	for (i = 0; i < p->nkicks; i++) {
+ 		struct adbe_kick *k = &p->kick[i];
+ 
+-		seq_printf(s, "kick %u %s: result=%d words=%u token=%#x base=%#x readback=%#x synced=%u@%uus stop=%u@%uus errors=%#x frames=%u frame %u->%u jumps=%u\n",
++		seq_printf(s, "kick %u %s: result=%d words=%u token=%#x base=%#x readback=%#x synced=%u@%uus applied=%u@%uus errors=%#x frames=%u frame %u->%u jumps=%u\n",
+ 			   i, k->what, k->result, k->words, k->token, k->base,
+-			   k->base_after, k->synced, k->first_sync_us, k->stops,
+-			   k->first_stop_us, k->errors, k->frames, k->frame_before,
++			   k->base_after, k->synced, k->first_sync_us, k->applied,
++			   k->first_applied_us, k->errors, k->frames, k->frame_before,
+ 			   k->frame_next, k->jumps);
+ 		seq_printf(s, "  before 0x101c=%#x 0x1040=%#x status=%#x; after 0x101c=%#x 0x1040=%#x; burst busy=%u max=%#x\n",
+ 			   k->parmst_before, k->ptr_before, k->status_before,
+@@ -1056,11 +1056,14 @@ static void adbe_shutdown(struct platform_device *pdev)
+ 	adbe_quiesce(platform_get_drvdata(pdev));
+ }
+ 
++/*
++ * No MODULE_DEVICE_TABLE: the KMS driver owns this node at boot, and the
++ * probe is loaded by hand only (after unbinding apple-adbe).
++ */
+ static const struct of_device_id adbe_of_match[] = {
+ 	{ .compatible = "adbe0,s8000" },
+ 	{}
+ };
+-MODULE_DEVICE_TABLE(of, adbe_of_match);
+ 
+ static struct platform_driver adbe_driver = {
+ 	.probe = adbe_probe,
+-- 
+2.56.0
+

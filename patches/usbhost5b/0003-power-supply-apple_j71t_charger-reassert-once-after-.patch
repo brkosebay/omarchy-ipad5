@@ -1,0 +1,126 @@
+From 2a6b8bfa872ae0f3a9cd0a5a31d33ae02cbeadf8 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Tue, 27 Oct 2026 10:27:17 +0000
+Subject: [PATCH 3/4] power: supply: apple_j71t_charger: reassert once after a
+ PMIC change, list ACA
+
+Shortly after a source attaches, the PMIC changes the input settings on
+its own: the first enable was followed 0.15 s (2026-10-26) and about 1 s
+(2026-10-27, camera adapter) later by "charging policy ownership fault",
+which stops charging for 60 s. Put the active budget back once per 10 s
+window and log which registers changed. A second change inside the
+window is still an ownership fault.
+
+The supplier now reports the camera adapter as an ACA source, and this
+supply forwards its USB type: list ACA here too. Without it every read
+logged "driver reporting unavailable enum value 4" (hundreds per minute).
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ drivers/power/supply/apple_j71t_charger.c | 49 ++++++++++++++++++-----
+ 1 file changed, 40 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/power/supply/apple_j71t_charger.c b/drivers/power/supply/apple_j71t_charger.c
+index b96d071302..630bbc9578 100644
+--- a/drivers/power/supply/apple_j71t_charger.c
++++ b/drivers/power/supply/apple_j71t_charger.c
+@@ -41,6 +41,8 @@
+  */
+ #define J71T_VBAT_MIN_UV 3000000
+ #define J71T_VBAT_MAX_UV 4400000
++/* One budget reassert per window before a register change counts as a fault. */
++#define J71T_REASSERT_WINDOW_MS 10000
+ 
+ static const int j71t_budgets_ua[] = { 500000, 1000000, 2100000, 2400000 };
+ 
+@@ -65,6 +67,7 @@ struct j71t_charger {
+ 	unsigned long fault_until;
+ 	unsigned long retry_after;
+ 	unsigned long ramp_after;
++	unsigned long reassert_after;
+ 	u8 old_control;
+ 	u8 old_input;
+ 	u8 old_charge;
+@@ -423,21 +426,44 @@ static void j71t_policy_log(struct j71t_charger *charger, int error)
+ 		dev_info(charger->dev, "charging policy deferred: %d; retry scheduled\n", error);
+ }
+ 
+-static int j71t_check_owned(struct j71t_charger *charger)
++static int j71t_check_owned(struct j71t_charger *charger, u8 *input, u8 *control, u8 *charge)
+ {
+-	u8 input, control, charge;
+-	int ret = j71t_read(charger, J71T_INPUT_LIMIT, &input);
++	int ret = j71t_read(charger, J71T_INPUT_LIMIT, input);
+ 
+ 	if (!ret)
+-		ret = j71t_read(charger, J71T_INPUT_CONTROL, &control);
++		ret = j71t_read(charger, J71T_INPUT_CONTROL, control);
+ 	if (!ret)
+-		ret = j71t_read(charger, J71T_CHARGE_CURRENT, &charge);
+-	if (!ret && (input != charger->input_code ||
+-		     (control & J71T_INPUT_SUSPEND) || charge != charger->charge_code))
++		ret = j71t_read(charger, J71T_CHARGE_CURRENT, charge);
++	if (!ret && (*input != charger->input_code ||
++		     (*control & J71T_INPUT_SUSPEND) || *charge != charger->charge_code))
+ 		ret = J71T_EREGREADBACK;
+ 	return ret;
+ }
+ 
++/*
++ * The PMIC changes the input settings on its own shortly after a source
++ * attaches (seen 0.15 s and about 1 s after the first enable, 2026-10-26/27).
++ * Put the active budget back once per window; a second change within the
++ * window is a real ownership fault.
++ */
++static int j71t_reassert(struct j71t_charger *charger, u8 input, u8 control, u8 charge)
++{
++	int ret;
++
++	if (time_before(jiffies, charger->reassert_after))
++		return J71T_EREGREADBACK;
++	charger->reassert_after = jiffies + msecs_to_jiffies(J71T_REASSERT_WINDOW_MS);
++	dev_info(charger->dev,
++		 "charger registers changed (input 0x%02x, control 0x%02x, charge 0x%02x); reasserting the %d mA budget\n",
++		 input, control, charge, charger->budget_ua / 1000);
++	ret = j71t_apply(charger, charger->charge_code, charger->input_code);
++	if (!ret && (control & J71T_INPUT_SUSPEND))
++		ret = j71t_set_suspend(charger, 0);
++	if (!ret)
++		ret = j71t_check_owned(charger, &input, &control, &charge);
++	return ret;
++}
++
+ /* A readable hot pack must still trip while another supplier read fails. */
+ static int j71t_thermal_floor(struct j71t_charger *charger)
+ {
+@@ -491,7 +517,11 @@ static void j71t_policy_work(struct work_struct *work)
+ 			goto report;
+ 	}
+ 	if (charger->active) {
+-		ret = j71t_check_owned(charger);
++		u8 input = 0, control = 0, charge = 0;
++
++		ret = j71t_check_owned(charger, &input, &control, &charge);
++		if (j71t_is_fault(ret))
++			ret = j71t_reassert(charger, input, control, charge);
+ 		if (j71t_is_fault(ret))
+ 			goto restore;
+ 		if (ret)
+@@ -700,7 +730,7 @@ static const struct power_supply_desc j71t_desc = {
+ 	.name = "charger",
+ 	.type = POWER_SUPPLY_TYPE_USB,
+ 	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN) | BIT(POWER_SUPPLY_USB_TYPE_SDP) |
+-		     BIT(POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID),
++		     BIT(POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID) | BIT(POWER_SUPPLY_USB_TYPE_ACA),
+ 	.properties = j71t_properties,
+ 	.num_properties = ARRAY_SIZE(j71t_properties),
+ 	.get_property = j71t_get_property,
+@@ -748,6 +778,7 @@ static int j71t_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		dev_warn(&pdev->dev,
+ 			 "CBAT unavailable/unsupported (%d): charging writes disabled\n", ret);
++	charger->reassert_after = jiffies;
+ 	charger->max_limit_ua = J71T_FLOOR_UA;
+ 	if (!of_property_read_u32(pdev->dev.of_node,
+ 				  "apple,usb-input-limit-max-microamp", &limit))

@@ -1,0 +1,107 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* j71t live ADT, AppleT700XTempSensor. Thresholds are conservative lab
+ * margins below Apple's 100 C alarm, not thermalmonitord skin policy.
+ */
+#include <dt-bindings/thermal/thermal.h>
+
+&cpu0 { #cooling-cells = <2>; };
+&cpu1 { #cooling-cells = <2>; };
+
+&{/soc} {
+	a9_thermal: thermal-sensor@20e0c0000 {
+		compatible = "apple,s8003-thermal";
+		reg = <0x2 0x0e0c0000 0x0 0x1000>,
+		      <0x2 0x02230000 0x0 0x1000>;
+		reg-names = "soc", "tcc";
+		#thermal-sensor-cells = <1>;
+	};
+};
+
+/ {
+	thermal-zones {
+		apple-a9-soc0 {
+			polling-delay-passive = <100>;
+			polling-delay = <100>;
+			thermal-sensors = <&a9_thermal 0>;
+			trips {
+				a9_soc0_passive: passive {
+					temperature = <80000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				hot {
+					temperature = <90000>;
+					hysteresis = <5000>;
+					type = "hot";
+				};
+				critical {
+					temperature = <100000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+			cooling-maps {
+				cpu {
+					trip = <&a9_soc0_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		apple-a9-soc1 {
+			polling-delay-passive = <100>;
+			polling-delay = <100>;
+			thermal-sensors = <&a9_thermal 1>;
+			trips {
+				a9_soc1_passive: passive {
+					temperature = <80000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				hot {
+					temperature = <90000>;
+					hysteresis = <5000>;
+					type = "hot";
+				};
+				critical {
+					temperature = <100000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+			cooling-maps {
+				cpu {
+					trip = <&a9_soc1_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+		apple-a9-tcc2 {
+			polling-delay-passive = <100>;
+			polling-delay = <100>;
+			thermal-sensors = <&a9_thermal 5>;
+			trips {
+				a9_tcc2_passive: passive {
+					temperature = <80000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				hot {
+					temperature = <90000>;
+					hysteresis = <5000>;
+					type = "hot";
+				};
+				critical {
+					temperature = <100000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+			cooling-maps {
+				cpu {
+					trip = <&a9_tcc2_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+	};
+};

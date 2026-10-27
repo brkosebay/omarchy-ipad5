@@ -1,0 +1,47 @@
+From 722194e2c2b6bef6dbb6fa3a15445c610cec7e2e Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 12:23:33 +0000
+Subject: [PATCH 43/55] dt-bindings: mfd: apple: describe address-only PMIC
+ children
+
+Permit a non-MMIO register bus with zero size cells. Preserve the legacy
+format and document a separate byte count for address-only NVMEM ranges.
+---
+ Documentation/devicetree/bindings/mfd/apple,pmic.yaml       | 6 +++++-
+ .../devicetree/bindings/nvmem/apple,pmic-nvmem.yaml         | 6 ++++++
+ 2 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/Documentation/devicetree/bindings/mfd/apple,pmic.yaml b/Documentation/devicetree/bindings/mfd/apple,pmic.yaml
+index e622fa1c83..964b6066d4 100644
+--- a/Documentation/devicetree/bindings/mfd/apple,pmic.yaml
++++ b/Documentation/devicetree/bindings/mfd/apple,pmic.yaml
+@@ -52,7 +52,11 @@ properties:
+     const: 1
+ 
+   "#size-cells":
+-    const: 1
++    enum: [0, 1]
++    description: |
++      Zero describes non-MMIO register addresses on the PMIC bus. NVMEM
++      children then provide their register count with the size property.
++      One preserves the legacy register-address and byte-count tuples.
+ 
+   gpio:
+     $ref: /schemas/gpio/apple,d2365-pmic-gpio.yaml
+diff --git a/Documentation/devicetree/bindings/nvmem/apple,pmic-nvmem.yaml b/Documentation/devicetree/bindings/nvmem/apple,pmic-nvmem.yaml
+index b184c10ed0..c20eb02dfe 100644
+--- a/Documentation/devicetree/bindings/nvmem/apple,pmic-nvmem.yaml
++++ b/Documentation/devicetree/bindings/nvmem/apple,pmic-nvmem.yaml
+@@ -29,6 +29,12 @@ properties:
+   reg:
+     maxItems: 1
+ 
++  size:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    minimum: 1
++    description:
++      Number of byte registers when the parent PMIC has zero size cells.
++
+ required:
+   - compatible
+   - reg

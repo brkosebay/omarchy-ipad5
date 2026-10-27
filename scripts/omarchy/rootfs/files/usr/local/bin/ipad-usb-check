@@ -1,0 +1,74 @@
+#!/usr/bin/python3
+"""Read/write a unique temporary file on one already automounted USB filesystem."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import pwd
+import stat
+import subprocess
+import sys
+import tempfile
+
+
+def usb_mount(device):
+    device = Path(device).resolve(strict=True)
+    info = device.stat()
+    if not stat.S_ISBLK(info.st_mode):
+        raise ValueError('expected a USB block device, such as /dev/sda1')
+    identity = f'{os.major(info.st_rdev)}:{os.minor(info.st_rdev)}'
+    ancestry = (Path('/sys/dev/block') / identity).resolve(strict=True)
+    if not any(part.startswith('usb') and part[3:].isdigit() for part in ancestry.parts):
+        raise ValueError('refusing a device without USB ancestry')
+    result = subprocess.run(['findmnt', '--json', '--source', str(device), '--output',
+                             'TARGET,SOURCE,FSTYPE,OPTIONS,MAJ:MIN'],
+                            capture_output=True, text=True, check=True)
+    mounts = json.loads(result.stdout)['filesystems']
+    if len(mounts) != 1 or mounts[0]['maj:min'] != identity:
+        raise ValueError('expected one mounted filesystem for the selected USB device')
+    mount = mounts[0]
+    target = Path(mount['target']).resolve(strict=True)
+    user = pwd.getpwuid(os.getuid()).pw_name
+    parent = Path('/run/media') / user
+    if parent not in target.parents or 'rw' not in mount['options'].split(','):
+        raise ValueError('expected a writable UDisks mount below /run/media/' + user)
+    return target, mount['fstype']
+
+
+def check(target):
+    data = os.urandom(65536)
+    name = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix='.linux-a9-usb-test-', dir=target,
+                                         delete=False) as file:
+            name = Path(file.name)
+            file.write(data)
+            file.flush()
+            os.fsync(file.fileno())
+        if name.read_bytes() != data:
+            raise ValueError('USB readback mismatch')
+        return hashlib.sha256(data).hexdigest()
+    finally:
+        if name is not None:
+            name.unlink(missing_ok=True)
+            os.sync()
+
+
+def main():
+    if len(sys.argv) != 2 or os.geteuid() == 0:
+        raise ValueError('run as the desktop user: ipad-usb-check /dev/sda1')
+    target, filesystem = usb_mount(sys.argv[1])
+    digest = check(target)
+    message = f'PASS user USB read/write: {sys.argv[1]} {filesystem} {target}, 64 KiB SHA256 {digest}'
+    state = Path.home() / '.local/state/linux-a9'
+    state.mkdir(parents=True, exist_ok=True)
+    (state / 'usb-host-check.txt').write_text(message + '\n')
+    print(message)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        print(f'USB check: {error}', file=sys.stderr)
+        sys.exit(1)

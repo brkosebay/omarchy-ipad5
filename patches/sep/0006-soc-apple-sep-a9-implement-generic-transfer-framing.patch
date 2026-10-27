@@ -1,0 +1,199 @@
+From b5789affe06ec78fc9efe88894d174ec1196e69d Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Mon, 26 Oct 2026 20:15:45 +0000
+Subject: [PATCH] soc: apple: sep-a9: implement generic transfer framing
+
+---
+ drivers/soc/apple/sep-a9.c | 113 +++++++++++++++++++++++++++++--------
+ 1 file changed, 90 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/soc/apple/sep-a9.c b/drivers/soc/apple/sep-a9.c
+index 519115c785..f185c347e1 100644
+--- a/drivers/soc/apple/sep-a9.c
++++ b/drivers/soc/apple/sep-a9.c
+@@ -180,9 +180,17 @@
+ #define SEP_TAG_XFER_CONT	0xfd	/* continuation chunk */
+ #define SEP_TAG_XFER_ACK	0xfe	/* SEP: send the next chunk */
+ #define SEP_TAG_XFER_ERR	0xff	/* SEP: error, status word in recv+0x10 */
+-#define SEP_XFER_HDR		7	/* reply payload starts after 7 bytes */
++#define SEP_GT_VERSION		1
++#define SEP_GT_VERSION_OFF	0x00
++#define SEP_GT_TOTAL_OFF	0x04
++#define SEP_GT_OFFSET_OFF	0x08
++#define SEP_GT_FLAGS_OFF	0x0c
++#define SEP_GT_RESERVED_OFF	0x10
++#define SEP_GT_COMMAND_OFF	0x14
++#define SEP_GT_CHUNK_OFF	0x18
++#define SEP_GT_PAYLOAD_OFF	0x1c
+ #define SEP_XFER_ERR_OFF	0x10
+-#define SEP_XFER_CHUNK		16356	/* payload bytes per chunk */
++#define SEP_XFER_CHUNK		(0x4000 - SEP_GT_PAYLOAD_OFF)
+ #define SEP_XFER_TIMEOUT_MS	10000
+ 
+ #define SEP_CMD_SBIO_INIT	0x73
+@@ -269,6 +277,14 @@ struct sep_a9 {
+ 	int last_ret;
+ 	u32 last_status;
+ 	size_t last_out_len;
++	u32 last_gt_version;
++	u32 last_gt_total;
++	u32 last_gt_offset;
++	u32 last_gt_flags;
++	u32 last_gt_reserved;
++	u32 last_gt_command;
++	u32 last_gt_chunk;
++	u32 last_gt_mailbox_data;
+ 	u8 last_out[SEP_XFER_CHUNK];
+ 
+ 	/* One-shot AppleSEPARTStorage MANIFEST request, under cfg_lock. */
+@@ -810,13 +826,15 @@ static int sep_ep_alloc(struct sep_a9 *sep, u8 ep, size_t send_len,
+ /*
+  * Run one single-chunk endpoint command (docs/sep/sbio-commands.md §1):
+  *
+- *	AP:  ep=E tag=0xfc op=cmd param=0 data=input length
+- *	SEP: ep=E tag=0xfc op=cmd param=0 data=reply payload length
++ *	AP:  ep=E tag=0xfc op=cmd param=0 data=sequence (zero here)
++ *	SEP: ep=E tag=0xfc op=cmd param=0 data=sequence (zero here)
+  *
+- * Input starts at send OOL offset 0, the reply payload at receive OOL offset
+- * 7. A tag 0xff reply is an error with its status word at receive OOL offset
+- * 0x10. The 0xfd/0xfe chunk sequence is not implemented: a transfer that
+- * needs it fails with -EMSGSIZE or -EPROTO. Called with cfg_lock held.
++ * Both OOL buffers contain AppleSEPGenericTransfer's seven-u32 little-endian
++ * header: version, total length, offset, flags, reserved, command and chunk
++ * length. Payload starts at +0x1c. A tag 0xff reply is an error with its
++ * status word at receive OOL offset 0x10. The 0xfd/0xfe chunk sequence is not
++ * implemented: a transfer that needs it fails with -EMSGSIZE or -EPROTO.
++ * Called with cfg_lock held.
+  */
+ static int sep_transfer(struct sep_a9 *sep, u8 ep, u8 cmd,
+ 			const void *in, size_t inlen, void *out, size_t outlen,
+@@ -824,20 +842,37 @@ static int sep_transfer(struct sep_a9 *sep, u8 ep, u8 cmd,
+ {
+ 	struct sep_ep *e = &sep->eps[ep];
+ 	unsigned long left;
+-	size_t len, n;
++	u32 version, total, offset, flags, reserved, command, chunk;
+ 	int ret;
+ 
+ 	*replylen = 0;
+ 	*status = 0;
++	sep->last_gt_version = 0;
++	sep->last_gt_total = 0;
++	sep->last_gt_offset = 0;
++	sep->last_gt_flags = 0;
++	sep->last_gt_reserved = 0;
++	sep->last_gt_command = 0;
++	sep->last_gt_chunk = 0;
++	sep->last_gt_mailbox_data = 0;
+ 
+ 	if (ep > SEP_EP_CLIENT_MAX || !e->published)
+ 		return -ENODEV;
+-	if (inlen > e->send_len || inlen > SEP_XFER_CHUNK)
++	if (inlen > SEP_XFER_CHUNK || SEP_GT_PAYLOAD_OFF + inlen > e->send_len)
+ 		return -EMSGSIZE;
+ 
++	memset(e->send, 0, SEP_GT_PAYLOAD_OFF);
++	put_unaligned_le32(SEP_GT_VERSION, e->send + SEP_GT_VERSION_OFF);
++	put_unaligned_le32(inlen, e->send + SEP_GT_TOTAL_OFF);
++	put_unaligned_le32(0, e->send + SEP_GT_OFFSET_OFF);
++	put_unaligned_le32(0, e->send + SEP_GT_FLAGS_OFF);
++	put_unaligned_le32(0, e->send + SEP_GT_RESERVED_OFF);
++	put_unaligned_le32(cmd, e->send + SEP_GT_COMMAND_OFF);
++	put_unaligned_le32(inlen, e->send + SEP_GT_CHUNK_OFF);
+ 	if (inlen)
+-		memcpy(e->send, in, inlen);
+-	dcache_clean_poc((unsigned long)e->send, (unsigned long)e->send + inlen);
++		memcpy(e->send + SEP_GT_PAYLOAD_OFF, in, inlen);
++	dcache_clean_poc((unsigned long)e->send,
++			 (unsigned long)e->send + SEP_GT_PAYLOAD_OFF + inlen);
+ 
+ 	mutex_lock(&sep->lock);
+ 	reinit_completion(&sep->xfer_done);
+@@ -847,7 +882,7 @@ static int sep_transfer(struct sep_a9 *sep, u8 ep, u8 cmd,
+ 	sep->xfer_waiting = true;
+ 	mutex_unlock(&sep->lock);
+ 
+-	ret = sep_send_raw(sep, ep, SEP_TAG_XFER, cmd, 0, inlen);
++	ret = sep_send_raw(sep, ep, SEP_TAG_XFER, cmd, 0, 0);
+ 	if (ret)
+ 		goto out_cancel;
+ 
+@@ -857,6 +892,7 @@ static int sep_transfer(struct sep_a9 *sep, u8 ep, u8 cmd,
+ 		ret = -ETIMEDOUT;
+ 		goto out_cancel;
+ 	}
++	sep->last_gt_mailbox_data = sep->xfer_data;
+ 
+ 	switch (sep->xfer_tag) {
+ 	case SEP_TAG_XFER:
+@@ -874,18 +910,43 @@ static int sep_transfer(struct sep_a9 *sep, u8 ep, u8 cmd,
+ 		return -EPROTO;
+ 	}
+ 
+-	/* data counts the payload only; the 7-byte header is extra. */
+-	len = sep->xfer_data;
+-	*replylen = len;
+-	if (len > SEP_XFER_CHUNK || SEP_XFER_HDR + len > e->recv_len)
+-		return -EMSGSIZE;	/* multi-chunk reply: not implemented */
++	if (sep->xfer_data)
++		return -EPROTO;	/* only first/single-chunk sequence zero is supported */
+ 
+ 	dcache_inval_poc((unsigned long)e->recv,
+-			 (unsigned long)e->recv + SEP_XFER_HDR + len);
+-	n = min(len, outlen);
+-	if (n)
+-		memcpy(out, e->recv + SEP_XFER_HDR, n);
+-	return n;
++			 (unsigned long)e->recv + SEP_GT_PAYLOAD_OFF);
++	version = get_unaligned_le32(e->recv + SEP_GT_VERSION_OFF);
++	total = get_unaligned_le32(e->recv + SEP_GT_TOTAL_OFF);
++	offset = get_unaligned_le32(e->recv + SEP_GT_OFFSET_OFF);
++	flags = get_unaligned_le32(e->recv + SEP_GT_FLAGS_OFF);
++	reserved = get_unaligned_le32(e->recv + SEP_GT_RESERVED_OFF);
++	command = get_unaligned_le32(e->recv + SEP_GT_COMMAND_OFF);
++	chunk = get_unaligned_le32(e->recv + SEP_GT_CHUNK_OFF);
++
++	sep->last_gt_version = version;
++	sep->last_gt_total = total;
++	sep->last_gt_offset = offset;
++	sep->last_gt_flags = flags;
++	sep->last_gt_reserved = reserved;
++	sep->last_gt_command = command;
++	sep->last_gt_chunk = chunk;
++	if (version != SEP_GT_VERSION || offset || command != cmd ||
++	    total != chunk)
++		return -EPROTO;
++	*replylen = total;
++	if (chunk > SEP_XFER_CHUNK || SEP_GT_PAYLOAD_OFF + chunk > e->recv_len ||
++	    total > outlen)
++		return -EMSGSIZE;	/* continuation replies are not implemented */
++
++	dcache_inval_poc((unsigned long)e->recv,
++			 (unsigned long)e->recv + SEP_GT_PAYLOAD_OFF + chunk);
++	if (chunk)
++		memcpy(out, e->recv + SEP_GT_PAYLOAD_OFF, chunk);
++	dev_info(sep->dev,
++		 "ep %#04x cmd %#x: GT reply v=%u total=%u offset=%u flags=%#x reserved=%#x command=%#x chunk=%u mailbox_data=%#x\n",
++		 ep, cmd, version, total, offset, flags, reserved, command, chunk,
++		 sep->xfer_data);
++	return chunk;
+ 
+ out_cancel:
+ 	mutex_lock(&sep->lock);
+@@ -2246,6 +2307,12 @@ static ssize_t sep_dbg_xfer_read(struct file *file, char __user *ubuf,
+ 			 "\nep=%#04x cmd=%#04x ret=%d sep_status=%#x\n",
+ 			 sep->last_ep, sep->last_cmd, sep->last_ret,
+ 			 sep->last_status);
++	len += scnprintf(buf + len, size - len,
++			 "gt_reply version=%u total=%u offset=%u flags=%#x reserved=%#x command=%#x chunk=%u mailbox_data=%#x\n",
++			 sep->last_gt_version, sep->last_gt_total,
++			 sep->last_gt_offset, sep->last_gt_flags,
++			 sep->last_gt_reserved, sep->last_gt_command,
++			 sep->last_gt_chunk, sep->last_gt_mailbox_data);
+ 	mutex_unlock(&sep->cfg_lock);
+ 
+ 	len = simple_read_from_buffer(ubuf, count, ppos, buf, len);
+-- 
+2.56.0
+

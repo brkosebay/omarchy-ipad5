@@ -1,0 +1,90 @@
+From 5bcde32ea68a6a712b35927b61fe60019cc5e798 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 13:15:48 +0000
+Subject: [PATCH 53/55] power: supply: bq27xxx: distinguish cache warmup from
+ runtime faults
+
+Track the first complete cache-only safety sample. Until flags,
+capacity, current, voltage and temperature succeed, expose ENODATA
+including unknown presence, keep raw errors for debug and retry reads
+after one second. Optional sample failures do not block readiness. After
+readiness retain runtime error reporting and the regular refresh
+interval. This avoids treating an initial HDQ failure as a permanently
+missing battery without inventing measurements.
+---
+ drivers/power/supply/bq27xxx_battery.c | 20 ++++++++++++++++----
+ include/linux/power/bq27xxx_battery.h  |  2 ++
+ 2 files changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/power/supply/bq27xxx_battery.c b/drivers/power/supply/bq27xxx_battery.c
+index bc7710f54d..879849373f 100644
+--- a/drivers/power/supply/bq27xxx_battery.c
++++ b/drivers/power/supply/bq27xxx_battery.c
+@@ -2147,6 +2147,8 @@ static void bq27xxx_battery_refresh_cache(struct bq27xxx_device_info *di)
+ 	if (ret)
+ 		goto out_error;
+ 	bq27xxx_cache_value(&cache.temperature, 0, &temperature);
++	/* Optional measurements do not determine safety-sample readiness. */
++	di->cache_ready = true;
+ 
+ 	if (bq27xxx_cache_has_prop(di, POWER_SUPPLY_PROP_TIME_TO_EMPTY_NOW)) {
+ 		ret = bq27xxx_battery_read_time(di, BQ27XXX_REG_TTE, &value);
+@@ -2192,15 +2194,18 @@ static void bq27xxx_battery_refresh_cache(struct bq27xxx_device_info *di)
+ 	changed = memcmp(&di->cache, &cache, sizeof(cache)) != 0;
+ 	di->cache = cache;
+ 	di->last_update = jiffies;
+-	dev_warn_ratelimited(di->dev, "battery cache refresh failed: %d\n",
+-			     ret);
++	if (di->cache_ready)
++		dev_warn_ratelimited(di->dev, "battery cache refresh failed: %d\n", ret);
++	else
++		dev_dbg(di->dev, "battery cache warming up: %d\n", ret);
+ 	if (changed)
+ 		power_supply_changed(di->bat);
+ 
+ out_unlock:
+ 	if (!di->removed && di->cache_refresh_ms)
+ 		queue_delayed_work(system_freezable_wq, &di->work,
+-				   msecs_to_jiffies(di->cache_refresh_ms));
++				   msecs_to_jiffies(di->cache_ready ?
++						    di->cache_refresh_ms : 1000));
+ 	mutex_unlock(&di->lock);
+ }
+ 
+@@ -2387,6 +2392,11 @@ static int bq27xxx_battery_get_cached_property(struct power_supply *psy,
+ 	int ret;
+ 
+ 	mutex_lock(&di->lock);
++	/* Presence is also unknown until the first complete safety sample. */
++	if (!di->cache_ready) {
++		ret = -ENODATA;
++		goto out_unlock;
++	}
+ 	if (psp != POWER_SUPPLY_PROP_PRESENT && di->cache.flags < 0) {
+ 		ret = di->cache.flags;
+ 		goto out_unlock;
+@@ -2597,8 +2607,10 @@ int bq27xxx_battery_setup(struct bq27xxx_device_info *di)
+ 		di->cache_properties = bq27545_cache_props;
+ 		di->num_cache_properties = ARRAY_SIZE(bq27545_cache_props);
+ 	}
+-	if (di->cache_only)
++	if (di->cache_only) {
+ 		bq27xxx_battery_init_cache(&di->cache);
++		di->cache_ready = false;
++	}
+ 
+ 	psy_desc = devm_kzalloc(di->dev, sizeof(*psy_desc), GFP_KERNEL);
+ 	if (!psy_desc)
+diff --git a/include/linux/power/bq27xxx_battery.h b/include/linux/power/bq27xxx_battery.h
+index 25c1424197..5b5feb1ff1 100644
+--- a/include/linux/power/bq27xxx_battery.h
++++ b/include/linux/power/bq27xxx_battery.h
+@@ -76,6 +76,8 @@ struct bq27xxx_device_info {
+ 	struct bq27xxx_reg_cache cache;
+ 	/* Serve properties only from the periodically populated register cache. */
+ 	bool cache_only;
++	/* At least one complete cache-only safety sample succeeded. */
++	bool cache_ready;
+ 	/* Optional transport-specific subset for cache-only operation. */
+ 	const enum power_supply_property *cache_properties;
+ 	size_t num_cache_properties;

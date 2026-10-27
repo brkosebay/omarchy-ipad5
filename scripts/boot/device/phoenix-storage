@@ -1,0 +1,39 @@
+#!/bin/bash
+# Sourced by phoenix-init. No root mount, NVMe queues, or storage writes.
+phoenix_storage() {
+    local params=/sys/module/pcie_apple_h9p/parameters
+    local host=/sys/bus/platform/devices/610000000.pcie
+    local done=/run/phoenix-storage-done i=0
+    if [ ! -r "$params/crash_quiesce_supported" ]; then
+        say 'legacy capture kernel: no host-only ANS quiesce support'
+        return 0
+    fi
+    [ -w /sys/module/nvme/parameters/apple_ans_probe ] || return 1
+    echo N >/sys/module/nvme/parameters/apple_ans_probe || return 1
+    echo Y >"$params/probe" || return 1
+    say 'resetting PCIe with ANS probe held; waiting up to 45s for quiesce'
+    (
+        if [ ! -w "$host/crash_quiesce" ]; then
+            echo 610000000.pcie >/sys/bus/platform/drivers_probe || exit 1
+        fi
+        # Late Wi-Fi GPIO work can make the host temporarily busy.
+        while [ "$i" -lt 35 ]; do
+            if [ -w "$host/crash_quiesce" ] && echo 1 >"$host/crash_quiesce"; then
+                echo success >"$done"
+                exit 0
+            fi
+            sleep 1
+            i=$((i + 1))
+        done
+    ) &
+    while [ "$i" -lt 45 ]; do
+        if [ -r "$done" ] && [ "$(cat "$done")" = success ]; then
+            say 'ANS/PCIe quiesce completed; stage2 may now load'
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    say 'ANS/PCIe quiesce timed out; refusing stage2 with a running probe'
+    return 1
+}

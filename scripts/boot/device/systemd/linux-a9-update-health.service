@@ -1,0 +1,20 @@
+# Decide a trial kernel (linux-a9-update boot ENTRY). Inert unless a trial is
+# pending. On the trial boot itself: wait for multi-user, the configured
+# units, network and a writable NVMe root (/etc/linux-a9/update.conf,
+# /etc/linux-a9/health.d/), then make the entry the default. On any other
+# boot, or when the checks time out, the trial is marked failed and the
+# default stays the known-good kernel. docs/boot/kernel-updates.md
+[Unit]
+Description=linux-a9: health-check a trial kernel before it becomes the default
+ConditionPathExists=/boot/linux-a9/update/trial
+Wants=network-online.target
+After=multi-user.target network-online.target sshd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/linux-a9-update health
+# HEALTH_TIMEOUT (default 300 s) plus slack for set-default/panic re-arm
+TimeoutStartSec=20min
+
+[Install]
+WantedBy=multi-user.target

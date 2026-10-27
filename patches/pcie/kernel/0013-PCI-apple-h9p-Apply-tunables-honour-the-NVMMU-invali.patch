@@ -1,0 +1,354 @@
+From 66148506e4ff87d762a428ff1a53e0a6aa797896 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 11:16:14 +0000
+Subject: [PATCH 13/43] PCI: apple-h9p: Apply tunables, honour the NVMMU
+ invalidate FIFO
+
+Round-1 bring-up on j71t hung right after the ANS glue reset all
+NVMMU FlatDMA slots: 36 back-to-back invalidate writes to NVMMU+0x4,
+each read back, then the first endpoint access never completed.
+
+iOS (AppleNVMeMMU, fffffff005eebc9c in the 20H350 iPad6,11 kernel)
+does not do that. With invalidate-fifo-workaround == 1, which iBoot
+sets in the live ADT of this device, it spins under a lock until bit 0
+of port0+0x22c (the invalidate FIFO, read through the NVMMU's second
+register range) reports empty, gives up after 20 ms, and only then
+writes the tag; it never reads the register back and never invalidates
+a tag it has not mapped. Do the same: poll (bounded, no panic) before
+each invalidate, drop the read-back, and skip slots that were never
+mapped since their last invalidate. Mode 2 (fixed spacing) is supported
+too.
+
+Also, as iOS does on S8003:
+
+- apply apple,tunable-phy and apple,tunable-common after the common
+  init, and apple,tunable-rc / apple,tunable-config after the port's
+  LNKCTL2 write, logging how many registers actually changed,
+- wait (bounded) for the LTSSM to settle in L0 after link-up,
+- export apple_ans_link_up() so the ANS glue can check the link before
+  touching the BAR; a read over a dead link stalls the CPU.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ drivers/pci/controller/pcie-apple-h9p.c | 195 ++++++++++++++++++++++--
+ include/linux/apple-ans.h               |   7 +
+ 2 files changed, 190 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/pci/controller/pcie-apple-h9p.c b/drivers/pci/controller/pcie-apple-h9p.c
+index 2a440cd263..1a625f1619 100644
+--- a/drivers/pci/controller/pcie-apple-h9p.c
++++ b/drivers/pci/controller/pcie-apple-h9p.c
+@@ -138,6 +138,20 @@
+ #define S8003_PORT_LINKPMGRSTS		0x0210
+ #define S8003_PORT_LINKCDMSTS		0x0804
+ #define S8003_PORT_LINKCDMSTS_LTSSM	GENMASK(14, 9)
++#define S8003_LTSSM_L0			0x11
++
++/* NVMMU invalidate FIFO status in the port 0 block (invalidate-fifo-workaround 1) */
++#define S8003_PORT_NVMMU_INV_FIFO	0x022c
++#define S8003_PORT_NVMMU_INV_FIFO_EMPTY	BIT(0)
++#define S8003_NVMMU_INV_FIFO_TIMEOUT_US	20000
++/* invalidate-fifo-workaround 2: iOS nvme-invalidate-delay default */
++#define S8003_NVMMU_INV_DELAY_US	8
++
++/* Block sizes, to bounds-check tunable offsets */
++#define H9P_RC_SIZE			0x8000
++#define H9P_PHY_SIZE			0x4000
++#define H9P_PORT_SIZE			0x4000
++#define H9P_CFG_SIZE			0x1000
+ 
+ /* ADT pci-bridge t-refclk-to-perst (both bridges on j71t) */
+ #define S8003_T_REFCLK_TO_PERST_US	100
+@@ -179,6 +193,9 @@ struct apple_h9p_hw {
+ 	u32 nvmmu_init_busy;
+ 	/* Accepted apple,lane-cfg values (bitmask) */
+ 	u32 lane_cfgs;
++	/* Port-block link status register and its link-up bit (0: unknown) */
++	u32 linksts;
++	u32 linksts_up;
+ 	int (*init_common)(struct apple_h9p_pcie *pcie);
+ 	int (*setup_port)(struct apple_h9p_pcie *pcie, unsigned int port);
+ };
+@@ -188,6 +205,12 @@ struct apple_h9p_nvmmu {
+ 	void __iomem *base;
+ 	bool ready;
+ 	bool sart;
++	/* ADT invalidate-fifo-workaround: 0 none, 1 poll FIFO, 2 delay */
++	u32 inv_fifo;
++	/* Serializes invalidates (FIFO poll + write) across CPUs */
++	spinlock_t inv_lock;
++	/* Tags mapped since their last invalidate */
++	DECLARE_BITMAP(used, APPLE_ANS_NVMMU_MAX_REQS);
+ 	u64 pa_base;
+ 	u32 va_base;
+ 	u32 size;
+@@ -689,6 +712,13 @@ static int apple_h9p_setup_nvmmu(struct apple_h9p_pcie *pcie)
+ 		return 0;
+ 
+ 	nvmmu->pcie = pcie;
++	spin_lock_init(&nvmmu->inv_lock);
++	of_property_read_u32(dev->of_node, "apple,nvmmu-invalidate-fifo",
++			     &nvmmu->inv_fifo);
++	if (nvmmu->inv_fifo > 2)
++		return dev_err_probe(dev, -EINVAL,
++				     "bad apple,nvmmu-invalidate-fifo %u\n",
++				     nvmmu->inv_fifo);
+ 	ret = apple_h9p_nvmmu_get_sart(pcie);
+ 	if (ret == -ENODEV)
+ 		dev_info(dev, "NVMMU: no loader-provided HMB (apple,nvme-hmb empty), SART off\n");
+@@ -763,14 +793,85 @@ static int apple_h9p_setup_nvmmu(struct apple_h9p_pcie *pcie)
+ 
+ 	nvmmu->ready = true;
+ 	if (nvmmu->sart)
+-		dev_info(dev, "NVMMU: ready, SART window %#x -> %pa size %#x\n",
+-			 nvmmu->va_base, &nvmmu->pa_base, nvmmu->size);
++		dev_info(dev, "NVMMU: ready, SART window %#x -> %pa size %#x, invalidate-fifo %u\n",
++			 nvmmu->va_base, &nvmmu->pa_base, nvmmu->size,
++			 nvmmu->inv_fifo);
+ 	else
+-		dev_info(dev, "NVMMU: ready (FlatDMA only)\n");
++		dev_info(dev, "NVMMU: ready (FlatDMA only), invalidate-fifo %u\n",
++			 nvmmu->inv_fifo);
+ 
+ 	return 0;
+ }
+ 
++/*
++ * Invalidate one TCB in the NVMMU cache. iOS (AppleNVMeMMU) with
++ * invalidate-fifo-workaround 1 waits for the invalidate FIFO in the port 0
++ * block to drain before each write, and never reads the register back;
++ * overrunning the FIFO is suspected to stall the port's inbound path.
++ */
++static int apple_h9p_nvmmu_invalidate(struct apple_h9p_pcie *pcie,
++				      unsigned int tag)
++{
++	struct apple_h9p_nvmmu *nvmmu = &pcie->nvmmu;
++	unsigned long flags;
++	u32 val;
++	int ret = 0;
++
++	spin_lock_irqsave(&nvmmu->inv_lock, flags);
++	if (nvmmu->inv_fifo == 1)
++		ret = readl_poll_timeout_atomic(pcie->base_port[0] +
++						S8003_PORT_NVMMU_INV_FIFO, val,
++						val & S8003_PORT_NVMMU_INV_FIFO_EMPTY,
++						1, S8003_NVMMU_INV_FIFO_TIMEOUT_US);
++	else if (nvmmu->inv_fifo == 2)
++		udelay(S8003_NVMMU_INV_DELAY_US);
++	if (!ret)
++		writel(tag, nvmmu->base + H9P_NVMMU_TCB_CTRL);
++	spin_unlock_irqrestore(&nvmmu->inv_lock, flags);
++
++	if (ret)
++		dev_err_ratelimited(pcie->dev,
++				    "NVMMU: invalidate FIFO did not drain (%#x), tag %u not invalidated\n",
++				    val, tag);
++	return ret;
++}
++
++static struct apple_h9p_pcie *apple_ans_host(struct device *dev)
++{
++	struct device *host_dev = dev;
++
++	while (host_dev && host_dev->bus == dev->bus)
++		host_dev = host_dev->parent;
++	if (!host_dev || !host_dev->parent)
++		return NULL;
++
++	return apple_h9p_pcie_lookup(host_dev->parent);
++}
++
++/*
++ * Is the endpoint's link still up? A BAR access over a dead link can stall
++ * the CPU forever on these root complexes, so the ANS glue checks this before
++ * the riskier steps of its bring-up.
++ */
++int apple_ans_link_up(struct device *dev)
++{
++	struct apple_h9p_pcie *pcie = apple_ans_host(dev);
++	int port;
++
++	if (!pcie)
++		return -ENODEV;
++	port = apple_h9p_pcie_device_port(pcie, dev);
++	if (port < 0 || port >= H9P_NUM_PORTS ||
++	    !(pcie->enabled_ports & BIT(port)))
++		return -ENODEV;
++	if (!pcie->hw->linksts)
++		return 1;	/* not known for T8010 */
++
++	return !!(readl(pcie->base_port[port] + pcie->hw->linksts) &
++		  pcie->hw->linksts_up);
++}
++EXPORT_SYMBOL_GPL(apple_ans_link_up);
++
+ int apple_ans_nvmmu_map(struct device *dev, unsigned int tag,
+ 			const u64 *pages, unsigned int npages,
+ 			bool to_memory, dma_addr_t *iova)
+@@ -820,10 +921,12 @@ int apple_ans_nvmmu_map(struct device *dev, unsigned int tag,
+ 		dma_wmb();
+ 		memset(tcb, 0, H9P_NVMMU_TCB_BYTES);
+ 		dma_wmb();
+-		h9p_writel_flush(tag, nvmmu->base + H9P_NVMMU_TCB_CTRL);
+ 		if (iova)
+ 			*iova = 0;
+-		return 0;
++		/* Never-mapped slots aren't cached; don't feed the FIFO */
++		if (!test_and_clear_bit(tag, nvmmu->used))
++			return 0;
++		return apple_h9p_nvmmu_invalidate(pcie, tag);
+ 	}
+ 
+ 	memset(tcb, 0, H9P_NVMMU_TCB_BYTES);
+@@ -840,6 +943,7 @@ int apple_ans_nvmmu_map(struct device *dev, unsigned int tag,
+ 	dma_wmb();
+ 	WRITE_ONCE(tcb[H9P_NVMMU_TCB_NPAGES], npages);
+ 	dma_wmb();
++	set_bit(tag, nvmmu->used);
+ 
+ 	if (iova)
+ 		*iova = H9P_NVMMU_FLATDMA_BASE + tag * H9P_NVMMU_FLATDMA_STRIDE;
+@@ -1011,6 +1115,48 @@ static u32 apple_s8003_lane_mask(struct apple_h9p_pcie *pcie,
+ 	return GENMASK(width - 1, 0) << s8003_lane_start[port];
+ }
+ 
++/*
++ * Apply an ADT-style tunable list. iOS reads apcie-phy-tunables etc. from the
++ * live ADT (records {u32 offset, u32 size, u64 mask, u64 value}); here they
++ * come from the DT as <offset mask value> u32 triplets copied from the j71t
++ * live ADT. Like iOS, only registers whose value changes are written.
++ */
++static int apple_h9p_apply_tunables(struct apple_h9p_pcie *pcie,
++				    struct device_node *np, const char *prop,
++				    void __iomem *base, u32 size,
++				    const char *what)
++{
++	struct device *dev = pcie->dev;
++	int n = of_property_count_u32_elems(np, prop);
++	unsigned int i, changed = 0;
++	u32 off, mask, val, old, new;
++
++	if (n <= 0)
++		return 0;
++	if (n % 3)
++		return dev_err_probe(dev, -EINVAL, "%pOF: bad %s\n", np, prop);
++
++	for (i = 0; i < n; i += 3) {
++		of_property_read_u32_index(np, prop, i, &off);
++		of_property_read_u32_index(np, prop, i + 1, &mask);
++		of_property_read_u32_index(np, prop, i + 2, &val);
++		if ((off & 3) || off > size - 4)
++			return dev_err_probe(dev, -EINVAL,
++					     "%pOF: %s offset %#x out of range\n",
++					     np, prop, off);
++		old = readl(base + off);
++		new = (old & ~mask) | (val & mask);
++		if (new != old) {
++			writel(new, base + off);
++			changed++;
++		}
++	}
++
++	dev_info(dev, "%s tunables: %u of %d registers changed\n", what,
++		 changed, n / 3);
++	return 0;
++}
++
+ static int apple_s8003_init_common(struct apple_h9p_pcie *pcie)
+ {
+ 	int ret;
+@@ -1028,12 +1174,16 @@ static int apple_s8003_init_common(struct apple_h9p_pcie *pcie)
+ 		return dev_err_probe(pcie->dev, ret, "common init timeout\n");
+ 
+ 	writel(1, pcie->base_rc + S8003_RC_COMMON_DONE);
+-	/*
+-	 * iOS applies the ADT apcie-phy-tunables and apcie-common-tunables here.
+-	 * They exist only in the live ADT (filled in by iBoot) and are not
+-	 * passed to Linux yet; we rely on the values iBoot left programmed.
+-	 */
+-	return 0;
++
++	/* iOS: apcie-phy-tunables, then apcie-common-tunables */
++	ret = apple_h9p_apply_tunables(pcie, pcie->dev->of_node,
++				       "apple,tunable-phy", pcie->base_phy,
++				       H9P_PHY_SIZE, "PHY");
++	if (ret)
++		return ret;
++	return apple_h9p_apply_tunables(pcie, pcie->dev->of_node,
++					"apple,tunable-common", pcie->base_rc,
++					H9P_RC_SIZE, "common");
+ }
+ 
+ static void apple_s8003_phy_ip_init(struct apple_h9p_pcie *pcie,
+@@ -1148,6 +1298,20 @@ static int apple_s8003_setup_port(struct apple_h9p_pcie *pcie,
+ 	h9p_rmww(pcie->base_config + port * H9P_CFG_PORT_STRIDE + cap +
+ 		 PCI_EXP_LNKCTL2, PCI_EXP_LNKCTL2_TLS, speed);
+ 
++	/* iOS: pcie-rc-tunables (root port config), apcie-config-tunables */
++	ret = apple_h9p_apply_tunables(pcie, pcie->port_nodes[port],
++				       "apple,tunable-rc",
++				       pcie->base_config +
++				       port * H9P_CFG_PORT_STRIDE,
++				       H9P_CFG_SIZE, "root port");
++	if (ret)
++		return ret;
++	ret = apple_h9p_apply_tunables(pcie, pcie->port_nodes[port],
++				       "apple,tunable-config", pb,
++				       H9P_PORT_SIZE, "port");
++	if (ret)
++		return ret;
++
+ 	writel(H9P_PORT_IRQMASK_PRE_LINK, pb + H9P_PORT_IRQMASK);
+ 	writel(H9P_PORT_IRQSTAT_PRE_LINK, pb + H9P_PORT_IRQSTAT);
+ 	h9p_rmw(pb + H9P_PORT_ENABLE, 0, H9P_PORT_ENABLE_APPLE);
+@@ -1181,7 +1345,12 @@ static int apple_s8003_setup_port(struct apple_h9p_pcie *pcie,
+ 				     "port %u link did not come up (LTSSM %#x)\n",
+ 				     port, val);
+ 
+-	dev_info(dev, "port %u: link up (LTSSM %#x)\n", port, val);
++	/* Link-up is reported during the Gen2 recovery; let it settle in L0 */
++	readl_poll_timeout(pb + S8003_PORT_LINKCDMSTS, val,
++			   FIELD_GET(S8003_PORT_LINKCDMSTS_LTSSM, val) ==
++			   S8003_LTSSM_L0, 100, 100000);
++	dev_info(dev, "port %u: link up (LTSSM %#lx)\n", port,
++		 FIELD_GET(S8003_PORT_LINKCDMSTS_LTSSM, val));
+ 	return 0;
+ }
+ 
+@@ -1530,6 +1699,8 @@ static const struct apple_h9p_hw apple_h9p_hw_s8003 = {
+ 	.nvmmu_init_busy = H9P_NVMMU_TCB_CTRL_INIT,
+ 	/* iOS panics on anything else ("X1 on port 0 not supported") */
+ 	.lane_cfgs = BIT(1) | BIT(3),
++	.linksts = S8003_PORT_LINKSTS,
++	.linksts_up = S8003_PORT_LINKSTS_UP,
+ 	.init_common = apple_s8003_init_common,
+ 	.setup_port = apple_s8003_setup_port,
+ };
+diff --git a/include/linux/apple-ans.h b/include/linux/apple-ans.h
+index 06aebd74eb..1874d7a2fb 100644
+--- a/include/linux/apple-ans.h
++++ b/include/linux/apple-ans.h
+@@ -21,6 +21,8 @@ struct device;
+ int apple_ans_nvmmu_map(struct device *dev, unsigned int tag,
+ 			const u64 *pages, unsigned int npages,
+ 			bool to_memory, dma_addr_t *iova);
++/* 1 if the endpoint's PCIe link is up, 0 if down, <0 on error */
++int apple_ans_link_up(struct device *dev);
+ #else
+ static inline int apple_ans_nvmmu_map(struct device *dev, unsigned int tag,
+ 				      const u64 *pages, unsigned int npages,
+@@ -28,6 +30,11 @@ static inline int apple_ans_nvmmu_map(struct device *dev, unsigned int tag,
+ {
+ 	return -EOPNOTSUPP;
+ }
++
++static inline int apple_ans_link_up(struct device *dev)
++{
++	return 1;
++}
+ #endif
+ 
+ #endif /* _LINUX_APPLE_ANS_H */
+-- 
+2.56.0
+

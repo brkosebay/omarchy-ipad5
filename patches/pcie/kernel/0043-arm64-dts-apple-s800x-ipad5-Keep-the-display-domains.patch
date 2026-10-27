@@ -1,0 +1,50 @@
+From 2752fedbbfe3f4f80ed586ca438acdf292e3cc66 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 18:01:24 +0000
+Subject: [PATCH 43/43] arm64: dts: apple: s800x-ipad5: Keep the display
+ domains on
+
+The iPad 5 panel is eDP: the ADT has displayport/lcd,edp, and the pmgr
+table puts DP (and DISP0_DART) under DISP0, which is under RTMUX.
+MIPI_DSI is unused on these boards.
+
+simple-framebuffer only works while the display pipe and eDP link that
+iBoot set up keep their state. On suspend, genpd powers off the
+framebuffer's domains (disp0, dp) in the noirq phase. They come back
+on at resume, but reset, so the panel stays black with the backlight on.
+
+Mark disp0 and dp always-on, as t8103-j293 does for its DFR display.
+rtmux stays on as their parent.
+---
+ arch/arm64/boot/dts/apple/s800x-ipad5.dtsi | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/apple/s800x-ipad5.dtsi b/arch/arm64/boot/dts/apple/s800x-ipad5.dtsi
+index 972d84d6c0..4dba784427 100644
+--- a/arch/arm64/boot/dts/apple/s800x-ipad5.dtsi
++++ b/arch/arm64/boot/dts/apple/s800x-ipad5.dtsi
+@@ -46,6 +46,21 @@ &framebuffer0 {
+ 	power-domains = <&ps_disp0 &ps_dp>;
+ };
+ 
++/*
++ * The framebuffer depends on the display pipe and eDP link that the boot
++ * loader set up, and both reset when these power-domains are powered off.
++ * That happens on suspend, when genpd powers off the framebuffer's domains
++ * in the noirq phase. Mark them as always on until a display driver can
++ * bring the panel back up.
++ */
++&ps_disp0 {
++	apple,always-on;
++};
++
++&ps_dp {
++	apple,always-on;
++};
++
+ &i2c0 {
+ 	status = "okay";
+ 
+-- 
+2.56.0
+

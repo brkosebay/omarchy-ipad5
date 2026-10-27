@@ -1,0 +1,82 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/display/adbe0,s8000.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple A9 display subsystem (disp0)
+
+maintainers:
+  - linux-a9 contributors <linux-a9@localhost>
+
+description: |
+  The A9 ADP/CLCD display subsystem has six register windows and five
+  interrupts. The compatible is the original Apple DeviceTree spelling.
+  This experimental binding describes the pipe that iBoot leaves running,
+  with an optional reserved VRAM area. The first window holds the ADP
+  control registers, the parameter FIFO port and both plane banks; the
+  first interrupt carries the pipe's VBI and packet-synced events. A
+  driver may adopt the running mode and replace the simple-framebuffer,
+  but never retrains the link. The node deliberately has no power-domain,
+  clock, reset, or IOMMU consumers: attaching those can reset the live
+  eDP link or the display DART, which firmware must leave as it is.
+
+properties:
+  compatible:
+    const: adbe0,s8000
+
+  reg:
+    items:
+      - description: Main display window
+      - description: Display window A
+      - description: Display window B
+      - description: Display window C
+      - description: Display window D
+      - description: Seven-register side window
+
+  interrupts:
+    items:
+      - description: ADP pipe interrupt (VBI, packet synced, pipe errors)
+      - description: Back-end interrupt candidate
+      - description: Third interrupt candidate
+      - description: Fourth interrupt candidate
+      - description: Fifth interrupt candidate
+
+  memory-region:
+    maxItems: 1
+    description: |
+      Reserved boot VRAM containing both the simple-framebuffer and optional
+      scratch scanout. Reservation alone does not prove DART reachability.
+
+required:
+  - compatible
+  - reg
+  - interrupts
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        display-subsystem@206200000 {
+            compatible = "adbe0,s8000";
+            reg = <0x2 0x06200000 0 0x100000>,
+                  <0x2 0x06400000 0 0x8000>,
+                  <0x2 0x06440000 0 0x8000>,
+                  <0x2 0x06480000 0 0x8000>,
+                  <0x2 0x064c0000 0 0x8000>,
+                  <0x2 0x06500000 0 0x1c>;
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 140 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 143 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 144 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 145 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 146 IRQ_TYPE_LEVEL_HIGH>;
+        };
+    };

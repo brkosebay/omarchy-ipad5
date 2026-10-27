@@ -1,0 +1,138 @@
+From 209a5a55e36946be24e5d9b0eef21491af956d65 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Mon, 26 Oct 2026 19:41:03 +0000
+Subject: [PATCH 2/2] nvme-pci: apple-ans: optional rescue for unsignalled
+ completions
+
+Add nvme.apple_ans_irq_rescue_ms (default 0, off). When it is set, a
+delayed work checks the CQs on the shared ANS vector while the controller
+is live. If a CQE is still pending at the same CQ head and phase on two
+consecutive ticks, it was not signalled, and the work drains the vector
+the same way the timeout path does. An unsignalled completion then costs
+one to two periods instead of io_timeout. The drains are logged as "IRQ
+rescue", rate-limited.
+
+The work is cancelled at the start of nvme_dev_disable(), before any queue
+or IRQ is torn down, and restarted when the controller is live again.
+With the parameter left at 0, this patch changes nothing.
+
+Validated by an ARM64 build only. No device access.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ drivers/nvme/host/pci-internal.h |  3 ++
+ drivers/nvme/host/pci.c          | 58 ++++++++++++++++++++++++++++++++
+ 2 files changed, 61 insertions(+)
+
+diff --git a/drivers/nvme/host/pci-internal.h b/drivers/nvme/host/pci-internal.h
+index 2407ca7a32..03759df92e 100644
+--- a/drivers/nvme/host/pci-internal.h
++++ b/drivers/nvme/host/pci-internal.h
+@@ -90,6 +90,9 @@ struct nvme_dev {
+ #define ANS_RECOVERY_PENDING	2
+ #define ANS_HEALTH_FAILED	3
+ #define ANS_VECTOR_DRAINED	4	/* report the next MSI after a timeout drain */
++	/* nvme.apple_ans_irq_rescue_ms: CQ head+phase seen pending, per queue */
++	struct delayed_work ans_irq_rescue;
++	u32 ans_irq_rescue_mark[2];
+ 	struct sg_table *hmb_sgt;
+ 	mempool_t *dmavec_mempool;
+ 	const struct nvme_pci_dma_ops *dma_ops;
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 1bf4fa793d..01e85429ba 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -1869,6 +1869,59 @@ static void nvme_apple_ans_drain_vector(struct nvme_queue *nvmeq,
+ 			     reason, nvmeq->cq_vector, found, irq, count);
+ }
+ 
++static unsigned int apple_ans_irq_rescue_ms;
++module_param(apple_ans_irq_rescue_ms, uint, 0444);
++MODULE_PARM_DESC(apple_ans_irq_rescue_ms,
++		 "Apple ANS: drain the shared MSI after an unsignalled completion waits 1-2 periods of this many ms (0 = off)");
++
++/*
++ * Optional safety net for the shared ANS vector. A live vector consumes a
++ * completion within microseconds; one still pending at the same CQ head on
++ * two consecutive ticks was not signalled, so drain it now instead of at
++ * the 5-second timeout. Reads are lockless; a stale view only delays or
++ * repeats a drain, which is safe.
++ */
++static void nvme_apple_ans_irq_rescue_work(struct work_struct *work)
++{
++	struct nvme_dev *dev = container_of(to_delayed_work(work),
++					    struct nvme_dev, ans_irq_rescue);
++	unsigned int i, n;
++
++	if (nvme_ctrl_state(&dev->ctrl) != NVME_CTRL_LIVE)
++		return;
++	n = min_t(unsigned int, dev->ctrl.queue_count,
++		  ARRAY_SIZE(dev->ans_irq_rescue_mark));
++	for (i = 0; i < n; i++) {
++		struct nvme_queue *q = &dev->queues[i];
++		u32 mark = 0;
++
++		if (nvme_apple_ans_vector_queue(q, 0) && nvme_cqe_pending(q))
++			mark = BIT(31) | READ_ONCE(q->cq_phase) << 16 |
++			       READ_ONCE(q->cq_head);
++		if (mark && mark == dev->ans_irq_rescue_mark[i]) {
++			nvme_apple_ans_drain_vector(q, "IRQ rescue");
++			memset(dev->ans_irq_rescue_mark, 0,
++			       sizeof(dev->ans_irq_rescue_mark));
++			break;
++		}
++		dev->ans_irq_rescue_mark[i] = mark;
++	}
++	schedule_delayed_work(&dev->ans_irq_rescue,
++			      msecs_to_jiffies(apple_ans_irq_rescue_ms));
++}
++
++static void nvme_apple_ans_irq_rescue_start(struct nvme_dev *dev)
++{
++	if (!apple_ans_irq_rescue_ms || !nvme_apple_ans_shared_vector(dev) ||
++	    dev->online_queues < 2)
++		return;
++	memset(dev->ans_irq_rescue_mark, 0, sizeof(dev->ans_irq_rescue_mark));
++	dev_info(dev->dev, "Apple ANS: IRQ rescue every %u ms\n",
++		 apple_ans_irq_rescue_ms);
++	schedule_delayed_work(&dev->ans_irq_rescue,
++			      msecs_to_jiffies(apple_ans_irq_rescue_ms));
++}
++
+ static int nvme_poll(struct blk_mq_hw_ctx *hctx, struct io_comp_batch *iob)
+ {
+ 	struct nvme_queue *nvmeq = hctx->driver_data;
+@@ -3777,6 +3830,8 @@ static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
+ 	bool dead;
+ 	int ret;
+ 
++	/* Before queues and IRQs go away; nvme_reset_work() restarts it. */
++	cancel_delayed_work_sync(&dev->ans_irq_rescue);
+ 	mutex_lock(&dev->shutdown_lock);
+ 	dead = nvme_pci_ctrl_is_dead(dev);
+ 	if (dead && shutdown && kexec_in_progress &&
+@@ -4028,6 +4083,7 @@ static void nvme_reset_work(struct work_struct *work)
+ 	}
+ 
+ 	nvme_start_ctrl(&dev->ctrl);
++	nvme_apple_ans_irq_rescue_start(dev);
+ 	return;
+ 
+  out_unlock:
+@@ -4262,6 +4318,7 @@ static struct nvme_dev *nvme_pci_alloc_dev(struct pci_dev *pdev,
+ 	if (!dev)
+ 		return ERR_PTR(-ENOMEM);
+ 	INIT_WORK(&dev->ctrl.reset_work, nvme_reset_work);
++	INIT_DELAYED_WORK(&dev->ans_irq_rescue, nvme_apple_ans_irq_rescue_work);
+ 	mutex_init(&dev->shutdown_lock);
+ 
+ 	dev->nr_write_queues = write_queues;
+@@ -4459,6 +4516,7 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	pci_set_drvdata(pdev, dev);
+ 
+ 	nvme_start_ctrl(&dev->ctrl);
++	nvme_apple_ans_irq_rescue_start(dev);
+ 	nvme_put_ctrl(&dev->ctrl);
+ 	flush_work(&dev->ctrl.scan_work);
+ 	return 0;

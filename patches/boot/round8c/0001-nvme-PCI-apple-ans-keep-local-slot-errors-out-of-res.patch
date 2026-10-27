@@ -1,0 +1,318 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 20:09:28 +0000
+Subject: [PATCH] nvme/PCI: apple-ans: keep local slot errors out of reset and
+ normalize warm ports
+
+Round 8b passed its health gate and partition scan before a FlatDMA slot
+retirement returned -ENODEV and unconditionally scheduled reset. This errno
+comes from host/port ownership checks, before invalidation, not from a
+controller failure. The original log does not record the request identity
+or the failing lookup branch.
+
+Resolve endpoint ownership through PCI topology instead of rereading live
+bridge bus-number registers during late-port rescans. Use the same lookup
+for MSI allocation. Log host/port rejection before hardware access.
+
+Track whether a slot was actually published to the NVMMU, and record its
+queue, CID, opcode and NSID. Release unpublished allocations without an
+invalidate. Keep mapped slots quarantined on retirement failure, but only
+schedule reset for a confirmed invalidate FIFO timeout or its latched
+poison; local lookup/validation errors log their owner and never reset.
+
+The outgoing handoff deliberately retains CC.EN after certified SHST and
+blocks bus mastering. L0 alone cannot certify inherited translation state
+for the next kernel. Always run the existing full port sequence before new
+tables on incoming handoff as on the successful cold-to-round8b entry.
+Keep the outgoing drain/SHST gates, full-cycle teardown, Round 7 control,
+DART checks, health gate, write window and recovery quota unchanged.
+
+Validated offline with production-C ASan/UBSan fixtures for topology,
+slot lifecycle/error classification, port normalization and existing boot
+safeguards; standalone Image.gz and 104 DTBs built. No device access.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ drivers/nvme/host/pci-apple-ans.c       |  40 ++++++--
+ drivers/pci/controller/pcie-apple-h9p.c | 119 ++++++------------------
+ 2 files changed, 61 insertions(+), 98 deletions(-)
+
+diff --git a/drivers/nvme/host/pci-apple-ans.c b/drivers/nvme/host/pci-apple-ans.c
+index 9ab643b59d..f0a5236a7e 100644
+--- a/drivers/nvme/host/pci-apple-ans.c
++++ b/drivers/nvme/host/pci-apple-ans.c
+@@ -57,6 +57,11 @@
+ 
+ struct apple_ans_nvme_req {
+ 	u64 pages[APPLE_ANS_NVMMU_MAX_PAGES];
++	u32 nsid;
++	u16 qid;
++	u16 cid;
++	u8 opcode;
++	bool mapped;
+ };
+ 
+ /*
+@@ -916,7 +921,7 @@ static blk_status_t nvme_pci_apple_ans_alloc_req(struct nvme_dev *dev,
+ 
+ 	*req = &ans->req[idx];
+ 	*tag = idx;
+-	memset((*req)->pages, 0, sizeof((*req)->pages));
++	memset(*req, 0, sizeof(**req));
+ 	return BLK_STS_OK;
+ }
+ 
+@@ -935,12 +940,28 @@ static void nvme_pci_apple_ans_free_req(struct nvme_dev *dev,
+ 	if (tag >= APPLE_ANS_NVMMU_MAX_REQS)
+ 		return;
+ 
+-	ret = apple_ans_nvmmu_map(dev->dev, tag, NULL, 0, false, NULL);
+-	if (ret) {
+-		dev_warn_ratelimited(dev->dev,
+-			"ANS DMA slot %u quarantined: %d; scheduling reset\n", tag, ret);
+-		nvme_reset_ctrl(&dev->ctrl);
+-		return;
++	/* Allocation/map failures never gave this slot to the NVMMU. */
++	if (req->mapped) {
++		ret = apple_ans_nvmmu_map(dev->dev, tag, NULL, 0, false, NULL);
++		if (ret) {
++			/* This API returns -ETIMEDOUT only for an invalidate FIFO
++			 * timeout, and -EIO only for its latched poison. Lookup,
++			 * ownership and argument errors are not hardware failures.
++			 * Keep the slot reserved, but never reset for those errors.
++			 */
++			bool failed = ret == -ETIMEDOUT || ret == -EIO;
++
++			dev_warn_ratelimited(dev->dev,
++					     "ANS DMA slot %u quarantined: %d qid %u cid %#x opcode %#x nsid %u mapped %u; %s\n",
++					     tag, ret, req->qid, req->cid, req->opcode,
++					     req->nsid, req->mapped,
++					     failed ? "confirmed NVMMU failure; scheduling reset" :
++					     "local retirement error; no reset");
++			if (failed)
++				nvme_reset_ctrl(&dev->ctrl);
++			return;
++		}
++		req->mapped = false;
+ 	}
+ 
+ 	spin_lock_irqsave(&ans->req_lock, flags);
+@@ -1059,6 +1080,10 @@ static blk_status_t nvme_pci_apple_ans_map_data(struct request *req)
+ 	if (status)
+ 		return status;
+ 
++	areq->qid = nvmeq->qid;
++	areq->cid = le16_to_cpu(iod->cmd.common.command_id);
++	areq->opcode = iod->cmd.common.opcode;
++	areq->nsid = le32_to_cpu(iod->cmd.common.nsid);
+ 	iod->dma_private = areq;
+ 	iod->dma_vecs = mempool_alloc(dev->dmavec_mempool, GFP_ATOMIC);
+ 	if (!iod->dma_vecs) {
+@@ -1101,6 +1126,7 @@ static blk_status_t nvme_pci_apple_ans_map_data(struct request *req)
+ 		goto out_unmap;
+ 	}
+ 
++	areq->mapped = true;
+ 	iod->total_len = total;
+ 	iod->cmd.common.flags |= NVME_CMD_APPLE_ANS_FLATDMA;
+ 	iod->cmd.common.dptr.prp1 = cpu_to_le64(flatdma + offs);
+diff --git a/drivers/pci/controller/pcie-apple-h9p.c b/drivers/pci/controller/pcie-apple-h9p.c
+index ebf39f421b..fd9f13fc6f 100644
+--- a/drivers/pci/controller/pcie-apple-h9p.c
++++ b/drivers/pci/controller/pcie-apple-h9p.c
+@@ -427,7 +427,6 @@ struct apple_h9p_pcie {
+ 
+ 	struct apple_h9p_nvmmu nvmmu;
+ 	enum apple_ans_boot_mode ans_mode;
+-	bool ans_inherited;
+ 
+ 	struct device **pd_dev;
+ 	struct device_link **pd_link;
+@@ -593,31 +592,6 @@ static int apple_h9p_pcie_config_write(struct pci_bus *bus, unsigned int devfn,
+ 	return pci_generic_config_write(bus, devfn, where, size, val);
+ }
+ 
+-static unsigned int apple_h9p_pcie_bus_to_port(struct apple_h9p_pcie *pcie,
+-					       unsigned int bus)
+-{
+-	unsigned int port;
+-
+-	for (port = 0; port < H9P_NUM_PORTS; port++) {
+-		u32 cfg, sec, sub;
+-
+-		if (!(pcie->enabled_ports & BIT(port)))
+-			continue;
+-
+-		cfg = readl(pcie->base_config + port * H9P_CFG_PORT_STRIDE +
+-			    PCI_PRIMARY_BUS);
+-		sec = (cfg >> 8) & 0xff;
+-		sub = (cfg >> 16) & 0xff;
+-
+-		if (!sec || !sub || sec == 0xff || sub == 0xff)
+-			continue;
+-		if (bus >= sec && bus <= sub)
+-			return port;
+-	}
+-
+-	return H9P_NUM_PORTS;
+-}
+-
+ static int apple_h9p_pcie_device_port(struct apple_h9p_pcie *pcie,
+ 				      struct device *dev)
+ {
+@@ -630,7 +604,11 @@ static int apple_h9p_pcie_device_port(struct apple_h9p_pcie *pcie,
+ 	if (!pdev->bus)
+ 		return -ENODEV;
+ 
+-	return apple_h9p_pcie_bus_to_port(pcie, pdev->bus->number);
++	/* Completion runs concurrently with late-port rescans. Bridge bus
++	 * registers are routing state, not stable ownership: use the same
++	 * topology walk as the config-access guard, with no ECAM reads.
++	 */
++	return apple_h9p_pcie_bus_port(pdev->bus);
+ }
+ 
+ static void apple_h9p_msi_compose_msg(struct irq_data *d, struct msi_msg *msg)
+@@ -671,7 +649,7 @@ static int apple_h9p_msi_alloc(struct irq_domain *domain, unsigned int virq,
+ 	if (!pdev->bus)
+ 		return -ENOSPC;
+ 
+-	port = apple_h9p_pcie_bus_to_port(pcie, pdev->bus->number);
++	port = apple_h9p_pcie_device_port(pcie, msi_dev);
+ 	if (port >= H9P_NUM_PORTS)
+ 		return -ENOSPC;
+ 	if (!(pcie->enabled_ports & BIT(port)))
+@@ -1052,14 +1030,10 @@ static int apple_h9p_setup_nvmmu(struct apple_h9p_pcie *pcie)
+ 	if (!nvmmu->tcb_sgl)
+ 		return -ENOMEM;
+ 
+-	/* Never replace inherited tables under an enabled controller. preinit
+-	 * first stops it with CC=0, then programs our allocations.
+-	 */
+-	if (!pcie->ans_inherited) {
+-		ret = apple_h9p_nvmmu_program(pcie);
+-		if (ret)
+-			return ret;
+-	}
++	/* Port bring-up has isolated the old endpoint before replacing tables. */
++	ret = apple_h9p_nvmmu_program(pcie);
++	if (ret)
++		return ret;
+ 
+ 	irq = platform_get_irq_byname_optional(pcie->pdev, "nvmmu");
+ 	if (irq > 0) {
+@@ -1074,7 +1048,7 @@ static int apple_h9p_setup_nvmmu(struct apple_h9p_pcie *pcie)
+ 	apple_h9p_map_dart(pcie);
+ 
+ 	nvmmu->ready = true;
+-	nvmmu->active = !pcie->ans_inherited;
++	nvmmu->active = true;
+ 	if (nvmmu->sart)
+ 		dev_info(dev, "NVMMU: ready, SART window %#x -> %pa size %#x, invalidate-fifo %u\n",
+ 			 nvmmu->va_base, &nvmmu->pa_base, nvmmu->size,
+@@ -1333,8 +1307,6 @@ int apple_ans_nvmmu_map(struct device *dev, unsigned int tag,
+ {
+ 	struct apple_h9p_nvmmu *nvmmu;
+ 	struct apple_h9p_pcie *pcie;
+-	struct device *host_dev = dev;
+-	unsigned int port;
+ 	unsigned int i;
+ 	u64 sgl_dma;
+ 	u32 *tcb;
+@@ -1347,21 +1319,19 @@ int apple_ans_nvmmu_map(struct device *dev, unsigned int tag,
+ 	if (npages && !pages)
+ 		return -EINVAL;
+ 
+-	while (host_dev && host_dev->bus == dev->bus)
+-		host_dev = host_dev->parent;
+-	if (!host_dev || !host_dev->parent)
++	pcie = apple_ans_host(dev);
++	if (!pcie) {
++		dev_err_ratelimited(dev,
++				    "NVMMU: tag %u host lookup failed; no hardware access\n", tag);
+ 		return -ENODEV;
+-
+-	pcie = apple_h9p_pcie_lookup(host_dev->parent);
+-	if (!pcie)
+-		return -ENODEV;
+-
++	}
+ 	ret = apple_h9p_pcie_device_port(pcie, dev);
+-	if (ret < 0)
+-		return ret;
+-	port = ret;
+-	if (port != 0 || !(pcie->enabled_ports & BIT(0)))
+-		return -ENODEV;
++	if (ret != 0 || !(pcie->enabled_ports & BIT(0))) {
++		dev_err_ratelimited(dev,
++				    "NVMMU: tag %u owner port %d enabled %#x; no hardware access\n",
++				    tag, ret, pcie->enabled_ports);
++		return ret < 0 ? ret : -ENODEV;
++	}
+ 
+ 	nvmmu = &pcie->nvmmu;
+ 	if (!nvmmu->ready)
+@@ -2092,47 +2062,16 @@ static int apple_s8003_setup_port_full(struct apple_h9p_pcie *pcie,
+ 	return 0;
+ }
+ 
+-/* iOS enableGated uses software _state, unavailable across kernels.
+- * This hardware equivalent is deliberately stricter. Never read an off port.
+- */
+-static bool apple_s8003_port_already_enabled(struct apple_h9p_pcie *pcie)
+-{
+-	void __iomem *rc = pcie->base_rc;
+-	void __iomem *pb = pcie->base_port[0];
+-
+-	if (!(readl(rc + S8003_RC_PORT_CTL(0)) & S8003_RC_PORT_CTL_ENABLE) ||
+-	    !(readl(rc + S8003_RC_PORT_PWR(0)) & S8003_RC_PORT_PWR_ON) ||
+-	    !(readl(rc + S8003_RC_PORT_REFCLK(0)) & S8003_RC_PORT_REFCLK_ON) ||
+-	    !(readl(rc + S8003_RC_PORT_READY(0)) & 1) ||
+-	    gpiod_get_value_cansleep(pcie->perst[0]) != 0)
+-		return false;
+-	return (readl(pb + S8003_PORT_LINKSTS) & S8003_PORT_LINKSTS_UP) &&
+-		FIELD_GET(S8003_PORT_LINKCDMSTS_LTSSM,
+-			  readl(pb + S8003_PORT_LINKCDMSTS)) == S8003_LTSSM_L0;
+-}
+-
+ static int apple_s8003_setup_port_once(struct apple_h9p_pcie *pcie,
+ 				       unsigned int port)
+ {
+-	void __iomem *pb = pcie->base_port[port];
+-
+ 	if (port || pcie->ans_mode == APPLE_ANS_ROUND7)
+ 		return apple_s8003_setup_port_round7(pcie, port);
+-	if (pcie->ans_mode == APPLE_ANS_HANDOFF &&
+-	    apple_s8003_port_already_enabled(pcie)) {
+-		pcie->ans_inherited = true;
+-		/* Host IRQ routing belongs to the new kernel. Do not touch
+-		 * PERST, LTSSM, clocks, power, DART or NVMMU on this path.
+-		 */
+-		writel(H9P_PORT_IRQSTAT_PRE_LINK, pb + H9P_PORT_IRQSTAT);
+-		writel(H9P_PORT_IRQMASK_LINK_UP, pb + H9P_PORT_IRQMASK);
+-		h9p_rmw(pb + H9P_PORT_ENABLE, 0, H9P_PORT_ENABLE_APPLE);
+-		writel(1 | ilog2(H9P_MSI_PER_PORT) << 4, pb + S8003_PORT_MSICTL);
+-		writel(0, pb + H9P_PORT_MSIVECBASE);
+-		dev_info(pcie->dev, "Apple ANS: handoff already-enabled L0; no port reset\n");
+-		return 0;
+-	}
+-	pcie->ans_inherited = false;
++	/* L0 proves link training, not ownership of inherited DMA state.
++	 * Normalize same-entry jumps just like the successful cold entry:
++	 * PERST and full port bring-up before installing new translations.
++	 * The outgoing drain/SHST/BME contract remains mandatory.
++	 */
+ 	dev_info(pcie->dev, "Apple ANS: %s full port bring-up\n",
+ 		 ans_boot_modes[pcie->ans_mode]);
+ 	return apple_s8003_setup_port_full(pcie, port);
+@@ -2158,9 +2097,7 @@ int apple_ans_restart_port(struct device *dev)
+ 			return ret;
+ 		pcie->nvmmu.active = false;
+ 	}
+-	/* Handoff needs a linked port. If the previous enable failed, the
+-	 * hardware predicate falls back to a complete enable sequence.
+-	 */
++	/* Both modes normalize the port before the next controller enable. */
+ 	ret = apple_s8003_setup_port_once(pcie, 0);
+ 	if (ret)
+ 		WRITE_ONCE(pcie->down_ports, pcie->down_ports | BIT(0));

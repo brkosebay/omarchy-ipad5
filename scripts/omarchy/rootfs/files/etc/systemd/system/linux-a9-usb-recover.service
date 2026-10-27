@@ -1,0 +1,15 @@
+[Unit]
+Description=linux-a9 recovery for USB ECM carrier loss with VBUS present
+ConditionFirmware=device-tree-compatible(apple,j71t)
+After=linux-a9-usb0-dhcp.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/linux-a9-usb-recover
+RuntimeDirectory=linux-a9-usb-recover
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target

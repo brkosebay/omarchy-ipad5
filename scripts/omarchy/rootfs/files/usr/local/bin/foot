@@ -1,0 +1,12 @@
+#!/bin/sh
+# linux-a9: foot without ext-background-effect, which makes Hyprland 0.56
+# repaint the whole terminal on every commit (a keystroke, a cursor blink) and
+# costs ~10x the CPU on the iPad's llvmpipe. Details and the upstream fix:
+# /usr/local/src/linux-a9/hide-background-effect.c. Delete this file (and the
+# .so) once Hyprland is fixed; /usr/bin/foot is untouched.
+shim=/usr/local/lib/linux-a9/hide-background-effect.so
+if [ -r "$shim" ]; then
+  LD_PRELOAD="$shim${LD_PRELOAD:+:$LD_PRELOAD}"
+  export LD_PRELOAD
+fi
+exec /usr/bin/foot "$@"

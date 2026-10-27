@@ -1,0 +1,446 @@
+From e44a80b0ab3c430d2c1a44664415cae952ba0f2b Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 12:23:33 +0000
+Subject: [PATCH 46/55] usb: gadget: report bounded Apple host current grants
+
+Handle the verified zero-data vendor request only on opted-in boards.
+Cache standard and signed extra allowances separately from optional PHY
+programming, publish sleepable queries and atomic notifications, and
+revoke elevated grants on reset, disconnect, suspend and transfer
+failure. Cap this platform at 2400 mA.
+---
+ drivers/usb/gadget/composite.c |  24 ++++
+ drivers/usb/gadget/udc/core.c  | 217 +++++++++++++++++++++++++++++++++
+ include/linux/usb/gadget.h     |  61 +++++++++
+ 3 files changed, 302 insertions(+)
+
+diff --git a/drivers/usb/gadget/composite.c b/drivers/usb/gadget/composite.c
+index df39e3487c..8cd83d6fa1 100644
+--- a/drivers/usb/gadget/composite.c
++++ b/drivers/usb/gadget/composite.c
+@@ -1593,6 +1593,16 @@ static int composite_ep0_queue(struct usb_composite_dev *cdev,
+ 	return ret;
+ }
+ 
++static void composite_current_grant_complete(struct usb_ep *ep,
++					     struct usb_request *req)
++{
++	struct usb_composite_dev *cdev = req->context;
++
++	if (req->status && cdev)
++		usb_gadget_revoke_current_grant(cdev->gadget);
++	composite_setup_complete(ep, req);
++}
++
+ static int count_ext_compat(struct usb_configuration *c)
+ {
+ 	int i, res;
+@@ -1765,6 +1775,16 @@ composite_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest *ctrl)
+ 	struct usb_function		*iter;
+ 	u8				endp;
+ 
++	value = usb_gadget_handle_current_grant(gadget, ctrl);
++	if (value != -EOPNOTSUPP) {
++		req->zero = 0;
++		req->context = cdev;
++		req->complete = composite_current_grant_complete;
++		req->length = 0;
++		gadget->ep0->driver_data = cdev;
++		goto check_value;
++	}
++
+ 	if (w_length > USB_COMP_EP0_BUFSIZ) {
+ 		if (ctrl->bRequestType & USB_DIR_IN) {
+ 			/* Cast away the const, we are going to overwrite on purpose. */
+@@ -2271,6 +2291,8 @@ composite_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest *ctrl)
+ 		value = composite_ep0_queue(cdev, req, GFP_ATOMIC);
+ 		if (value < 0) {
+ 			DBG(cdev, "ep_queue --> %d\n", value);
++			if (req->complete == composite_current_grant_complete)
++				usb_gadget_revoke_current_grant(gadget);
+ 			req->status = 0;
+ 			composite_setup_complete(gadget->ep0, req);
+ 		}
+@@ -2588,6 +2610,7 @@ void composite_suspend(struct usb_gadget *gadget)
+ 	 * suspend/resume callbacks?
+ 	 */
+ 	DBG(cdev, "suspend\n");
++	usb_gadget_current_budget_suspend(gadget, true);
+ 	if (cdev->config) {
+ 		list_for_each_entry(f, &cdev->config->functions, list) {
+ 			if (f->suspend)
+@@ -2616,6 +2639,7 @@ void composite_resume(struct usb_gadget *gadget)
+ 	 * suspend/resume callbacks?
+ 	 */
+ 	DBG(cdev, "resume\n");
++	usb_gadget_current_budget_suspend(gadget, false);
+ 	if (cdev->driver->resume)
+ 		cdev->driver->resume(cdev);
+ 	if (cdev->config) {
+diff --git a/drivers/usb/gadget/udc/core.c b/drivers/usb/gadget/udc/core.c
+index f6da12b553..ea40ab612d 100644
+--- a/drivers/usb/gadget/udc/core.c
++++ b/drivers/usb/gadget/udc/core.c
+@@ -17,6 +17,8 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/sched/task_stack.h>
+ #include <linux/workqueue.h>
++#include <linux/notifier.h>
++#include <linux/property.h>
+ 
+ #include <linux/usb/ch9.h>
+ #include <linux/usb/gadget.h>
+@@ -70,6 +72,192 @@ static LIST_HEAD(udc_list);
+ /* Protects udc_list, udc->driver, driver->is_bound, and related calls */
+ static DEFINE_MUTEX(udc_lock);
+ 
++/* Authorization from USB configuration and the opt-in Apple host protocol. */
++static ATOMIC_NOTIFIER_HEAD(gadget_current_notifier);
++
++static void gadget_current_snapshot(struct usb_gadget *gadget,
++				    struct usb_gadget_current_budget *budget)
++{
++	int base = gadget->current_base_ma;
++	int extra = gadget->current_extra_ma;
++	int budget_ma = base;
++
++	budget->of_node = dev_of_node(gadget->dev.parent);
++	budget->configured = gadget->current_configured;
++	budget->connected = gadget->current_bus_connected;
++	budget->suspended = gadget->current_suspended ||
++			    gadget->state == USB_STATE_SUSPENDED;
++	budget->host_grant = gadget->current_host_grant;
++	if (budget->host_grant) {
++		/* IOUSBDeviceFamily active-bus policy: signed extra is wIndex. */
++		budget_ma = base && extra ? 500 + extra : base + extra;
++		budget_ma = clamp(budget_ma, 0, 2400);
++	}
++	budget->current_ma = budget->connected && !budget->suspended ? budget_ma : 0;
++}
++
++static void gadget_current_notify(struct usb_gadget *gadget)
++{
++	struct usb_gadget_current_budget budget;
++	unsigned long flags;
++
++	if (!gadget->current_budget_enabled)
++		return;
++	spin_lock_irqsave(&gadget->state_lock, flags);
++	gadget_current_snapshot(gadget, &budget);
++	spin_unlock_irqrestore(&gadget->state_lock, flags);
++	atomic_notifier_call_chain(&gadget_current_notifier, 0, &budget);
++}
++
++/**
++ * usb_gadget_register_current_notifier - subscribe to gadget budget changes
++ * @nb: notifier whose callback must not sleep or query the budget
++ *
++ * Callbacks receive a temporary struct usb_gadget_current_budget pointer.
++ * A consumer should schedule work, then query the current snapshot by its
++ * controller node. Register before the initial query to avoid lost events.
++ */
++int usb_gadget_register_current_notifier(struct notifier_block *nb)
++{
++	return atomic_notifier_chain_register(&gadget_current_notifier, nb);
++}
++EXPORT_SYMBOL_GPL(usb_gadget_register_current_notifier);
++
++int usb_gadget_unregister_current_notifier(struct notifier_block *nb)
++{
++	return atomic_notifier_chain_unregister(&gadget_current_notifier, nb);
++}
++EXPORT_SYMBOL_GPL(usb_gadget_unregister_current_notifier);
++
++/**
++ * usb_gadget_get_current_budget - query an opted-in controller's authorization
++ * @node: controller node held by the caller
++ * @budget: returned snapshot; valid only on success
++ *
++ * Sleepable. A device-tree phandle identifies the supplying controller.
++ * The notifier callback must not call this function: the UDC lock may be held.
++ */
++int usb_gadget_get_current_budget(const struct device_node *node,
++				  struct usb_gadget_current_budget *budget)
++{
++	struct usb_udc *udc;
++	unsigned long flags;
++	int ret = -ENODEV;
++
++	if (!node || !budget)
++		return -EINVAL;
++	mutex_lock(&udc_lock);
++	list_for_each_entry(udc, &udc_list, list) {
++		struct usb_gadget *gadget = udc->gadget;
++
++		if (!gadget->current_budget_enabled ||
++		    dev_of_node(gadget->dev.parent) != node)
++			continue;
++		spin_lock_irqsave(&gadget->state_lock, flags);
++		gadget_current_snapshot(gadget, budget);
++		spin_unlock_irqrestore(&gadget->state_lock, flags);
++		ret = 0;
++		break;
++	}
++	mutex_unlock(&udc_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(usb_gadget_get_current_budget);
++
++static void gadget_current_set_base(struct usb_gadget *gadget, unsigned int ma)
++{
++	unsigned long flags;
++
++	if (!gadget->current_budget_enabled)
++		return;
++	spin_lock_irqsave(&gadget->state_lock, flags);
++	gadget->current_base_ma = min(ma, 500U);
++	if (!ma) {
++		gadget->current_extra_ma = 0;
++		gadget->current_host_grant = false;
++	}
++	spin_unlock_irqrestore(&gadget->state_lock, flags);
++	gadget_current_notify(gadget);
++}
++
++/* Also used to revoke a grant when its ep0 status transfer fails. */
++void usb_gadget_revoke_current_grant(struct usb_gadget *gadget)
++{
++	unsigned long flags;
++
++	if (!gadget->current_budget_enabled)
++		return;
++	spin_lock_irqsave(&gadget->state_lock, flags);
++	gadget->current_extra_ma = 0;
++	gadget->current_host_grant = false;
++	spin_unlock_irqrestore(&gadget->state_lock, flags);
++	gadget_current_notify(gadget);
++}
++EXPORT_SYMBOL_GPL(usb_gadget_revoke_current_grant);
++
++void usb_gadget_current_budget_suspend(struct usb_gadget *gadget, bool suspended)
++{
++	unsigned long flags;
++
++	if (!gadget->current_budget_enabled)
++		return;
++	spin_lock_irqsave(&gadget->state_lock, flags);
++	gadget->current_suspended = suspended;
++	/* Resume requires a fresh grant; do not reuse an earlier high budget. */
++	gadget->current_extra_ma = 0;
++	gadget->current_host_grant = false;
++	spin_unlock_irqrestore(&gadget->state_lock, flags);
++	gadget_current_notify(gadget);
++}
++EXPORT_SYMBOL_GPL(usb_gadget_current_budget_suspend);
++
++int usb_gadget_handle_current_grant(struct usb_gadget *gadget,
++				    const struct usb_ctrlrequest *ctrl)
++{
++	unsigned long flags;
++	s16 extra = le16_to_cpu(ctrl->wIndex);
++	s16 suspend = le16_to_cpu(ctrl->wValue);
++	bool newly_connected = false;
++
++	if (!gadget->current_budget_enabled)
++		return -EOPNOTSUPP;
++	/* Some UDCs omit DEFAULT/ADDRESS notifications during enumeration. */
++	spin_lock_irqsave(&gadget->state_lock, flags);
++	if (!gadget->current_bus_connected) {
++		gadget->current_bus_connected = true;
++		if (!gadget->current_base_ma)
++			gadget->current_base_ma = 100;
++		newly_connected = true;
++	}
++	spin_unlock_irqrestore(&gadget->state_lock, flags);
++	if (newly_connected)
++		gadget_current_notify(gadget);
++	if (ctrl->bRequest != 0x40 ||
++	    (ctrl->bRequestType != 0x40 && ctrl->bRequestType != 0xc0))
++		return -EOPNOTSUPP;
++	/* Only the exact no-data device vendor request is reserved on this board. */
++	if (ctrl->wLength || extra < -2400 || extra > 2400 ||
++	    suspend < 0 || suspend > 2400) {
++		usb_gadget_revoke_current_grant(gadget);
++		return -EINVAL;
++	}
++	spin_lock_irqsave(&gadget->state_lock, flags);
++	if (gadget->current_suspended) {
++		spin_unlock_irqrestore(&gadget->state_lock, flags);
++		usb_gadget_revoke_current_grant(gadget);
++		return -ESHUTDOWN;
++	}
++	gadget->current_extra_ma = extra;
++	gadget->current_host_grant = true;
++	spin_unlock_irqrestore(&gadget->state_lock, flags);
++	dev_info_ratelimited(&gadget->dev,
++			     "Apple host current grant: extra %d mA, suspend %d mA\n",
++			     extra, suspend);
++	gadget_current_notify(gadget);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(usb_gadget_handle_current_grant);
++
+ /* ------------------------------------------------------------------------- */
+ 
+ /**
+@@ -669,6 +857,8 @@ int usb_gadget_vbus_draw(struct usb_gadget *gadget, unsigned mA)
+ 		gadget->mA = mA;
+ 
+ out:
++	/* Authorization is independent of optional PHY power programming. */
++	gadget_current_set_base(gadget, mA);
+ 	trace_usb_gadget_vbus_draw(gadget, ret);
+ 
+ 	return ret;
+@@ -1137,10 +1327,28 @@ void usb_gadget_set_state(struct usb_gadget *gadget,
+ 
+ 	spin_lock_irqsave(&gadget->state_lock, flags);
+ 	gadget->state = state;
++	if (state <= USB_STATE_DEFAULT) {
++		gadget->current_host_grant = false;
++		gadget->current_extra_ma = 0;
++		gadget->current_suspended = false;
++		gadget->current_configured = false;
++		gadget->current_bus_connected = state == USB_STATE_DEFAULT;
++		gadget->current_base_ma = state == USB_STATE_DEFAULT ? 100 : 0;
++	} else if (state == USB_STATE_SUSPENDED) {
++		gadget->current_host_grant = false;
++		gadget->current_extra_ma = 0;
++		gadget->current_suspended = true;
++	} else if (state == USB_STATE_ADDRESS || state == USB_STATE_CONFIGURED) {
++		gadget->current_bus_connected = true;
++		if (state == USB_STATE_CONFIGURED)
++			gadget->current_configured = true;
++		gadget->current_suspended = false;
++	}
+ 	if (!gadget->teardown)
+ 		schedule_work(&gadget->work);
+ 	spin_unlock_irqrestore(&gadget->state_lock, flags);
+ 	trace_usb_gadget_set_state(gadget, 0);
++	gadget_current_notify(gadget);
+ }
+ EXPORT_SYMBOL_GPL(usb_gadget_set_state);
+ 
+@@ -1389,6 +1597,14 @@ void usb_initialize_gadget(struct device *parent, struct usb_gadget *gadget,
+ 	gadget->teardown = false;
+ 	INIT_WORK(&gadget->work, usb_gadget_state_work);
+ 	gadget->dev.parent = parent;
++	gadget->current_base_ma = 0;
++	gadget->current_extra_ma = 0;
++	gadget->current_host_grant = false;
++	gadget->current_suspended = false;
++	gadget->current_configured = false;
++	gadget->current_bus_connected = false;
++	gadget->current_budget_enabled =
++		device_property_read_bool(parent, "apple,host-current-budget");
+ 
+ 	if (release)
+ 		gadget->dev.release = release;
+@@ -1581,6 +1797,7 @@ void usb_del_gadget(struct usb_gadget *gadget)
+ 		return;
+ 
+ 	dev_vdbg(gadget->dev.parent, "unregistering gadget\n");
++	gadget_current_set_base(gadget, 0);
+ 
+ 	mutex_lock(&udc_lock);
+ 	list_del(&udc->list);
+diff --git a/include/linux/usb/gadget.h b/include/linux/usb/gadget.h
+index 8285b19a25..2f1f036857 100644
+--- a/include/linux/usb/gadget.h
++++ b/include/linux/usb/gadget.h
+@@ -360,6 +360,27 @@ struct usb_gadget_ops {
+ 	int	(*check_config)(struct usb_gadget *gadget);
+ };
+ 
++struct device_node;
++struct notifier_block;
++
++/**
++ * struct usb_gadget_current_budget - instantaneous USB power authorization
++ * @of_node: controller node, valid for the synchronous callback or caller query
++ * @current_ma: active authorization in mA, zero when disconnected or suspended
++ * @host_grant: an explicit host vendor request supplied the additional budget
++ * @configured: a configuration was selected in this bus session, even if suspended
++ * @connected: actual host bus activity was observed, preserved across suspend
++ * @suspended: the bus is suspended; an earlier host grant has been revoked
++ */
++struct usb_gadget_current_budget {
++	const struct device_node *of_node;
++	unsigned int current_ma;
++	bool host_grant;
++	bool configured;
++	bool connected;
++	bool suspended;
++};
++
+ /**
+  * struct usb_gadget - represents a usb device
+  * @work: (internal use) Workqueue to be used for sysfs_notify()
+@@ -386,6 +407,13 @@ struct usb_gadget_ops {
+  * @out_epnum: last used out ep number
+  * @in_epnum: last used in ep number
+  * @mA: last set mA value
++ * @current_base_ma: standard configuration current authorization
++ * @current_extra_ma: signed extra current from an opt-in host grant
++ * @current_host_grant: an explicit host grant is active
++ * @current_suspended: composite bus suspend revokes active authorization
++ * @current_configured: a configuration was selected in this bus session
++ * @current_bus_connected: a host reset/address/configuration or SETUP was seen
++ * @current_budget_enabled: board opted into USB current authorization
+  * @otg_caps: OTG capabilities of this gadget.
+  * @sg_supported: true if we can handle scatter-gather
+  * @is_otg: True if the USB device port uses a Mini-AB jack, so that the
+@@ -462,6 +490,14 @@ struct usb_gadget {
+ 	unsigned			out_epnum;
+ 	unsigned			in_epnum;
+ 	unsigned			mA;
++	/* Opt-in current authorization, protected by state_lock. */
++	unsigned int			current_base_ma;
++	s16				current_extra_ma;
++	bool				current_host_grant;
++	bool				current_suspended;
++	bool				current_configured;
++	bool				current_bus_connected;
++	bool				current_budget_enabled;
+ 	struct usb_otg_caps		*otg_caps;
+ 
+ 	unsigned			sg_supported:1;
+@@ -637,6 +673,16 @@ static inline int gadget_is_otg(struct usb_gadget *g)
+ /*-------------------------------------------------------------------------*/
+ 
+ #if IS_ENABLED(CONFIG_USB_GADGET)
++
++int usb_gadget_register_current_notifier(struct notifier_block *nb);
++int usb_gadget_unregister_current_notifier(struct notifier_block *nb);
++int usb_gadget_get_current_budget(const struct device_node *node,
++				  struct usb_gadget_current_budget *budget);
++int usb_gadget_handle_current_grant(struct usb_gadget *gadget,
++				    const struct usb_ctrlrequest *ctrl);
++void usb_gadget_revoke_current_grant(struct usb_gadget *gadget);
++void usb_gadget_current_budget_suspend(struct usb_gadget *gadget, bool suspended);
++
+ int usb_gadget_frame_number(struct usb_gadget *gadget);
+ int usb_gadget_wakeup(struct usb_gadget *gadget);
+ int usb_gadget_set_remote_wakeup(struct usb_gadget *gadget, int set);
+@@ -651,6 +697,21 @@ int usb_gadget_deactivate(struct usb_gadget *gadget);
+ int usb_gadget_activate(struct usb_gadget *gadget);
+ int usb_gadget_check_config(struct usb_gadget *gadget);
+ #else
++
++static inline int usb_gadget_register_current_notifier(struct notifier_block *nb)
++{ return -ENODEV; }
++static inline int usb_gadget_unregister_current_notifier(struct notifier_block *nb)
++{ return 0; }
++static inline int usb_gadget_get_current_budget(const struct device_node *node,
++						struct usb_gadget_current_budget *budget)
++{ return -ENODEV; }
++static inline int usb_gadget_handle_current_grant(struct usb_gadget *gadget,
++						  const struct usb_ctrlrequest *ctrl)
++{ return -EOPNOTSUPP; }
++static inline void usb_gadget_revoke_current_grant(struct usb_gadget *gadget) { }
++static inline void usb_gadget_current_budget_suspend(struct usb_gadget *gadget,
++						     bool suspended) { }
++
+ static inline int usb_gadget_frame_number(struct usb_gadget *gadget)
+ { return 0; }
+ static inline int usb_gadget_wakeup(struct usb_gadget *gadget)

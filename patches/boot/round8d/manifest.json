@@ -1,0 +1,11 @@
+{
+  "base": "bd24e6785e050003481478d798a76695006f7341",
+  "head": "9c11ab8866e1bb6b66f0893f55a8337324e9dfc3",
+  "branch": "a9/boot",
+  "incremental_after": "patches/boot/round8c",
+  "patches": {
+    "0001-nvme-PCI-apple-ans-disable-the-controller-before-cyc.patch": "7ac236e0e209d784b4d2c6f899982c88910fcf7d4e9aa3a98ba9eaf530b88b4a"
+  },
+  "device_access": false,
+  "hardware_tested": false
+}

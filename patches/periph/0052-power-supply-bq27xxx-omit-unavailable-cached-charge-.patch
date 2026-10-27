@@ -1,0 +1,29 @@
+From 41c03c2e909081503d89694954a9950c2e13d80e Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 12:44:00 +0000
+Subject: [PATCH 52/55] power: supply: bq27xxx: omit unavailable cached charge
+ samples
+
+An optional cached charge-now read error must not abort the complete
+battery uevent. Return ENODATA for an unavailable cached sample while
+retaining the raw cache error for diagnostics. Preserve valid charge
+values and recovery, as well as the error behavior of live-read
+profiles.
+---
+ drivers/power/supply/bq27xxx_battery.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/drivers/power/supply/bq27xxx_battery.c b/drivers/power/supply/bq27xxx_battery.c
+index 239a29294a..bc7710f54d 100644
+--- a/drivers/power/supply/bq27xxx_battery.c
++++ b/drivers/power/supply/bq27xxx_battery.c
+@@ -2427,6 +2427,9 @@ static int bq27xxx_battery_get_cached_property(struct power_supply *psy,
+ 		break;
+ 	case POWER_SUPPLY_PROP_CHARGE_NOW:
+ 		ret = bq27xxx_cached_value(&di->cache.charge_now, val);
++		/* An unavailable optional HDQ sample must not abort the uevent. */
++		if (ret)
++			ret = -ENODATA;
+ 		break;
+ 	case POWER_SUPPLY_PROP_CHARGE_FULL:
+ 		ret = bq27xxx_cached_value(&di->cache.charge_full, val);

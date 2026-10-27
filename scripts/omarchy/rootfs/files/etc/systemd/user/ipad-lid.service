@@ -1,0 +1,18 @@
+# linux-a9: Smart Cover (ipad-lid --help). Starts only where the kernel has the
+# cover's switch ("iPad Smart Cover", an input device with SW_LID), and takes no
+# action until switched on (`ipad-lid on`); it never suspends unless
+# `ipad-lid suspend on` was run. ExecCondition makes a kernel without the switch
+# a skipped unit, not a failed one.
+[Unit]
+Description=linux-a9 iPad Smart Cover
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecCondition=/usr/local/bin/ipad-lid --available
+ExecStart=/usr/local/bin/ipad-lid
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

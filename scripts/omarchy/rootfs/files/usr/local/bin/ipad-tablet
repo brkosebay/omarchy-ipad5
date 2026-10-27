@@ -1,0 +1,190 @@
+#!/bin/bash
+# Tablet actions for Omarchy on the iPad: one command per thing a bar button
+# or a touch gesture does, so both stay in step (ipad-gestures, the
+# linuxa9.tablet bar widget, docs/omarchy/tablet-usage.md).
+#
+#   ipad-tablet apps              app grid (the dock's; Super + Alt + Space)
+#   ipad-tablet menu              Omarchy menu (Super + Space)
+#   ipad-tablet keyboard          on-screen keyboard on/off (ipad-osk toggle)
+#   ipad-tablet close             close the focused window
+#   ipad-tablet fullscreen        full screen on/off for the focused window
+#   ipad-tablet float             floating on/off for the focused window
+#   ipad-tablet rotate            next orientation (ipad-rotate next)
+#   ipad-tablet rotate-lock       rotation lock on/off (ipad-rotate lock toggle)
+#   ipad-tablet workspace next|prev   neighbouring workspace (1-10)
+#   ipad-tablet cycle next|prev   next/previous window on this workspace
+#   ipad-tablet layout [tablet|tiling|floating|next]
+#                                 how windows are arranged (no argument: print):
+#                                   tiling    Omarchy's own tiling [default]
+#                                   tablet    one window at a time, full size
+#                                             (Hyprland's monocle layout)
+#                                   floating  Omarchy's floating workspaces
+#                                             (title bars, the dock)
+#   ipad-tablet browser [float|tile]  browsers open floating or tiled [tile]
+#
+# The layout and browser choices are kept in ~/.local/state/linux-a9/display
+# (with ipad-rotate's), read by ~/.config/hypr/ipad-tablet.lua at every
+# Hyprland (re)load. Works from the desktop and over SSH.
+set -uo pipefail
+
+state=${XDG_STATE_HOME:-$HOME/.local/state}/linux-a9/display
+
+get_state() {
+  [[ -r $state ]] || return 0
+  sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$state" | tail -1
+}
+
+set_state() {
+  local tmp
+  mkdir -p "${state%/*}"
+  tmp=$(mktemp "$state.XXXXXX")
+  grep -v "^[[:space:]]*$1[[:space:]]*=" "$state" 2>/dev/null >"$tmp" || true
+  echo "$1=$2" >>"$tmp"
+  mv -f "$tmp" "$state"
+}
+
+# From the desktop Hyprland's instance is in the environment; over SSH (or
+# with a stale one after a Hyprland restart) use the newest running one.
+find_hyprland() {
+  export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+  local sig=${HYPRLAND_INSTANCE_SIGNATURE:-}
+  if [[ -z $sig || ! -S $XDG_RUNTIME_DIR/hypr/$sig/.socket.sock ]]; then
+    sig=""
+    [[ -d $XDG_RUNTIME_DIR/hypr ]] && sig=$(ls -t "$XDG_RUNTIME_DIR/hypr" | head -1)
+    [[ -n $sig && -S $XDG_RUNTIME_DIR/hypr/$sig/.socket.sock ]] || return 1
+    export HYPRLAND_INSTANCE_SIGNATURE=$sig
+  fi
+  # The session bus too, for the shell's IPC and squeekboard over SSH.
+  export OMARCHY_PATH=${OMARCHY_PATH:-/usr/share/omarchy}
+  export DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}
+  if [[ -z ${WAYLAND_DISPLAY:-} ]]; then
+    local sock
+    sock=$(ls -t "$XDG_RUNTIME_DIR"/wayland-[0-9] 2>/dev/null | head -1)
+    [[ -n $sock ]] && export WAYLAND_DISPLAY=${sock##*/}
+  fi
+  return 0
+}
+
+dispatch() {
+  hyprctl dispatch "$1" >/dev/null
+}
+
+# Floating (or re-laying out) a full-screen window without leaving full screen
+# first leaves Omarchy's bar hidden as if it still were (seen in QEMU).
+leave_fullscreen() {
+  if [[ $(hyprctl activeworkspace -j | jq -r '.hasfullscreen') == true ]]; then
+    dispatch 'hl.dsp.window.fullscreen_state({ internal = 0, client = 0 })'
+  fi
+}
+
+# Omarchy gives each monitor a block of ten workspace ids (monitor-workspaces.lua:
+# slot = (id - 1) % 10 + 1); o.workspaces.focus takes the slot, as Super + N does.
+workspace() {
+  local id slot
+  id=$(hyprctl activeworkspace -j | jq -r '.id')
+  [[ $id =~ ^[0-9]+$ ]] && ((id > 0)) || id=1
+  slot=$(((id - 1) % 10 + 1))
+  case ${1:-next} in
+    next) ((slot < 10)) && slot=$((slot + 1)) ;;
+    prev) ((slot > 1)) && slot=$((slot - 1)) ;;
+    *) echo "usage: ipad-tablet workspace next|prev" >&2; return 2 ;;
+  esac
+  hyprctl dispatch "o.workspaces.focus($slot)" >/dev/null 2>&1 ||
+    dispatch "hl.dsp.focus({ workspace = \"$(((id - 1) / 10 * 10 + slot))\" })"
+}
+
+cycle() {
+  local next=true msg=cyclenext
+  [[ ${1:-next} == prev ]] && next=false msg=cycleprev
+  if [[ $(hyprctl getoption general:layout -j 2>/dev/null | jq -r '.str // empty') == monocle ]]; then
+    dispatch "hl.dsp.layout(\"$msg\")"
+  else
+    dispatch "hl.dsp.window.cycle_next({ next = $next })"
+  fi
+}
+
+current_layout() {
+  case $(get_state layout) in
+    tablet | floating) get_state layout ;;
+    *) echo tiling ;;
+  esac
+}
+
+layout() {
+  local want=${1:-}
+  case $want in
+    "") current_layout; return 0 ;;
+    next)
+      case $(current_layout) in
+        tiling) want=tablet ;;
+        tablet) want=floating ;;
+        *) want=tiling ;;
+      esac
+      ;;
+    tablet | tiling | floating) ;;
+    *) echo "usage: ipad-tablet layout [tablet|tiling|floating|next]" >&2; return 2 ;;
+  esac
+  set_state layout "$want"
+  # Floating is Omarchy's own workspace mode, written as its default (what
+  # Appearance > Workspace Layout writes, without that command's keeping busy
+  # workspaces as they are: here the screen should change at once). The other
+  # two use Omarchy's tiled default and let ipad-tablet.lua pick the layout.
+  # The focused workspace drops a Super + L layout of its own; other
+  # workspaces with one keep it.
+  local modes=${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/workspace-layouts ws=""
+  mkdir -p "$modes"
+  printf 'o.workspace_mode({ default = "%s" })\n' "$([[ $want == floating ]] && echo floating || echo dwindle)" \
+    >"$modes/default.lua"
+  if find_hyprland; then
+    leave_fullscreen
+    ws=$(hyprctl activeworkspace -j | jq -r '.id')
+    [[ $ws =~ ^[0-9]+$ ]] && rm -f "$modes/$ws.lua"
+    hyprctl reload >/dev/null
+    omarchy-shell -q omarchy.workspaces refresh
+    omarchy-shell -q omarchy.dock refresh
+    notify-send -t 2000 -i view-grid "Layout: $want" 2>/dev/null || true
+  fi
+  echo "$want"
+}
+
+browser() {
+  case ${1:-} in
+    "") echo "$(get_state browser | grep -E '^(float|tile)$' || echo tile)"; return 0 ;;
+    float | tile) set_state browser "$1" ;;
+    *) echo "usage: ipad-tablet browser [float|tile]" >&2; return 2 ;;
+  esac
+  find_hyprland && hyprctl reload >/dev/null
+  echo "$1 (new browser windows)"
+}
+
+action=${1:-}
+shift || true
+case $action in
+  layout) layout "$@"; exit $? ;;
+  browser) browser "$@"; exit $? ;;
+  rotate-lock) ipad-rotate lock toggle >/dev/null; exit $? ;;
+  -h | --help | help | "")
+    awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"
+    exit 0
+    ;;
+esac
+
+find_hyprland || { echo "Hyprland isn't running" >&2; exit 1; }
+case $action in
+  apps) omarchy-shell omarchy.dock apps >/dev/null ;;
+  menu) omarchy-menu toggle root >/dev/null 2>&1 || omarchy-shell shell toggle omarchy.menu '{"menu":"root"}' >/dev/null ;;
+  keyboard) ipad-osk toggle ;;
+  close) dispatch 'hl.dsp.window.close()' ;;
+  fullscreen) dispatch 'hl.dsp.window.fullscreen({ mode = "fullscreen" })' ;;
+  float)
+    leave_fullscreen
+    dispatch 'hl.dsp.window.float({ action = "toggle" })'
+    ;;
+  rotate) ipad-rotate next >/dev/null ;;
+  workspace) workspace "$@" ;;
+  cycle) cycle "$@" ;;
+  *)
+    echo "ipad-tablet: unknown action '$action' (ipad-tablet --help)" >&2
+    exit 2
+    ;;
+esac

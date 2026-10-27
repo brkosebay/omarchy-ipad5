@@ -1,0 +1,470 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 09:56:33 +0000
+Subject: [PATCH 07/14] media: apple: vxd: fix the GART for 16 KiB pages and DRAM
+ above 4 GiB
+
+The GART could not have mapped anything correctly on the device. Three
+defects, all invisible in the 4 KiB-page QEMU smoke where DRAM sits
+below 4 GiB:
+
+- VXD_GART_PTE() cast the physical address to u32 before shifting.
+  AppleD5500::initialize_gart computes ((PA >> 8) & 0xfffffff0) | 1 on
+  the full 40-bit address.  The j71t DRAM starts at 0x8_0000_0000
+  (device run 1: "dir 0x803758000"), so every directory and page-table
+  entry pointed 32 GiB below DRAM.
+- GART pages are 4 KiB, but map/unmap and the directory stepped by
+  PAGE_SIZE, which is 16 KiB on the device kernel.  Directory entry i
+  pointed at pts + i * 16 KiB while the CPU filled the tables 4 KiB
+  apart, and a mapping wrote one entry per 16 KiB, so three quarters of
+  the firmware image resolved to the dummy page.
+- unmap recomputed the device VA from the DMA address and ignored
+  apple_vxd.va_offset, so it cleared the identity slots and left the
+  offset mapping live.
+
+The walk now always steps VXD_GART_PAGE_SIZE (4 KiB), the page tables
+are num_pts consecutive 4 KiB tables (2 MiB instead of 8 MiB on the
+device), and the entry macro matches Apple's arithmetic.  A mapping is
+validated before the first entry is written, so a bad request no longer
+leaves a partial mapping behind.  Live mappings are tracked on the GART
+list, and a dirty flag records changes for the decode submit path (Apple
+rewrites 0x1008 = 0xf00 before the next submit after a GART change).
+
+The directory is now allocated 64 KiB aligned, as Apple does
+(withOptions(0x403, 0x1000, alignment 0x10000)).  The decode message
+carries (MMU_DIR_ADR & ~0xff) | hwContextID in a single word.  The
+AppleD5500 submit path builds that word from the same directory
+descriptor (+0x27a8) it programs into 0x1020, so the low 16 address
+bits have to be zero.  The DMA mask is now 40 bits, the physical range
+a GART entry can hold.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ drivers/media/platform/apple/vxd/apple-vxd-core.c |   4 +-
+ drivers/media/platform/apple/vxd/apple-vxd-gart.c | 200 +++++++++++++++-------
+ drivers/media/platform/apple/vxd/apple-vxd.h      |  51 +++++-
+ 3 files changed, 188 insertions(+), 67 deletions(-)
+
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-core.c b/drivers/media/platform/apple/vxd/apple-vxd-core.c
+index 2780baeb9b0c7827faa3284801a9eaa72d0ba881..95f5233448ff19d995eb176ffb8d1823f475daed 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-core.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-core.c
+@@ -380,8 +380,10 @@ static int apple_vxd_probe(struct platform_device *pdev)
+ 
+ 	/* The block has no DART; DMA addresses are physical and the core's
+ 	 * own GART translates the low 32 bits into device address space.
++	 * GART entries hold PA >> 8 in 32 bits: 40-bit physical addresses.
+ 	 */
+-	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
++	ret = dma_set_mask_and_coherent(&pdev->dev,
++					DMA_BIT_MASK(VXD_GART_PA_BITS));
+ 	if (ret) {
+ 		dev_err_probe(&pdev->dev, ret,
+ 			      "failed to set the DMA mask\n");
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-gart.c b/drivers/media/platform/apple/vxd/apple-vxd-gart.c
+index adb364e701997cf2ee621c71f8d7ee35785524e6..c3a2490acd90180023da82d99acd3bb50057058e 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-gart.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-gart.c
+@@ -3,26 +3,80 @@
+  * Apple VXD - the core's own two-level memory translation unit ("GART")
+  *
+  * The vxd node has no iommu-parent; instead AppleD5500 programs a page
+- * table hierarchy of its own:
++ * table hierarchy of its own (AppleD5500::initialize_gart [E]):
+  *
+- *   - directory table: 1024 x 4-byte entries, one per 4 MiB of device VA
+- *   - page tables:     1024 x 4-byte entries, one per 4 KiB of device VA
++ *   - directory table: 1024 x 4-byte entries, one per 4 MiB of device VA,
++ *     in a 4 KiB buffer allocated 64 KiB aligned
++ *   - page tables:     1024 x 4-byte entries, one per 4 KiB of device VA,
++ *     num_pts consecutive 4 KiB tables
+  *   - a dummy page filling every unmapped directory/page slot
+- *   - entries: ((phys >> 12) << 4) | 1   (AppleD5500::initialize_gart [E])
++ *   - entries: ((PA >> 8) & 0xfffffff0) | 1 on the 40-bit physical address
+  *   - the directory table address is programmed through MTX_MMU_DIR_ADR
+- *     (0x1020) as (phys >> 8) in ProcessorInitialise [E]
++ *     (0x1020) as (PA >> 8) in ProcessorInitialise [E]
++ *
++ * GART pages are 4 KiB whatever the kernel page size: every table walk
++ * below steps VXD_GART_PAGE_SIZE, never PAGE_SIZE (the device kernel runs
++ * 16 KiB pages, which rounds 1-3 got wrong).
+  *
+  * We pre-allocate variant->num_gart_pts page tables (512 = the kext's
+  * "2GB mapping" for a 2 GiB device) and identity-map the low 32 bits of
+  * every DMA address, so mapping is just writing the slot selected by the
+- * address itself.  The host must flush the CPU caches for the tables when
+- * they change (dma_alloc_coherent memory is already uncached).
++ * address itself.  The tables are dma_alloc_coherent memory, so no cache
++ * maintenance is needed when they change.
+  */
+ #include <linux/dma-mapping.h>
+ #include <linux/slab.h>
+ 
+ #include "apple-vxd.h"
+ 
++/*
++ * Coherent buffer with a bus-address alignment beyond PAGE_SIZE.  The
++ * direct allocator hands out naturally aligned blocks in practice, so the
++ * exact size is tried first; only a misaligned result is retried with
++ * enough slack to align inside it.
++ */
++int apple_vxd_dma_alloc_aligned(struct apple_vxd_dev *vxd, size_t size,
++				size_t align, struct apple_vxd_dma_buf *buf)
++{
++	struct device *dev = vxd->dev;
++	size_t off;
++
++	if (WARN_ON(!size || !is_power_of_2(align)))
++		return -EINVAL;
++
++	memset(buf, 0, sizeof(*buf));
++	buf->raw_size = PAGE_ALIGN(size);
++	buf->raw_vaddr = dma_alloc_coherent(dev, buf->raw_size, &buf->raw_dma,
++					    GFP_KERNEL);
++	if (!buf->raw_vaddr)
++		return -ENOMEM;
++
++	if (buf->raw_dma & (align - 1)) {
++		dma_free_coherent(dev, buf->raw_size, buf->raw_vaddr,
++				  buf->raw_dma);
++		buf->raw_size = PAGE_ALIGN(size + align);
++		buf->raw_vaddr = dma_alloc_coherent(dev, buf->raw_size,
++						    &buf->raw_dma, GFP_KERNEL);
++		if (!buf->raw_vaddr)
++			return -ENOMEM;
++	}
++
++	off = ALIGN(buf->raw_dma, align) - buf->raw_dma;
++	buf->vaddr = buf->raw_vaddr + off;
++	buf->dma = buf->raw_dma + off;
++	buf->size = size;
++	return 0;
++}
++
++void apple_vxd_dma_free_aligned(struct apple_vxd_dev *vxd,
++				struct apple_vxd_dma_buf *buf)
++{
++	if (buf->raw_vaddr)
++		dma_free_coherent(vxd->dev, buf->raw_size, buf->raw_vaddr,
++				  buf->raw_dma);
++	memset(buf, 0, sizeof(*buf));
++}
++
+ int apple_vxd_gart_init(struct apple_vxd_dev *vxd)
+ {
+ 	struct apple_vxd_gart *gart = &vxd->gart;
+@@ -34,12 +88,13 @@ int apple_vxd_gart_init(struct apple_vxd_dev *vxd)
+ 	mutex_init(&gart->lock);
+ 	INIT_LIST_HEAD(&gart->mappings);
+ 
+-	gart->dir = dma_alloc_coherent(dev, VXD_GART_DIR_ENTRIES * sizeof(u32),
+-				       &gart->dir_dma, GFP_KERNEL);
+-	if (!gart->dir) {
+-		ret = -ENOMEM;
++	ret = apple_vxd_dma_alloc_aligned(vxd,
++					  VXD_GART_DIR_ENTRIES * sizeof(u32),
++					  VXD_GART_DIR_ALIGN, &gart->dir_buf);
++	if (ret)
+ 		goto err;
+-	}
++	gart->dir = gart->dir_buf.vaddr;
++	gart->dir_dma = gart->dir_buf.dma;
+ 
+ 	gart->dummy = dma_alloc_coherent(dev, PAGE_SIZE, &gart->dummy_dma,
+ 					 GFP_KERNEL);
+@@ -48,10 +103,11 @@ int apple_vxd_gart_init(struct apple_vxd_dev *vxd)
+ 		goto err_free_dir;
+ 	}
+ 
+-	/* Page tables are one contiguous DMA block of num_pts pages: every
+-	 * table stays 4 KiB aligned and its address encodable in a PTE.
++	/* Page tables are one contiguous DMA block of num_pts 4 KiB tables:
++	 * table i sits at pts_dma + i * 4 KiB, which is what the directory
++	 * entry for i points at.
+ 	 */
+-	gart->pts = dma_alloc_coherent(dev, (size_t)num_pts * PAGE_SIZE,
++	gart->pts = dma_alloc_coherent(dev, (size_t)num_pts * VXD_GART_PT_SIZE,
+ 				       &gart->pts_dma, GFP_KERNEL);
+ 	if (!gart->pts) {
+ 		ret = -ENOMEM;
+@@ -59,29 +115,42 @@ int apple_vxd_gart_init(struct apple_vxd_dev *vxd)
+ 	}
+ 	gart->num_pts = num_pts;
+ 
++	if (upper_32_bits(gart->pts_dma) >> (VXD_GART_PA_BITS - 32) ||
++	    upper_32_bits(gart->dir_dma) >> (VXD_GART_PA_BITS - 32) ||
++	    upper_32_bits(gart->dummy_dma) >> (VXD_GART_PA_BITS - 32)) {
++		dev_err(dev, "GART tables above the %u-bit PA range\n",
++			VXD_GART_PA_BITS);
++		ret = -ERANGE;
++		goto err_free_pts;
++	}
++
+ 	/* Unmapped VAs resolve to the dummy page, as in AppleD5500. */
+ 	for (i = 0; i < num_pts * VXD_GART_PT_ENTRIES; i++)
+ 		gart->pts[i] = VXD_GART_PTE(gart->dummy_dma);
+ 	for (i = 0; i < VXD_GART_DIR_ENTRIES; i++) {
+ 		if (i < num_pts)
+ 			gart->dir[i] = VXD_GART_PTE(gart->pts_dma +
+-						   (dma_addr_t)i * PAGE_SIZE);
++						   (dma_addr_t)i * VXD_GART_PT_SIZE);
+ 		else
+ 			gart->dir[i] = VXD_GART_PTE(gart->dummy_dma);
+ 	}
+ 
+-	dev_info(dev, "GART initialized: dir %#llx, %u page tables, dummy %#llx\n",
+-		 (unsigned long long)gart->dir_dma, num_pts,
+-		 (unsigned long long)gart->dummy_dma);
++	dev_info(dev,
++		 "GART initialized: dir %pad (64 KiB aligned), %u x 4 KiB page tables at %pad, dummy %pad, dir[0] %#x\n",
++		 &gart->dir_dma, num_pts, &gart->pts_dma, &gart->dummy_dma,
++		 gart->dir[0]);
+ 
+ 	return 0;
+ 
++err_free_pts:
++	dma_free_coherent(dev, (size_t)num_pts * VXD_GART_PT_SIZE, gart->pts,
++			  gart->pts_dma);
+ err_free_dummy:
+ 	dma_free_coherent(dev, PAGE_SIZE, gart->dummy, gart->dummy_dma);
+ err_free_dir:
+-	dma_free_coherent(dev, VXD_GART_DIR_ENTRIES * sizeof(u32), gart->dir,
+-			  gart->dir_dma);
++	apple_vxd_dma_free_aligned(vxd, &gart->dir_buf);
+ err:
++	memset(gart, 0, sizeof(*gart));
+ 	return ret;
+ }
+ 
+@@ -90,82 +159,91 @@ void apple_vxd_gart_fini(struct apple_vxd_dev *vxd)
+ 	struct apple_vxd_gart *gart = &vxd->gart;
+ 	struct device *dev = vxd->dev;
+ 
++	WARN_ON(gart->pts && !list_empty(&gart->mappings));
++
+ 	if (gart->pts)
+-		dma_free_coherent(dev, (size_t)gart->num_pts * PAGE_SIZE,
++		dma_free_coherent(dev, (size_t)gart->num_pts * VXD_GART_PT_SIZE,
+ 				  gart->pts, gart->pts_dma);
+ 	if (gart->dummy)
+ 		dma_free_coherent(dev, PAGE_SIZE, gart->dummy, gart->dummy_dma);
+-	if (gart->dir)
+-		dma_free_coherent(dev, VXD_GART_DIR_ENTRIES * sizeof(u32),
+-				  gart->dir, gart->dir_dma);
++	apple_vxd_dma_free_aligned(vxd, &gart->dir_buf);
+ 	memset(gart, 0, sizeof(*gart));
+ }
+ 
++/* Slot of device VA @va in the page-table block. */
++static u32 *vxd_gart_slot(struct apple_vxd_gart *gart, u32 va)
++{
++	u32 dir_idx = va >> 22;		/* 4 MiB per page table */
++	u32 ent_idx = (va >> VXD_GART_PAGE_SHIFT) & (VXD_GART_PT_ENTRIES - 1);
++
++	if (dir_idx >= gart->num_pts)
++		return NULL;
++	return &gart->pts[dir_idx * VXD_GART_PT_ENTRIES + ent_idx];
++}
++
+ int apple_vxd_gart_map_at(struct apple_vxd_dev *vxd, dma_addr_t dma,
+ 			  size_t size, u32 va_base,
+ 			  struct apple_vxd_mapping *map)
+ {
+ 	struct apple_vxd_gart *gart = &vxd->gart;
+-	u32 dir_idx, ent_idx, npages, i;
+-	int ret = 0;
++	u32 npages, i;
++
++	memset(map, 0, sizeof(*map));
++	INIT_LIST_HEAD(&map->list);
+ 
+-	if (!size || size & (PAGE_SIZE - 1))
++	if (!size || !IS_ALIGNED(size, VXD_GART_PAGE_SIZE) ||
++	    !IS_ALIGNED(dma, VXD_GART_PAGE_SIZE) ||
++	    !IS_ALIGNED(va_base, VXD_GART_PAGE_SIZE) ||
++	    upper_32_bits(dma + size - 1) >> (VXD_GART_PA_BITS - 32))
+ 		return -EINVAL;
+ 
+-	npages = size / PAGE_SIZE;
+-	memset(map, 0, sizeof(*map));
+-	map->dma = dma;
+-	map->size = size;
++	npages = size >> VXD_GART_PAGE_SHIFT;
++	if ((u64)va_base + size > (u64)gart->num_pts << 22) {
++		/* Device aperture beyond the mapped window. */
++		dev_err(vxd->dev,
++			"GART: VA %#x (DMA %pad+0x%zx) maps outside the %u page-table window\n",
++			va_base, &dma, size, gart->num_pts);
++		return -ENOSPC;
++	}
+ 
+ 	mutex_lock(&gart->lock);
+-	for (i = 0; i < npages; i++) {
+-		u32 va = va_base + i * PAGE_SIZE;
+-
+-		dir_idx = va >> 22;		/* 4 MiB per page table */
+-		ent_idx = (va >> 12) & (VXD_GART_PT_ENTRIES - 1);
+-
+-		if (dir_idx >= gart->num_pts) {
+-			/* Device aperture beyond the mapped window. */
+-			dev_err(vxd->dev,
+-				"GART: VA %#x (DMA %pad+0x%zx) maps outside the %u page-table window\n",
+-				va, &dma, size, gart->num_pts);
+-			ret = -ENOSPC;
+-			goto out;
+-		}
+-		gart->pts[dir_idx * VXD_GART_PT_ENTRIES + ent_idx] =
+-			VXD_GART_PTE(dma + (dma_addr_t)i * PAGE_SIZE);
+-	}
++	for (i = 0; i < npages; i++)
++		*vxd_gart_slot(gart, va_base + (i << VXD_GART_PAGE_SHIFT)) =
++			VXD_GART_PTE(dma + ((dma_addr_t)i << VXD_GART_PAGE_SHIFT));
++	map->dma = dma;
++	map->size = size;
+ 	map->va = va_base;
+-out:
++	list_add_tail(&map->list, &gart->mappings);
++	gart->dirty = true;
+ 	mutex_unlock(&gart->lock);
+-	return ret;
++	return 0;
+ }
+ 
+ int apple_vxd_gart_map(struct apple_vxd_dev *vxd, dma_addr_t dma, size_t size,
+ 		       struct apple_vxd_mapping *map)
+ {
+-	return apple_vxd_gart_map_at(vxd, dma, size, (u32)dma, map);
++	return apple_vxd_gart_map_at(vxd, dma, size, (u32)dma + vxd->va_offset,
++				     map);
+ }
+ 
+ void apple_vxd_gart_unmap(struct apple_vxd_dev *vxd, struct apple_vxd_mapping *map)
+ {
+ 	struct apple_vxd_gart *gart = &vxd->gart;
+-	u32 dir_idx, ent_idx, npages, i;
++	u32 npages, i;
++	u32 *slot;
+ 
+ 	if (!map->size)
+ 		return;
+ 
+ 	mutex_lock(&gart->lock);
+-	npages = map->size / PAGE_SIZE;
++	npages = map->size >> VXD_GART_PAGE_SHIFT;
+ 	for (i = 0; i < npages; i++) {
+-		u32 va = (u32)(map->dma + (dma_addr_t)i * PAGE_SIZE);
+-
+-		dir_idx = va >> 22;
+-		ent_idx = (va >> 12) & (VXD_GART_PT_ENTRIES - 1);
+-		if (dir_idx < gart->num_pts)
+-			gart->pts[dir_idx * VXD_GART_PT_ENTRIES + ent_idx] =
+-				VXD_GART_PTE(gart->dummy_dma);
++		slot = vxd_gart_slot(gart, map->va + (i << VXD_GART_PAGE_SHIFT));
++		if (slot)
++			*slot = VXD_GART_PTE(gart->dummy_dma);
+ 	}
++	list_del(&map->list);
++	gart->dirty = true;
+ 	mutex_unlock(&gart->lock);
+ 	memset(map, 0, sizeof(*map));
+ }
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd.h b/drivers/media/platform/apple/vxd/apple-vxd.h
+index 68eb3b96d193a90a2f55603df083bb017bd953ae..7f7ea3c6c8bdbfef9cd5178313cfe0ec1819e9f7 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd.h
++++ b/drivers/media/platform/apple/vxd/apple-vxd.h
+@@ -21,6 +21,7 @@
+ #include <linux/io.h>
+ #include <linux/mutex.h>
+ #include <linux/platform_device.h>
++#include <linux/sizes.h>
+ #include <linux/spinlock.h>
+ #include <linux/types.h>
+ #include <linux/workqueue.h>
+@@ -67,17 +68,32 @@ struct apple_vxd_variant {
+  * The core's own two-level "GART" (there is no DART on this node): a 1024
+  * entry directory of 4 KiB page tables covering 4 GiB of device address
+  * space, entries beyond the mapped page tables pointing at a dummy page.
+- * Page table entries are ((phys >> 12) << 4) | 1, exactly as computed by
+- * AppleD5500::initialize_gart [E].
++ *
++ * GART pages are always 4 KiB, whatever the kernel page size (the device
++ * kernel runs 16 KiB pages).  Entries are ((PA >> 8) & 0xfffffff0) | 1,
++ * computed on the full 40-bit physical address exactly as
++ * AppleD5500::initialize_gart does [E]: DRAM sits at 0x8_0000_0000 here,
++ * so truncating to 32 bits first (rounds 1-3) pointed every entry below
++ * DRAM.
++ *
++ * The directory is 64 KiB aligned: Apple allocates it that way
++ * (withOptions(0x403, 0x1000, alignment 0x10000)) because the decode
++ * message carries (MMU_DIR_ADR value & ~0xff) | hwContextID in one word
++ * (SubmitCommandBufferInternal, ds-vxd-decode-protocol.md correction).
+  *
+  * We identity-map the low 32 bits of every DMA address, so device address
+  * == dma_addr & 0xffffffff for the whole 2 GiB of DRAM on this device, and
+  * the mapped page tables (indices 0..num_gart_pts) cover it.
+  */
++#define VXD_GART_PAGE_SHIFT		12
++#define VXD_GART_PAGE_SIZE		BIT(VXD_GART_PAGE_SHIFT)
+ #define VXD_GART_DIR_ENTRIES		1024
+ #define VXD_GART_PT_ENTRIES		1024
++#define VXD_GART_PT_SIZE		(VXD_GART_PT_ENTRIES * sizeof(u32))
++#define VXD_GART_DIR_ALIGN		SZ_64K
++#define VXD_GART_PA_BITS		40
+ #define VXD_GART_PTE_VALID		BIT(0)
+-#define VXD_GART_PTE(phys)		((((u32)(phys) >> 12) << 4) | \
++#define VXD_GART_PTE(phys)		(((u32)((u64)(phys) >> 8) & 0xfffffff0) | \
+ 					 VXD_GART_PTE_VALID)
+ 
+ struct apple_vxd_mapping {
+@@ -87,16 +103,37 @@ struct apple_vxd_mapping {
+ 	u32 va;				/* device address, == low 32 of dma */
+ };
+ 
++/*
++ * A coherent DMA buffer whose bus address is aligned beyond PAGE_SIZE.
++ * dma_alloc_coherent() makes no alignment promise past the page, so the
++ * buffer is over-allocated when the first try is misaligned.
++ */
++struct apple_vxd_dma_buf {
++	void *vaddr;			/* aligned CPU address */
++	dma_addr_t dma;			/* aligned bus address */
++	size_t size;			/* usable bytes from vaddr */
++	void *raw_vaddr;		/* what dma_free_coherent() needs */
++	dma_addr_t raw_dma;
++	size_t raw_size;
++};
++
+ struct apple_vxd_gart {
+ 	struct mutex lock;		/* serializes table updates */
++	struct apple_vxd_dma_buf dir_buf; /* directory, 64 KiB aligned */
+ 	u32 *dir;			/* directory table, VXD_GART_DIR_ENTRIES */
+ 	dma_addr_t dir_dma;
+ 	u32 *dummy;			/* unmapped VAs resolve here */
+ 	dma_addr_t dummy_dma;
+-	u32 *pts;			/* num_gart_pts consecutive page tables */
++	u32 *pts;			/* num_gart_pts consecutive 4 KiB tables */
+ 	dma_addr_t pts_dma;
+ 	u32 num_pts;
+-	struct list_head mappings;
++	struct list_head mappings;	/* every live apple_vxd_mapping */
++	/*
++	 * Set by every map/unmap.  Apple rewrites 0x1008 = 0xf00 before the
++	 * next decode submit when its GART changed (AppleD5500+0x27a0 [E]);
++	 * the decode submit path consumes and clears it.
++	 */
++	bool dirty;
+ };
+ 
+ /*
+@@ -237,6 +274,10 @@ __printf(2, 3) void vxd_step(const struct device *dev, const char *fmt, ...);
+ __printf(2, 3) void vxd_step_io(const struct device *dev, const char *fmt, ...);
+ 
+ /* gart.c */
++int apple_vxd_dma_alloc_aligned(struct apple_vxd_dev *vxd, size_t size,
++				size_t align, struct apple_vxd_dma_buf *buf);
++void apple_vxd_dma_free_aligned(struct apple_vxd_dev *vxd,
++				struct apple_vxd_dma_buf *buf);
+ int apple_vxd_gart_init(struct apple_vxd_dev *vxd);
+ void apple_vxd_gart_fini(struct apple_vxd_dev *vxd);
+ int apple_vxd_gart_map(struct apple_vxd_dev *vxd, dma_addr_t dma, size_t size,

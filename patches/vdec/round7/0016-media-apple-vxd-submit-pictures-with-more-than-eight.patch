@@ -1,0 +1,336 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 12:40:08 +0000
+Subject: [PATCH 16/21] media: apple: vxd: submit pictures with more than eight
+ slices
+
+Apple's fence for packet n of a submission is (seq << 4) | (n * 2 &
+0xe): the tags repeat after eight packets, and only the 0x4004 message
+is ever answered (round 5 on the device: "1 of 4 packets answered").
+apple_vxd_submit() therefore keeps arming every packet's fence up to
+eight packets, as before, and arms only the last one beyond that; the
+other messages still carry Apple's tag.  Messages are built twice
+(checked before anything is armed, rebuilt for the push) instead of
+into a per-packet array on the stack, and the completion line reports
+the packet count of the job.
+
+The command buffers grow to Apple's size: eight 0x40000-byte register
+programs and 32 KiB host packet lists (DecodeCreateH264VLD,
+ds-vxd-cmdstream.md section 16.5).  A B slice with two weight tables
+is about 1.5 KiB of commands, so a buffer holds 128 of the largest; the
+packet lists are host memory and come from kvcalloc().
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ .../media/platform/apple/vxd/apple-vxd-cmdbuf.c    | 15 +++--
+ drivers/media/platform/apple/vxd/apple-vxd-core.c  |  6 +-
+ drivers/media/platform/apple/vxd/apple-vxd-fw.c    |  2 +-
+ drivers/media/platform/apple/vxd/apple-vxd-mbox.c  | 77 +++++++++++++---------
+ drivers/media/platform/apple/vxd/apple-vxd.h       | 34 ++++++----
+ 5 files changed, 78 insertions(+), 56 deletions(-)
+
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-cmdbuf.c b/drivers/media/platform/apple/vxd/apple-vxd-cmdbuf.c
+index 216fbe3bf74ce401b69d96759740c79cd3f763d2..4385f14843ff1cb98a9a26fb512e879b8c753087 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-cmdbuf.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-cmdbuf.c
+@@ -2,7 +2,7 @@
+ /*
+  * Apple VXD - command buffers (R3b)
+  *
+- * The pool of eight 64 KiB GART-mapped command buffers with their
++ * The pool of eight 256 KiB GART-mapped command buffers with their
+  * host-only packet lists, the packet -> mailbox message arithmetic, the
+  * probe-time self-test and the debugfs view.  The encoders themselves are
+  * in apple-vxd-cmd.c (host-buildable, R3c).
+@@ -233,8 +233,8 @@ int apple_vxd_cmdbufs_init(struct apple_vxd_dev *vxd)
+ 		goto err_unmap;
+ 	}
+ 
+-	pool->pkt_mem = kcalloc(APPLE_VXD_NUM_CMDBUFS, APPLE_VXD_PKTLIST_SIZE,
+-				GFP_KERNEL);
++	pool->pkt_mem = kvcalloc(APPLE_VXD_NUM_CMDBUFS, APPLE_VXD_PKTLIST_SIZE,
++				 GFP_KERNEL);
+ 	if (!pool->pkt_mem) {
+ 		ret = -ENOMEM;
+ 		goto err_unmap;
+@@ -263,15 +263,16 @@ int apple_vxd_cmdbufs_init(struct apple_vxd_dev *vxd)
+ 	}
+ 
+ 	dev_info(vxd->dev,
+-		 "command buffers: %u x 64 KiB at %pad, device VA %#x..%#x, packet lists %u x %u B; MMU context word (hwctx 0) %#010x\n",
+-		 APPLE_VXD_NUM_CMDBUFS, &pool->mem.dma, pool->map.va,
++		 "command buffers: %u x %u KiB at %pad, device VA %#x..%#x, packet lists %u x %u B; MMU context word (hwctx 0) %#010x\n",
++		 APPLE_VXD_NUM_CMDBUFS, APPLE_VXD_CMDBUF_SIZE / SZ_1K,
++		 &pool->mem.dma, pool->map.va,
+ 		 pool->map.va + (u32)total - 1, APPLE_VXD_NUM_CMDBUFS,
+ 		 APPLE_VXD_PKTLIST_SIZE, apple_vxd_mmu_ctx_word(vxd, 0));
+ 	return 0;
+ 
+ err_kfree:
+ 	pool->ready = false;
+-	kfree(pool->pkt_mem);
++	kvfree(pool->pkt_mem);
+ 	pool->pkt_mem = NULL;
+ err_unmap:
+ 	apple_vxd_gart_unmap(vxd, &pool->map);
+@@ -299,7 +300,7 @@ void apple_vxd_cmdbufs_fini(struct apple_vxd_dev *vxd)
+ 	spin_unlock_irqrestore(&vxd->mbox_lock, flags);
+ 
+ 	apple_vxd_gart_unmap(vxd, &pool->map);
+-	kfree(pool->pkt_mem);
++	kvfree(pool->pkt_mem);
+ 	apple_vxd_dma_free_aligned(vxd, &pool->mem);
+ 	memset(pool, 0, sizeof(*pool));
+ }
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-core.c b/drivers/media/platform/apple/vxd/apple-vxd-core.c
+index 19190aa21b2cdb1d4adb6c01cd5bf1ccbc4eb3ab..e7c52aec7c10d35a5d567f42562c46316cea7c03 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-core.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-core.c
+@@ -136,8 +136,8 @@ static bool vxd_job_take(struct apple_vxd_dev *vxd, bool need_signal,
+ 
+ /*
+  * Every fence of the job goes back to the pool.  A packet whose 0xc0 did
+- * not arrive (the firmware may answer only the 0x4004 message) is simply
+- * released; a fault on any packet that did answer fails the picture.
++ * not arrive (the firmware answers only the 0x4004 message) is simply
++ * released; a fault on any armed packet that did answer fails the picture.
+  */
+ static void vxd_job_complete(struct apple_vxd_dev *vxd,
+ 			     const struct apple_vxd_job *job, bool timed_out)
+@@ -159,7 +159,7 @@ static void vxd_job_complete(struct apple_vxd_dev *vxd,
+ 	vxd_step_io(vxd->dev,
+ 		    "decode: %s: fence %#x (seq %#x), %u of %u packets answered, status %#x, %lld us -> %s",
+ 		    timed_out ? "TIMEOUT" : "completion", last->id, job->seq,
+-		    answered, job->nfences, status,
++		    answered, job->npackets, status,
+ 		    ktime_us_delta(ktime_get(), job->submitted),
+ 		    error ? "ERROR" : "DONE");
+ 	for (i = 0; i < job->nfences; i++)
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-fw.c b/drivers/media/platform/apple/vxd/apple-vxd-fw.c
+index 48c7129e68282ea6a9387796df3aafd39f5584e0..230d25c304489e1063fd315ea48d3dbda197fea7 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-fw.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-fw.c
+@@ -417,7 +417,7 @@ int apple_vxd_boot_firmware(struct apple_vxd_dev *vxd)
+ 	 * R3b: the eight command buffers are mapped now, before the MTX and
+ 	 * its MMU start, so no mapping changes under a running core.
+ 	 */
+-	vxd_step(vxd->dev, "boot: allocate + GART-map 8 x 64 KiB command buffers");
++	vxd_step(vxd->dev, "boot: allocate + GART-map 8 x 256 KiB command buffers");
+ 	ret = apple_vxd_cmdbufs_init(vxd);
+ 	if (ret) {
+ 		dev_err(vxd->dev, "command buffers: %d\n", ret);
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd-mbox.c b/drivers/media/platform/apple/vxd/apple-vxd-mbox.c
+index c99dcec9574a70e95abeb8d88386762fd23b2b7c..466d8c069a362d39b19ea0176ff215283df8cd3e 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd-mbox.c
++++ b/drivers/media/platform/apple/vxd/apple-vxd-mbox.c
+@@ -695,14 +695,18 @@ void apple_vxd_mbox_stop(struct apple_vxd_dev *vxd)
+  * is bound to that fence and freed by its 0xc0.  Returns 0 once every
+  * message is in TO_MTX; on an error nothing is left armed, and a buffer
+  * the firmware may already have been told about stays quarantined.
++ *
++ * Messages are built twice (checked before anything is armed, rebuilt for
++ * the push) so a 128-slice picture needs no per-packet array on the stack.
+  */
+ int apple_vxd_submit(struct apple_vxd_ctx *ctx, struct apple_vxd_cmdbuf *cb)
+ {
+-	u32 msgs[APPLE_VXD_JOB_MAX_PACKETS][VXD_DECODE_MSG_WORDS];
+-	struct apple_vxd_fence *fences[APPLE_VXD_JOB_MAX_PACKETS] = { };
++	struct apple_vxd_fence *fences[APPLE_VXD_JOB_MAX_FENCES] = { };
+ 	struct apple_vxd_dev *vxd = ctx->vxd;
+ 	struct apple_vxd_msg_ticket ticket;
+-	unsigned int i, pushed = 0;
++	u32 msg[VXD_DECODE_MSG_WORDS];
++	unsigned int i, narmed, first_armed, pushed = 0;
++	struct apple_vxd_fence *last = NULL;
+ 	unsigned long flags;
+ 	bool gart_dirty;
+ 	int n, ret;
+@@ -715,6 +719,18 @@ int apple_vxd_submit(struct apple_vxd_ctx *ctx, struct apple_vxd_cmdbuf *cb)
+ 			n, APPLE_VXD_JOB_MAX_PACKETS);
+ 		return -EINVAL;
+ 	}
++	narmed = n <= APPLE_VXD_JOB_MAX_FENCES ? n : 1;
++	first_armed = n - narmed;
++
++	/* Every packet must make a message before anything is armed. */
++	for (i = 0, off = 0; i < n; i++) {
++		u32 *pkt = (u32 *)(cb->pkt + off);
++
++		ret = apple_vxd_packet_msg(vxd, pkt, 0, 0, i == n - 1, msg);
++		if (ret < 0)
++			return ret;
++		off += VXD_PKT_HDR_BYTES + pkt[1];
++	}
+ 
+ 	mutex_lock(&vxd->power_lock);
+ 	if (!vxd->mbox_ready || !vxd->hw_ready || vxd->fw_panicked) {
+@@ -725,33 +741,22 @@ int apple_vxd_submit(struct apple_vxd_ctx *ctx, struct apple_vxd_cmdbuf *cb)
+ 	/* Fences first: the firmware may answer before the last push. */
+ 	spin_lock_irqsave(&vxd->mbox_lock, flags);
+ 	seq = vxd_fence_next_seq_locked(vxd);
+-	for (i = 0, off = 0; i < n; i++) {
+-		const u32 *pkt = (const u32 *)(cb->pkt + off);
+-
+-		fences[i] = vxd_fence_arm_locked(vxd, vxd_fence_id(seq, i),
+-						 pkt[3 + VXD_PKT_KIND / 4]);
++	for (i = 0; i < narmed; i++) {
++		fences[i] = vxd_fence_arm_locked(vxd,
++						 vxd_fence_id(seq, first_armed + i),
++						 VXD_MSG_DECODE);
+ 		if (!fences[i])
+ 			break;
+-		off += VXD_PKT_HDR_BYTES + pkt[1];
+ 	}
+ 	spin_unlock_irqrestore(&vxd->mbox_lock, flags);
+-	if (i < n) {
++	if (i < narmed) {
+ 		ret = -EBUSY;
+ 		goto out_fences;
+ 	}
+ 
+-	for (i = 0, off = 0; i < n; i++) {
+-		u32 *pkt = (u32 *)(cb->pkt + off);
+-
+-		ret = apple_vxd_packet_msg(vxd, pkt, fences[i]->id, 0, i == n - 1,
+-					   msgs[i]);
+-		if (ret < 0)
+-			goto out_fences;
+-		fences[i]->type = ret;
+-		off += VXD_PKT_HDR_BYTES + pkt[1];
+-	}
+-	fences[n - 1]->job = true;
+-	ret = apple_vxd_cmdbuf_bind(vxd, cb, fences[n - 1]);
++	last = fences[narmed - 1];
++	last->job = true;
++	ret = apple_vxd_cmdbuf_bind(vxd, cb, last);
+ 	if (ret)
+ 		goto out_fences;
+ 
+@@ -762,7 +767,8 @@ int apple_vxd_submit(struct apple_vxd_ctx *ctx, struct apple_vxd_cmdbuf *cb)
+ 		goto out_unbind;
+ 	}
+ 	vxd->job.ctx = ctx;
+-	vxd->job.nfences = n;
++	vxd->job.nfences = narmed;
++	vxd->job.npackets = n;
+ 	vxd->job.seq = seq;
+ 	vxd->job.submitted = ktime_get();
+ 	memcpy(vxd->job.fences, fences, sizeof(fences));
+@@ -777,12 +783,21 @@ int apple_vxd_submit(struct apple_vxd_ctx *ctx, struct apple_vxd_cmdbuf *cb)
+ 	if (gart_dirty)
+ 		vxd_write(vxd, VXD_REG_MMU_CONTROL1, VXD_MMU_INVALDC_ALL);
+ 
+-	for (i = 0; i < n; i++) {
++	for (i = 0, off = 0; i < n; i++) {
++		u32 *pkt = (u32 *)(cb->pkt + off);
++		int type;
++
++		off += VXD_PKT_HDR_BYTES + pkt[1];
++		type = apple_vxd_packet_msg(vxd, pkt, vxd_fence_id(seq, i), 0,
++					    i == n - 1, msg);
++		if (i >= first_armed)
++			fences[i - first_armed]->type = type;
+ 		vxd_step_io(vxd->dev,
+-			    "decode: push %#x fence %#x {%#x %#x %#x %#x %#x %#x}",
+-			    fences[i]->type, fences[i]->id, msgs[i][0], msgs[i][1],
+-			    msgs[i][2], msgs[i][3], msgs[i][4], msgs[i][5]);
+-		ret = apple_vxd_msg_push(vxd, msgs[i], &ticket);
++			    "decode: push %#x fence %#x%s {%#x %#x %#x %#x %#x %#x}",
++			    type, vxd_fence_id(seq, i),
++			    i >= first_armed ? "" : " (not armed)", msg[0],
++			    msg[1], msg[2], msg[3], msg[4], msg[5]);
++		ret = apple_vxd_msg_push(vxd, msg, &ticket);
+ 		if (ret)
+ 			break;
+ 		pushed++;
+@@ -805,14 +820,14 @@ int apple_vxd_submit(struct apple_vxd_ctx *ctx, struct apple_vxd_cmdbuf *cb)
+ 
+ out_unbind:
+ 	spin_lock_irqsave(&vxd->mbox_lock, flags);
+-	if (cb->state == APPLE_VXD_CMDBUF_DEVICE && cb->fence == fences[n - 1]) {
++	if (cb->state == APPLE_VXD_CMDBUF_DEVICE && cb->fence == last) {
+ 		cb->state = APPLE_VXD_CMDBUF_HOST;
+ 		cb->fence = NULL;
+-		fences[n - 1]->cmdbuf = NULL;
++		last->cmdbuf = NULL;
+ 	}
+ 	spin_unlock_irqrestore(&vxd->mbox_lock, flags);
+ out_fences:
+-	for (i = 0; i < n; i++)
++	for (i = 0; i < narmed; i++)
+ 		if (fences[i])
+ 			apple_vxd_fence_release(vxd, fences[i]);
+ out_unlock:
+diff --git a/drivers/media/platform/apple/vxd/apple-vxd.h b/drivers/media/platform/apple/vxd/apple-vxd.h
+index a97aa918692f713f23a70d6feca971734335b904..cb1110fddcf63ad1d092ffd687ade02786d95d6d 100644
+--- a/drivers/media/platform/apple/vxd/apple-vxd.h
++++ b/drivers/media/platform/apple/vxd/apple-vxd.h
+@@ -11,7 +11,7 @@
+  *   R1  boot the resident DEVA image on the MTX
+  *   R3a host<->firmware mailbox: ring geometry, 0x80 init message, push,
+  *       IRQ drain, fences, debugfs ping (ds-vxd-decode-protocol.md)
+- *   R3b command buffers: 8 x 64 KiB pool, packet container, command
++ *   R3b command buffers: 8 x 256 KiB pool, packet container, command
+  *       emitters, GART-mapped V4L2 buffers (ds-vxd-cmdstream.md)
+  *   R3c+ H.264 command-stream generator and the decode submit (pending)
+  */
+@@ -193,9 +193,11 @@ struct apple_vxd_fence {
+ };
+ 
+ /*
+- * R3b: command buffers.  Apple allocates eight 0x10000-byte command
+- * buffers per H.264 decoder (DecodeCreateH264VLD 0xfffffff0062c3d98 [E]).
+- * Each one is two things:
++ * R3b: command buffers.  Apple allocates eight 0x40000-byte register
++ * programs and eight 0x10000-byte packet lists per H.264 decoder
++ * (DecodeCreateH264VLD 0xfffffff0062c3d98, ds-vxd-cmdstream.md section
++ * 16.5 [E]); a B slice with weight tables takes about 1.5 KiB, so 256 KiB
++ * holds APPLE_VXD_JOB_MAX_PACKETS of the largest.  Each one is two things:
+  *
+  *   - the device-visible register program, GART-mapped, filled with the
+  *     ds-vxd-cmdstream.md command words one 64-byte-aligned chunk per
+@@ -211,9 +213,9 @@ struct apple_vxd_fence {
+  * apple_vxd_cmdbufs_reclaim() after the firmware is stopped frees it.
+  */
+ #define APPLE_VXD_NUM_CMDBUFS		8
+-#define APPLE_VXD_CMDBUF_SIZE		SZ_64K
++#define APPLE_VXD_CMDBUF_SIZE		SZ_256K
+ #define APPLE_VXD_CMDBUF_ALIGN		SZ_64K
+-#define APPLE_VXD_PKTLIST_SIZE		SZ_4K
++#define APPLE_VXD_PKTLIST_SIZE		SZ_32K	/* 128 x (12 + 0x78) bytes */
+ 
+ struct apple_vxd_cmdbuf_pool {
+ 	struct apple_vxd_dma_buf mem;		/* NUM x SIZE, 64 KiB aligned */
+@@ -267,19 +269,23 @@ struct apple_vxd_run {
+ 
+ /*
+  * One submission in flight: one picture, one command buffer, one message
+- * per packet.  Every packet gets a fence of the same submission
+- * ((seq << 4) | packet * 2, Apple's arithmetic), so a 0xc0 for any of
+- * them is recognised whatever the firmware's per-packet policy is; the
+- * job completes on the last packet's fence (the 0x4004 message) or on the
+- * watchdog.  Eight packets at most: the packet index has three bits.
++ * per packet.  Every message carries a fence of the same submission,
++ * (seq << 4) | (packet * 2 & 0xe) as Apple computes it, so the tags repeat
++ * after eight packets.  Up to eight packets every fence is armed and a
++ * 0xc0 for any of them is recognised (round 5 on the device: only the
++ * 0x4004 message answers); past eight only the last packet's is, since
++ * the firmware never answers a 0x2000 message.  The job completes on the
++ * last packet's fence or on the watchdog.
+  */
+-#define APPLE_VXD_JOB_MAX_PACKETS	8
++#define APPLE_VXD_JOB_MAX_FENCES	8
++#define APPLE_VXD_JOB_MAX_PACKETS	128
+ #define APPLE_VXD_JOB_TIMEOUT_MS	1000
+ 
+ struct apple_vxd_job {
+ 	struct apple_vxd_ctx *ctx;
+-	struct apple_vxd_fence *fences[APPLE_VXD_JOB_MAX_PACKETS];
+-	unsigned int nfences;
++	struct apple_vxd_fence *fences[APPLE_VXD_JOB_MAX_FENCES];
++	unsigned int nfences;		/* armed; the last one is the job's */
++	unsigned int npackets;
+ 	u16 seq;
+ 	ktime_t submitted;
+ };

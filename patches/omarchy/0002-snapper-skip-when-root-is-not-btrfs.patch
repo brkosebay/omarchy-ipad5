@@ -1,0 +1,106 @@
+From 000f92a7a677e0f0a9eb2a0f3dcf9b7a517255c5 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Berkay=20K=C3=B6sebay?= <maintainer@example.invalid>
+Date: Thu, 22 Oct 2026 13:18:42 +0200
+Subject: [PATCH 2/2] Skip Snapper setup when / is not btrfs
+
+Snapper snapshots btrfs subvolumes, and the ISO always installs onto btrfs,
+so config/snapper.sh runs create-config unconditionally. An image built onto
+another filesystem, such as an ext4 root an iPad mounts over NBD from a Mac,
+has nothing to snapshot: create-config fails and takes omarchy-apply-system
+down with it. Skip the step there instead.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ install/config/snapper.sh    | 35 +++++++++++++++++++++--------------
+ test/shell.d/snapper-test.sh | 19 +++++++++++++++++++
+ 2 files changed, 40 insertions(+), 14 deletions(-)
+
+diff --git a/install/config/snapper.sh b/install/config/snapper.sh
+index 3e936ec14..45912edea 100644
+--- a/install/config/snapper.sh
++++ b/install/config/snapper.sh
+@@ -2,23 +2,30 @@ SNAPPER_CONFIG_PATH="${OMARCHY_SNAPPER_CONFIG_PATH:-/etc/snapper/configs/root}"
+ SNAPPER_CONF_PATH="${OMARCHY_SNAPPER_CONF_PATH:-/etc/conf.d/snapper}"
+ template="${OMARCHY_SNAPPER_TEMPLATE:-${OMARCHY_PATH:-/usr/share/omarchy}/default/snapper/root}"
+ 
+-echo "Configuring Omarchy Snapper snapshot retention"
++# Snapper snapshots btrfs subvolumes, and the ISO always installs onto btrfs.
++# An image built onto another filesystem (an ext4 root served over the network,
++# say) has nothing to snapshot, and create-config would fail the whole setup.
++if [[ $(findmnt -no FSTYPE /) != "btrfs" ]]; then
++  echo "Skipping Snapper snapshot retention: / is not btrfs"
++else
++  echo "Configuring Omarchy Snapper snapshot retention"
+ 
+-if [[ ! -f $SNAPPER_CONFIG_PATH ]]; then
+-  mkdir -p "$(dirname "$SNAPPER_CONFIG_PATH")"
++  if [[ ! -f $SNAPPER_CONFIG_PATH ]]; then
++    mkdir -p "$(dirname "$SNAPPER_CONFIG_PATH")"
+ 
+-  if [[ ${OMARCHY_SNAPPER_CONFIGURE_TEST:-0} == "1" ]]; then
+-    : >"$SNAPPER_CONFIG_PATH"
+-  else
+-    snapper --no-dbus -c root create-config / >/dev/null 2>&1 || snapper -c root create-config / >/dev/null
++    if [[ ${OMARCHY_SNAPPER_CONFIGURE_TEST:-0} == "1" ]]; then
++      : >"$SNAPPER_CONFIG_PATH"
++    else
++      snapper --no-dbus -c root create-config / >/dev/null 2>&1 || snapper -c root create-config / >/dev/null
++    fi
+   fi
+-fi
+ 
+-install -m 0644 "$template" "$SNAPPER_CONFIG_PATH"
++  install -m 0644 "$template" "$SNAPPER_CONFIG_PATH"
+ 
+-mkdir -p "$(dirname "$SNAPPER_CONF_PATH")"
+-printf '%s\n' 'SNAPPER_CONFIGS="root"' >"$SNAPPER_CONF_PATH"
+-chmod 0644 "$SNAPPER_CONF_PATH"
++  mkdir -p "$(dirname "$SNAPPER_CONF_PATH")"
++  printf '%s\n' 'SNAPPER_CONFIGS="root"' >"$SNAPPER_CONF_PATH"
++  chmod 0644 "$SNAPPER_CONF_PATH"
+ 
+-systemctl disable --now snapper-timeline.timer >/dev/null 2>&1 || true
+-systemctl enable --now snapper-cleanup.timer limine-snapper-sync.service >/dev/null 2>&1 || true
++  systemctl disable --now snapper-timeline.timer >/dev/null 2>&1 || true
++  systemctl enable --now snapper-cleanup.timer limine-snapper-sync.service >/dev/null 2>&1 || true
++fi
+diff --git a/test/shell.d/snapper-test.sh b/test/shell.d/snapper-test.sh
+index ea0ec8946..7cd3d33bb 100644
+--- a/test/shell.d/snapper-test.sh
++++ b/test/shell.d/snapper-test.sh
+@@ -37,6 +37,12 @@ printf 'systemctl %s\n' "$*" >>"$TEST_LOG"
+ STUB
+ chmod +x "$fake_bin/systemctl"
+ 
++cat >"$fake_bin/findmnt" <<'STUB'
++#!/bin/bash
++printf '%s\n' "${TEST_ROOT_FSTYPE:-btrfs}"
++STUB
++chmod +x "$fake_bin/findmnt"
++
+ notification_migration=$(grep -rl 'Disable Limine Snapper warning notifier' "$ROOT/migrations" | head -n 1 || true)
+ [[ -n $notification_migration ]] || fail "Limine Snapper warning notifier migration exists"
+ grep -F 'limine-snapper-notify.desktop' "$notification_migration" >/dev/null
+@@ -71,6 +77,19 @@ grep -Fx 'systemctl disable --now snapper-timeline.timer' "$test_tmp/calls.log"
+ grep -Fx 'systemctl enable --now snapper-cleanup.timer limine-snapper-sync.service' "$test_tmp/calls.log" >/dev/null || fail "snapshot configure enables cleanup and Limine snapshot sync"
+ pass "snapshot configure normalizes Snapper policy and services"
+ 
++# A root that isn't btrfs has nothing to snapshot; create-config would fail.
++: >"$test_tmp/calls.log"
++TEST_LOG="$test_tmp/calls.log" \
++TEST_ROOT_FSTYPE=ext4 \
++PATH="$fake_bin:$PATH" \
++OMARCHY_PATH="$ROOT" \
++OMARCHY_SNAPPER_CONFIG_PATH="$test_tmp/ext4/etc/snapper/configs/root" \
++OMARCHY_SNAPPER_CONF_PATH="$test_tmp/ext4/etc/conf.d/snapper" \
++  bash -euo pipefail "$ROOT/install/config/snapper.sh" >/dev/null || fail "snapshot configure succeeds on a root that isn't btrfs"
++[[ ! -e $test_tmp/ext4/etc/snapper/configs/root && ! -s $test_tmp/calls.log ]] ||
++  fail "snapshot configure leaves Snapper alone on a root that isn't btrfs" "$(cat "$test_tmp/calls.log")"
++pass "snapshot configure skips Snapper on a root that isn't btrfs"
++
+ setup_system="$ROOT/bin/omarchy-apply-system"
+ grep -F 'config/all.sh' "$setup_system" >/dev/null ||
+   fail "system setup runs the config phase"
+-- 
+2.49.0
+

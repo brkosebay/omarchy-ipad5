@@ -1,0 +1,357 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Mon, 26 Oct 2026 18:20:00 +0100
+Subject: [PATCH] soc: apple: sep-a9: add bounded arts manifest probe
+
+The j71t SEP node carries ap-manifest and no has-art property.  XNU's
+AppleSEPARTStorageService therefore publishes the 16 KiB arts OOL buffers,
+copies the IM4M DER from the staged AppleSEPFirmware into the AP-to-SEP
+buffer, and sends MANIFEST (tag 1, opcode 6).  The SEP answers with the same
+tag and opcode 7; parameter zero means success.  It does not send ART_LOAD
+or ART_NO_ART on this hardware.
+
+Add an explicit, one-shot debugfs implementation of that operation.  Binary
+data is staged through arts-manifest and the request is issued only by a
+write to arts-start.  Validate the DER length and IM4M marker, require the
+advertised arts endpoint to have a published OOL binding, use one mailbox
+word, and never retry.  Keep the raw response visible for bring-up.
+
+Nothing runs automatically and this path cannot issue any ART storage
+mutation opcode.
+---
+ drivers/soc/apple/sep-a9.c | 272 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 272 insertions(+)
+
+diff --git a/drivers/soc/apple/sep-a9.c b/drivers/soc/apple/sep-a9.c
+index 7dc2c9454f66..000000000000 100644
+--- a/drivers/soc/apple/sep-a9.c
++++ b/drivers/soc/apple/sep-a9.c
+@@ -180,6 +180,22 @@
+ #define SEP_XFER_TIMEOUT_MS	10000
+ 
+ #define SEP_CMD_SBIO_INIT	0x73
++
++/* AppleSEPARTStorageService on the advertised 'arts' endpoint. */
++#define SEP_NAME_ARTS		0x61727473	/* 'arts', big-endian 4CC */
++#define SEP_ARTS_OOL_SIZE	0x4000		/* j71t advertises 4 pages */
++#define SEP_ARTS_TAG		0x01		/* first XNU tag-pool entry + 1 */
++#define SEP_ARTS_OP_MANIFEST	0x06		/* Opcode::MANIFEST (3) << 1 */
++#define SEP_ARTS_OP_REPLY	0x07		/* request opcode | 1 */
++#define SEP_ARTS_TIMEOUT_MS	10000
++#define SEP_ARTS_DER_MIN	10
++
++enum sep_arts_result {
++	SEP_ARTS_NEVER,
++	SEP_ARTS_WAITING,
++	SEP_ARTS_REPLY,
++	SEP_ARTS_TIMEOUT,
++};
+ 
+ struct sep_ep {
+ 	/* advertisement */
+@@ -231,5 +247,21 @@ struct sep_a9 {
+ 	u8 last_out[SEP_XFER_CHUNK];
+ 
++	/* One-shot AppleSEPARTStorage MANIFEST request, under cfg_lock. */
++	struct completion arts_done;
++	enum sep_arts_result arts_result;
++	bool arts_ran;
++	bool arts_waiting;
++	int arts_ep;
++	size_t arts_manifest_len;
++	u8 arts_reply_tag;
++	u8 arts_reply_op;
++	u8 arts_reply_param;
++	u32 arts_reply_data;
++	u64 arts_reply_raw;
++	int arts_ret;
++	s64 arts_reply_us;
++	ktime_t arts_t0;
++
+ 	/* last wrapper activation (debugfs start), under cfg_lock */
+ 	bool armed_once;
+ 	u32 pwrstate;
+@@ -410,6 +442,25 @@ static void sep_xfer_rx(struct sep_a9 *sep, u64 msg)
+ 	complete(&sep->xfer_done);
+ }
+ 
++/* Record the one expected arts MANIFEST response. Called with lock held. */
++static void sep_arts_rx(struct sep_a9 *sep, u64 msg)
++{
++	if (!sep->arts_waiting || SEP_MSG_GET_EP(msg) != sep->arts_ep ||
++	    SEP_MSG_GET_TAG(msg) != SEP_ARTS_TAG ||
++	    SEP_MSG_GET_OP(msg) != SEP_ARTS_OP_REPLY)
++		return;
++
++	sep->arts_reply_tag = SEP_MSG_GET_TAG(msg);
++	sep->arts_reply_op = SEP_MSG_GET_OP(msg);
++	sep->arts_reply_param = SEP_MSG_GET_PARAM(msg);
++	sep->arts_reply_data = SEP_MSG_GET_DATA(msg);
++	sep->arts_reply_raw = msg;
++	sep->arts_reply_us = ktime_us_delta(ktime_get(), sep->arts_t0);
++	sep->arts_result = SEP_ARTS_REPLY;
++	sep->arts_waiting = false;
++	complete(&sep->arts_done);
++}
++
+ /*
+  * During a wake test: ep 0 op 0x0f or 0x15 is the indication the XNU mailbox
+  * drain callback wakes its waiter for. Anything else is counted, first one
+@@ -470,8 +519,10 @@ static int sep_drain(struct sep_a9 *sep)
+ 		sep_wake_rx(sep, msg);
+ 		if (SEP_MSG_GET_EP(msg) == SEP_EP_DISCOVERY)
+ 			sep_discovery_rx(sep, msg);
+-		else
++		else {
++			sep_arts_rx(sep, msg);
+ 			sep_xfer_rx(sep, msg);
++		}
+ 
+ 		if (++drained > SEP_LOG_ENTRIES) {
+ 			sep->dropped++;
+@@ -1120,6 +1177,218 @@ static const struct file_operations sep_dbg_ool_fops = {
+ 	.write = sep_dbg_ool_write,
+ };
+ 
++static int sep_find_named_ep(struct sep_a9 *sep, u32 name)
++{
++	unsigned int i;
++	int found = -1;
++
++	mutex_lock(&sep->lock);
++	for (i = 0; i <= SEP_EP_CLIENT_MAX; i++) {
++		if (!sep_ep_complete(&sep->eps[i]) || sep->eps[i].name != name)
++			continue;
++		if (found >= 0) {
++			found = -EEXIST;
++			break;
++		}
++		found = i;
++	}
++	mutex_unlock(&sep->lock);
++	return found;
++}
++
++/*
++ * Binary write of the IM4M DER into the already-published arts AP->SEP OOL
++ * buffer.  It only stages bytes; arts-start is the separate commit point.
++ */
++static ssize_t sep_dbg_arts_manifest_write(struct file *file,
++					   const char __user *ubuf, size_t count,
++					   loff_t *ppos)
++{
++	struct sep_a9 *sep = file->private_data;
++	struct sep_ep *e;
++	loff_t off = *ppos;
++	int ep, ret = 0;
++
++	if (!count)
++		return 0;
++
++	mutex_lock(&sep->cfg_lock);
++	if (!sep->running) {
++		ret = -ENXIO;
++		goto out;
++	}
++	if (sep->arts_ran) {
++		ret = -EALREADY;
++		goto out;
++	}
++	ep = sep_find_named_ep(sep, SEP_NAME_ARTS);
++	if (ep < 0) {
++		ret = ep == -1 ? -ENOENT : ep;
++		goto out;
++	}
++	e = &sep->eps[ep];
++	if (!e->published || !e->send || e->send_len != SEP_ARTS_OOL_SIZE) {
++		ret = -ENODEV;
++		goto out;
++	}
++	if (off < 0 || off != sep->arts_manifest_len ||
++	    count > e->send_len - off) {
++		ret = -EINVAL;
++		goto out;
++	}
++	if (copy_from_user(e->send + off, ubuf, count)) {
++		ret = -EFAULT;
++		goto out;
++	}
++	dcache_clean_poc((unsigned long)e->send + off,
++			 (unsigned long)e->send + off + count);
++	sep->arts_manifest_len += count;
++	*ppos += count;
++	dev_info(sep->dev, "arts ep %#04x: staged IM4M bytes %#zx/%#zx\n",
++		 ep, sep->arts_manifest_len, e->send_len);
++out:
++	mutex_unlock(&sep->cfg_lock);
++	return ret ? ret : count;
++}
++
++static const struct file_operations sep_dbg_arts_manifest_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = sep_dbg_arts_manifest_write,
++};
++
++static int sep_arts_manifest_start(struct sep_a9 *sep)
++{
++	struct sep_ep *e;
++	unsigned long left;
++	u16 der_content;
++	u32 before;
++	int ep, ret;
++
++	if (!sep->running)
++		return -ENXIO;
++	if (sep->arts_ran)
++		return -EALREADY;
++	ep = sep_find_named_ep(sep, SEP_NAME_ARTS);
++	if (ep < 0)
++		return ep == -1 ? -ENOENT : ep;
++	e = &sep->eps[ep];
++	if (!e->published || !e->send || e->send_len != SEP_ARTS_OOL_SIZE)
++		return -ENODEV;
++	if (sep->arts_manifest_len < SEP_ARTS_DER_MIN)
++		return -ENODATA;
++	if (((u8 *)e->send)[0] != 0x30 || ((u8 *)e->send)[1] != 0x82 ||
++	    memcmp(e->send + 4, "\x16\x04IM4M", 6))
++		return -EBADMSG;
++	der_content = get_unaligned_be16(e->send + 2);
++	if ((size_t)der_content + 4 != sep->arts_manifest_len)
++		return -EMSGSIZE;
++
++	before = readl(sep->mbox + SEP_MBOX_SND_STS);
++	if (!(before & SEP_MBOX_STS_EMPTY))
++		return -EBUSY;
++
++	/* This request is one-shot even on timeout: never resend in this boot. */
++	sep->arts_ran = true;
++	sep->arts_ep = ep;
++	sep->arts_reply_tag = 0;
++	sep->arts_reply_op = 0;
++	sep->arts_reply_param = 0xff;
++	sep->arts_reply_data = 0;
++	sep->arts_reply_raw = 0;
++	sep->arts_reply_us = 0;
++	sep->arts_ret = 0;
++	sep->arts_result = SEP_ARTS_WAITING;
++	reinit_completion(&sep->arts_done);
++	mutex_lock(&sep->lock);
++	sep->arts_waiting = true;
++	mutex_unlock(&sep->lock);
++	dcache_clean_poc((unsigned long)e->send,
++			 (unsigned long)e->send + sep->arts_manifest_len);
++
++	dev_info(sep->dev, "arts ep %#04x: sending MANIFEST tag=%#x op=%#x, IM4M %#zx bytes\n",
++		 ep, SEP_ARTS_TAG, SEP_ARTS_OP_MANIFEST,
++		 sep->arts_manifest_len);
++	sep->arts_t0 = ktime_get();
++	ret = sep_send_raw(sep, ep, SEP_ARTS_TAG, SEP_ARTS_OP_MANIFEST, 0, 0);
++	if (!ret)
++		ret = sep_tx_drain(sep, before, "arts MANIFEST");
++	if (ret)
++		goto cancel;
++
++	left = wait_for_completion_timeout(&sep->arts_done,
++					   msecs_to_jiffies(SEP_ARTS_TIMEOUT_MS));
++	if (!left) {
++		ret = -ETIMEDOUT;
++		sep->arts_result = SEP_ARTS_TIMEOUT;
++		goto cancel;
++	}
++
++	ret = sep->arts_reply_param ? -EIO : 0;
++	sep->arts_ret = ret;
++	dev_info(sep->dev, "arts ep %#04x: MANIFEST reply raw=%016llx param=%#x data=%#x after %lld us: %s\n",
++		 ep, sep->arts_reply_raw, sep->arts_reply_param,
++		 sep->arts_reply_data, sep->arts_reply_us,
++		 ret ? "SEP rejected" : "success");
++	return ret;
++
++cancel:
++	mutex_lock(&sep->lock);
++	sep->arts_waiting = false;
++	mutex_unlock(&sep->lock);
++	sep->arts_ret = ret;
++	dev_warn(sep->dev, "arts ep %#04x: MANIFEST stopped: %d (no retry in this boot)\n",
++		 ep, ret);
++	return ret;
++}
++
++static ssize_t sep_dbg_arts_start_write(struct file *file,
++					const char __user *ubuf, size_t count,
++					loff_t *ppos)
++{
++	struct sep_a9 *sep = file->private_data;
++	char buf[8];
++	unsigned int on;
++	int ret;
++
++	if (count >= sizeof(buf) || copy_from_user(buf, ubuf, count))
++		return -EINVAL;
++	buf[count] = '\0';
++	if (kstrtouint(strim(buf), 0, &on) || on != 1)
++		return -EINVAL;
++	mutex_lock(&sep->cfg_lock);
++	ret = sep_arts_manifest_start(sep);
++	mutex_unlock(&sep->cfg_lock);
++	return ret ? ret : count;
++}
++
++static ssize_t sep_dbg_arts_start_read(struct file *file, char __user *ubuf,
++				       size_t count, loff_t *ppos)
++{
++	struct sep_a9 *sep = file->private_data;
++	char buf[320];
++	ssize_t len;
++
++	mutex_lock(&sep->cfg_lock);
++	len = scnprintf(buf, sizeof(buf),
++			"ran=%d result=%u ret=%d ep=%d manifest_len=%zu\n"
++			"reply tag=%02x op=%02x param=%02x data=%08x raw=%016llx after_us=%lld\n",
++			sep->arts_ran, sep->arts_result, sep->arts_ret,
++			sep->arts_ep, sep->arts_manifest_len,
++			sep->arts_reply_tag, sep->arts_reply_op,
++			sep->arts_reply_param, sep->arts_reply_data,
++			sep->arts_reply_raw, sep->arts_reply_us);
++	mutex_unlock(&sep->cfg_lock);
++	return simple_read_from_buffer(ubuf, count, ppos, buf, len);
++}
++
++static const struct file_operations sep_dbg_arts_start_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.read = sep_dbg_arts_start_read,
++	.write = sep_dbg_arts_start_write,
++};
++
+ static int sep_pwrstate_read(u32 *val);
+ 
+ /*
+@@ -2053,5 +2322,9 @@ static void sep_debugfs_init(struct sep_a9 *sep)
+ 	debugfs_create_file("send", 0200, sep->dbg, sep, &sep_dbg_send_fops);
+ 	debugfs_create_file("ool", 0200, sep->dbg, sep, &sep_dbg_ool_fops);
++	debugfs_create_file("arts-manifest", 0200, sep->dbg, sep,
++			    &sep_dbg_arts_manifest_fops);
++	debugfs_create_file("arts-start", 0600, sep->dbg, sep,
++			    &sep_dbg_arts_start_fops);
+ 	debugfs_create_file("start", 0200, sep->dbg, sep, &sep_dbg_start_fops);
+ 	debugfs_create_file("fifo", 0444, sep->dbg, sep, &sep_dbg_fifo_fops);
+ 	debugfs_create_file("xfer", 0600, sep->dbg, sep, &sep_dbg_xfer_fops);
+@@ -2078,10 +2308,13 @@ static int sep_probe(struct platform_device *pdev)
+ 	mutex_init(&sep->tx_lock);
+ 	mutex_init(&sep->cfg_lock);
+ 	init_completion(&sep->xfer_done);
++	init_completion(&sep->arts_done);
+ 	INIT_DELAYED_WORK(&sep->poll, sep_poll_work);
+ 	sep->poll_us = 10000;
+ 	sep->sbio_ep = -1;
+ 	sep->last_ep = -1;
++	sep->arts_ep = -1;
++	sep->arts_result = SEP_ARTS_NEVER;
+ 
+ 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+ 	if (!res)
+-- 
+2.51.0
+

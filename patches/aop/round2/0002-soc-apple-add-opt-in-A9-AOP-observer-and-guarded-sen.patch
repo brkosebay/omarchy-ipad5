@@ -1,0 +1,1049 @@
+From 6b181e7a202eb50659ccbdc988491a552e5e92db Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 10:14:20 +0000
+Subject: [PATCH 2/2] soc: apple: add opt-in A9 AOP observer and guarded sensor
+ groundwork
+
+Observe five fixed wrapper registers under existing PMGR domain locks without becoming a power consumer. Keep debug and attach-preflight parameters off by default; never access FIFO, IRQ, reset or remap controls. Refuse running ownership and stopped memory-contract gaps explicitly.
+
+Isolate the old 56-bit RTKit codec and bounded SPU v2 protocol helpers. Add a dormant IIO consumer requiring verified calibration, units, ARot and a real first sample. No transport calls it until queue ownership and loading are established.
+---
+ Documentation/driver-api/apple-a9-aop.rst     |  72 ++++++
+ .../dts/apple/s8003-j71t-aop-observer.dtsi    |  21 ++
+ arch/arm64/boot/dts/apple/s8003-j71t.dts      |   1 +
+ drivers/pmdomain/apple/pmgr-pwrstate.c        |  85 +++++++
+ drivers/soc/apple/Kconfig                     |  21 ++
+ drivers/soc/apple/Makefile                    |   3 +
+ drivers/soc/apple/a9-aop-iio.c                | 184 ++++++++++++++
+ drivers/soc/apple/a9-aop-iio.h                |  36 +++
+ drivers/soc/apple/a9-aop-protocol.h           | 231 ++++++++++++++++++
+ drivers/soc/apple/apple-a9-aop.c              | 230 +++++++++++++++++
+ include/linux/soc/apple/pmgr-observe.h        |  27 ++
+ 11 files changed, 911 insertions(+)
+ create mode 100644 Documentation/driver-api/apple-a9-aop.rst
+ create mode 100644 arch/arm64/boot/dts/apple/s8003-j71t-aop-observer.dtsi
+ create mode 100644 drivers/soc/apple/a9-aop-iio.c
+ create mode 100644 drivers/soc/apple/a9-aop-iio.h
+ create mode 100644 drivers/soc/apple/a9-aop-protocol.h
+ create mode 100644 drivers/soc/apple/apple-a9-aop.c
+ create mode 100644 include/linux/soc/apple/pmgr-observe.h
+
+diff --git a/Documentation/driver-api/apple-a9-aop.rst b/Documentation/driver-api/apple-a9-aop.rst
+new file mode 100644
+index 0000000000..b8afc0d8d0
+--- /dev/null
++++ b/Documentation/driver-api/apple-a9-aop.rst
+@@ -0,0 +1,72 @@
++.. SPDX-License-Identifier: GPL-2.0-only
++
++===============================
++J71t AOP bring-up (experimental)
++===============================
++
++CONFIG_APPLE_A9_AOP is a built-in, default-off, read-only observer. With
++``apple_a9_aop.debug=1``, root may read ``/sys/kernel/debug/apple-a9-aop/status``.
++The driver maps five four-byte resources and issues only readl() on them.
++The MMU necessarily maps whole pages; no debugfs operation can address the
++rest of those pages. FIFO, interrupt set/clear, reset/remap, and firmware
++memory are never accessed. There are no write file operations or IRQs.
++
++The diagnostic node deliberately has no power-domains property. An observer
++API locks the existing PMGR domains in child-before-parent order, records
++genpd and raw hardware state, and skips wrapper reads unless all five domains
++are ON with ACTUAL=TARGET=15 and no reset, disable or parent-off bits. It does
++not resume or hold any power domain. Hardware auto-PM remains untouched; the
++software locks cannot exclude autonomous transitions, and the raw auto-enable
++bit is included in the capture. Enabling the observer is an explicit hardware
++diagnostic opt-in, not protection against an external bus fault.
++
++This is a Linux-time snapshot, after the ordinary PMGR provider's probe.
++The existing AOP always-on policy and warm-boot retention policy are unchanged.
++It is not a pre-PMGR bootloader trace and does not prove firmware identity.
++
++``apple_a9_aop.attach=1`` also enables the read-only ``preflight`` check:
++
++* Running CPU: retain everything, refuse unknown host/memory ownership.
++* Stopped CPU: request the main and external files listed below, report sizes,
++  then refuse the unresolved
++  reservation/remap/patchbay contract. No image is copied to AOP memory.
++
++The exact filenames are ``apple/aop/ipad6faop-20H350.bin`` and
++``apple/aop/ipad6faop_ext-20H350.bin``. request_firmware_direct() avoids a
++userspace-helper wait. Sizes are inventory checks, not authenticity checks;
++the host extractor must validate the pinned component and image SHA256s.
++Mailbox fault bits 18/19 in either control register also stop preflight,
++without acknowledging or clearing them.
++
++The old 56-bit-payload/8-bit-endpoint codec, management hello12, bounded SPU
++queue descriptors, version2 subpackets, announcement32, subtype4 property
++payloads/replies, and 22-byte motion decoder are isolated in a protocol header.
++They are not connected to an MMIO mailbox. Queue header/block ownership,
++cache policy, IOP address translation and takeover remain unresolved. Generic
++96-bit ASC mailbox/RTKit clients are unchanged.
++
++CONFIG_APPLE_A9_AOP_IIO builds a dormant consumer; no code currently calls its
++registration function. The future SPU core must supply a real first report,
++verified 16.16-g scale, calibration, interval units/rate, and verified ARot
++layout. Candidate ARot v1 decoding is explicit and strictly checked, but is
++not established hardware behavior. If firmware already applied ARot, a measured
++residual screen matrix is required to prevent double rotation. No private
++calibration or guessed matrix is included in the board DTS. On registration
++the direct IIO interface provides report counts, scale, read-only sampling
++frequency and a mount matrix. Samples are invalidated on parse/transport
++failure and become stale after max(1 second, five report intervals). AP receipt
++time is used for freshness only; no unverified AOP timestamps are exported.
++
++No rate is advertised as available or programmed automatically. The stream
++plan helper builds batch(0x16), raw(0x5c), report(0) property payloads only when
++units have been verified; report=0 builds a stop plan. A negotiated transport
++must correlate and check every reply before advancing and invalidate IIO on
++any transport failure. The observer has no call path to these helpers.
++
++Future hardware implementation must separate retain/attach from cold load,
++reserve the exact boot-described memory before writes, validate the external
++image tag/address and patchbay, establish coherent bounded queues, and discover
++the accel service/channel through actual endpoint and ready announcements.
++The saved ADT service ID 0x10000007 is not a mailbox endpoint constant.
++
++No part of this work writes syscfg, NVRAM or boot firmware storage.
+diff --git a/arch/arm64/boot/dts/apple/s8003-j71t-aop-observer.dtsi b/arch/arm64/boot/dts/apple/s8003-j71t-aop-observer.dtsi
+new file mode 100644
+index 0000000000..41493adce3
+--- /dev/null
++++ b/arch/arm64/boot/dts/apple/s8003-j71t-aop-observer.dtsi
+@@ -0,0 +1,21 @@
++// SPDX-License-Identifier: GPL-2.0+ OR MIT
++/* Diagnostic only: no power-domains, reset, IRQ, SRAM or FIFO resource.
++ * Kconfig and apple_a9_aop.debug are both off by default.
++ */
++/ {
++	soc {
++		aop_observer: aop-observer@210800044 {
++			compatible = "apple,j71t-aop-observer";
++			reg = <0x2 0x10800044 0x0 0x4>,
++			      <0x2 0x10800b88 0x0 0x4>,
++			      <0x2 0x10804008 0x0 0x4>,
++			      <0x2 0x10804020 0x0 0x4>,
++			      <0x2 0x10804040 0x0 0x4>;
++			reg-names = "cpu-control", "cpu-running", "inbox-control",
++				    "outbox-control", "idle-status";
++			/* Observer phandles deliberately do not use power-domains. */
++			apple,observe-domains = <&ps_aop_gpio &ps_aop &ps_aop_busif
++						 &ps_aop_cpu &ps_aop_filter>;
++		};
++	};
++};
+diff --git a/arch/arm64/boot/dts/apple/s8003-j71t.dts b/arch/arm64/boot/dts/apple/s8003-j71t.dts
+index 0d906ae80b..4a7b6c8da2 100644
+--- a/arch/arm64/boot/dts/apple/s8003-j71t.dts
++++ b/arch/arm64/boot/dts/apple/s8003-j71t.dts
+@@ -6,6 +6,7 @@
+ 
+ /dts-v1/;
+ 
++#include "s8003-j71t-aop-observer.dtsi"
+ #include "s8003.dtsi"
+ #include "s800x-ipad5.dtsi"
+ 
+diff --git a/drivers/pmdomain/apple/pmgr-pwrstate.c b/drivers/pmdomain/apple/pmgr-pwrstate.c
+index 82c33cf727..d10c19dbb4 100644
+--- a/drivers/pmdomain/apple/pmgr-pwrstate.c
++++ b/drivers/pmdomain/apple/pmgr-pwrstate.c
+@@ -10,12 +10,14 @@
+ #include <linux/err.h>
+ #include <linux/of.h>
+ #include <linux/of_address.h>
++#include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_domain.h>
+ #include <linux/regmap.h>
+ #include <linux/mfd/syscon.h>
+ #include <linux/reset-controller.h>
+ #include <linux/module.h>
++#include <linux/soc/apple/pmgr-observe.h>
+ 
+ #define APPLE_PMGR_RESET        BIT(31)
+ #define APPLE_PMGR_AUTO_ENABLE  BIT(28)
+@@ -298,6 +300,8 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
+ 	if (ret < 0)
+ 		goto err_remove;
+ 
++	platform_set_drvdata(pdev, ps);
++
+ 	return 0;
+ err_remove:
+ 	of_genpd_del_provider(node);
+@@ -305,6 +309,87 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
+ 	return ret;
+ }
+ 
++/* A9 AOP observer API: BEGIN */
++#if IS_ENABLED(CONFIG_APPLE_A9_AOP)
++/*
++ * Read-only observer for bring-up. The caller's nodes follow the same
++ * child -> parent order as genpd power transitions. No domain is attached,
++ * resumed, pinned on, reset, or written by this function.
++ */
++int apple_pmgr_observe(struct device_node **nodes, unsigned int count,
++		       struct apple_pmgr_observation *states,
++		       void (*read)(void *), void *data)
++{
++	struct platform_device *providers[5];
++	struct apple_pmgr_ps *ps[5];
++	unsigned long flags;
++	unsigned int i, j, found = 0;
++	int ret = 0;
++	bool accessible = true;
++
++	if (!count || count > ARRAY_SIZE(providers) || !read)
++		return -EINVAL;
++	for (i = 0; i < count; i++) {
++		for (j = 0; j < i; j++)
++			if (nodes[i] == nodes[j]) {
++				ret = -EINVAL;
++				goto put;
++			}
++		providers[i] = of_find_device_by_node(nodes[i]);
++		if (!providers[i]) {
++			ret = -EPROBE_DEFER;
++			goto put;
++		}
++		device_lock(&providers[i]->dev);
++		found++;
++		if (!providers[i]->dev.driver ||
++		    strcmp(providers[i]->dev.driver->name, "apple-pmgr-pwrstate")) {
++			ret = -EPROBE_DEFER;
++			goto put;
++		}
++		ps[i] = platform_get_drvdata(providers[i]);
++		if (!ps[i]) {
++			ret = -EPROBE_DEFER;
++			goto put;
++		}
++	}
++
++	/* PMGR domains use GENPD_FLAG_IRQ_SAFE, i.e. genpd.slock. */
++	local_irq_save(flags);
++	for (i = 0; i < count; i++)
++		spin_lock_nested(&ps[i]->genpd.slock, i);
++	for (i = 0; i < count; i++) {
++		states[i].genpd_status = ps[i]->genpd.status;
++		ret = regmap_read(ps[i]->regmap, ps[i]->offset, &states[i].raw);
++		if (ret)
++			goto unlock;
++		if (states[i].genpd_status != GENPD_STATE_ON ||
++		    FIELD_GET(APPLE_PMGR_PS_ACTUAL, states[i].raw) != APPLE_PMGR_PS_ACTIVE ||
++		    FIELD_GET(APPLE_PMGR_PS_TARGET, states[i].raw) != APPLE_PMGR_PS_ACTIVE ||
++		    states[i].raw & (APPLE_PMGR_RESET | APPLE_PMGR_DEV_DISABLE |
++				     APPLE_PMGR_PARENT_OFF))
++			accessible = false;
++	}
++	if (accessible)
++		read(data);
++	else
++		ret = -EHOSTDOWN;
++unlock:
++	for (i = count; i > 0; i--)
++		spin_unlock(&ps[i - 1]->genpd.slock);
++	local_irq_restore(flags);
++put:
++	while (found) {
++		found--;
++		device_unlock(&providers[found]->dev);
++		put_device(&providers[found]->dev);
++	}
++	return ret;
++}
++EXPORT_SYMBOL_GPL(apple_pmgr_observe);
++#endif
++/* A9 AOP observer API: END */
++
+ static const struct of_device_id apple_pmgr_ps_of_match[] = {
+ 	{ .compatible = "apple,t8103-pmgr-pwrstate" },
+ 	{ .compatible = "apple,pmgr-pwrstate" },
+diff --git a/drivers/soc/apple/Kconfig b/drivers/soc/apple/Kconfig
+index 99fa23a57c..0977184596 100644
+--- a/drivers/soc/apple/Kconfig
++++ b/drivers/soc/apple/Kconfig
+@@ -4,6 +4,27 @@ if ARCH_APPLE || COMPILE_TEST
+ 
+ menu "Apple SoC drivers"
+ 
++config APPLE_A9_AOP
++	bool "J71t AOP read-only bring-up observer"
++	depends on ARCH_APPLE && OF && DEBUG_FS && APPLE_PMGR_PWRSTATE
++	select FW_LOADER
++	default n
++	help
++	  Read only five allowlisted AOP wrapper registers after checking all
++	  five power domains. Does not attach to genpd, change power, consume
++	  FIFOs, request IRQs or write hardware. Also requires the boot parameter
++	  apple_a9_aop.debug=1. An optional attach preflight never starts RTKit.
++
++config APPLE_A9_AOP_IIO
++	bool "J71t AOP accelerometer consumer groundwork"
++	depends on APPLE_A9_AOP && IIO
++	default n
++	help
++	  Compile the accelerometer consumer and old SPU packet helpers. No
++	  transport currently calls it: no IIO device is registered by enabling
++	  this option. Registration requires a negotiated service, a real first
++	  report, and verified calibration, scale, interval and ARot evidence.
++
+ config APPLE_MAILBOX
+ 	tristate "Apple SoC mailboxes"
+ 	depends on PM
+diff --git a/drivers/soc/apple/Makefile b/drivers/soc/apple/Makefile
+index cad33f1cc0..2a1e2f8900 100644
+--- a/drivers/soc/apple/Makefile
++++ b/drivers/soc/apple/Makefile
+@@ -1,5 +1,8 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ 
++obj-$(CONFIG_APPLE_A9_AOP) += apple-a9-aop.o
++obj-$(CONFIG_APPLE_A9_AOP_IIO) += a9-aop-iio.o
++
+ obj-$(CONFIG_APPLE_MAILBOX) += apple-mailbox.o
+ apple-mailbox-y = mailbox.o
+ 
+diff --git a/drivers/soc/apple/a9-aop-iio.c b/drivers/soc/apple/a9-aop-iio.c
+new file mode 100644
+index 0000000000..65e713bf2a
+--- /dev/null
++++ b/drivers/soc/apple/a9-aop-iio.c
+@@ -0,0 +1,184 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Dormant IIO consumer for a future negotiated J71t SPU service. */
++#include <linux/err.h>
++#include <linux/iio/iio.h>
++#include <linux/ktime.h>
++#include <linux/module.h>
++#include <linux/spinlock.h>
++
++#include "a9-aop-protocol.h"
++#include "a9-aop-iio.h"
++
++struct a9_aop_accel {
++	spinlock_t lock; /* Protects latest, received_ns and valid. */
++	struct a9_aop_motion latest;
++	u64 received_ns;
++	u64 stale_ns;
++	bool valid;
++	u32 interval_us;
++	struct iio_mount_matrix matrix;
++};
++
++static const struct iio_mount_matrix *
++a9_aop_accel_matrix(const struct iio_dev *indio_dev, const struct iio_chan_spec *chan)
++{
++	struct a9_aop_accel *accel = iio_priv(indio_dev);
++
++	return &accel->matrix;
++}
++
++static const struct iio_chan_spec_ext_info a9_aop_accel_ext[] = {
++	IIO_MOUNT_MATRIX(IIO_SHARED_BY_TYPE, a9_aop_accel_matrix),
++	{}
++};
++
++#define A9_ACCEL_CHANNEL(axis, index) { \
++	.type = IIO_ACCEL, .modified = 1, .channel2 = IIO_MOD_##axis, \
++	.address = index, .info_mask_separate = BIT(IIO_CHAN_INFO_RAW), \
++	.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE) | \
++		BIT(IIO_CHAN_INFO_SAMP_FREQ), .ext_info = a9_aop_accel_ext, \
++}
++
++static const struct iio_chan_spec a9_aop_accel_channels[] = {
++	A9_ACCEL_CHANNEL(X, 0), A9_ACCEL_CHANNEL(Y, 1), A9_ACCEL_CHANNEL(Z, 2),
++};
++
++static int a9_aop_accel_read_raw(struct iio_dev *indio_dev,
++				 const struct iio_chan_spec *chan,
++				 int *val, int *val2, long mask)
++{
++	struct a9_aop_accel *accel = iio_priv(indio_dev);
++	unsigned long flags;
++	u64 now;
++	int ret;
++
++	switch (mask) {
++	case IIO_CHAN_INFO_RAW:
++		spin_lock_irqsave(&accel->lock, flags);
++		now = ktime_get_boottime_ns();
++		if (!accel->valid || now - accel->received_ns > accel->stale_ns) {
++			ret = -ENODATA;
++		} else {
++			*val = accel->latest.axes[chan->address];
++			ret = IIO_VAL_INT;
++		}
++		spin_unlock_irqrestore(&accel->lock, flags);
++		return ret;
++	case IIO_CHAN_INFO_SCALE:
++		/* Only registered after 16.16 g is verified. m/s^2 per count. */
++		*val = 0;
++		*val2 = 149638;
++		return IIO_VAL_INT_PLUS_NANO;
++	case IIO_CHAN_INFO_SAMP_FREQ:
++		*val = 1000000;
++		*val2 = accel->interval_us;
++		return IIO_VAL_FRACTIONAL;
++	default:
++		return -EINVAL;
++	}
++}
++
++static const struct iio_info a9_aop_accel_info = {
++	.read_raw = a9_aop_accel_read_raw,
++};
++
++int a9_aop_accel_report(struct iio_dev *indio_dev, const struct a9_spu_subpacket *sub)
++{
++	struct a9_aop_accel *accel = iio_priv(indio_dev);
++	struct a9_aop_motion motion;
++	unsigned long flags;
++	int ret;
++
++	ret = a9_spu_motion(sub, &motion);
++	if (ret) {
++		a9_aop_accel_invalidate(indio_dev);
++		return ret;
++	}
++	spin_lock_irqsave(&accel->lock, flags);
++	accel->latest = motion;
++	/* AP receipt time is used only for freshness, never exported as the
++	 * firmware sample timestamp. AOP timestamp conversion is unverified.
++	 */
++	accel->received_ns = ktime_get_boottime_ns();
++	accel->valid = true;
++	spin_unlock_irqrestore(&accel->lock, flags);
++	return 0;
++}
++
++void a9_aop_accel_invalidate(struct iio_dev *indio_dev)
++{
++	struct a9_aop_accel *accel = iio_priv(indio_dev);
++	unsigned long flags;
++
++	spin_lock_irqsave(&accel->lock, flags);
++	accel->valid = false;
++	spin_unlock_irqrestore(&accel->lock, flags);
++}
++
++struct iio_dev *a9_aop_accel_register(struct device *parent,
++				      const struct a9_aop_accel_config *config)
++{
++	struct a9_aop_accel *accel;
++	struct iio_dev *indio_dev;
++	s8 matrix[9];
++	unsigned int i, row, col, nonzero;
++	int ret;
++
++	if (!config->arot_layout_verified || !config->scale_verified ||
++	    !config->calibration_verified || !config->interval_units_verified ||
++	    !config->report_interval_us || config->report_interval_us > 10000000 ||
++	    !config->first_report)
++		return ERR_PTR(-EOPNOTSUPP);
++	ret = a9_aop_arot_v1(config->arot, config->arot_size, matrix);
++	if (ret)
++		return ERR_PTR(ret);
++	if (config->firmware_applied_arot) {
++		if (!config->residual_matrix)
++			return ERR_PTR(-EINVAL);
++		memcpy(matrix, config->residual_matrix, sizeof(matrix));
++		/* Reject malformed residual matrices as well. */
++		for (row = 0; row < 3; row++) {
++			nonzero = 0;
++			for (col = 0; col < 3; col++) {
++				s8 value = matrix[row * 3 + col];
++
++				if (value < -1 || value > 1)
++					return ERR_PTR(-EINVAL);
++				nonzero += value != 0;
++			}
++			if (nonzero != 1)
++				return ERR_PTR(-EINVAL);
++		}
++		for (col = 0; col < 3; col++) {
++			nonzero = 0;
++			for (row = 0; row < 3; row++)
++				nonzero += matrix[row * 3 + col] != 0;
++			if (nonzero != 1)
++				return ERR_PTR(-EINVAL);
++		}
++	}
++	indio_dev = devm_iio_device_alloc(parent, sizeof(*accel));
++	if (!indio_dev)
++		return ERR_PTR(-ENOMEM);
++	accel = iio_priv(indio_dev);
++	spin_lock_init(&accel->lock);
++	accel->interval_us = config->report_interval_us;
++	accel->stale_ns = max_t(u64, 1000000000ULL, (u64)accel->interval_us * 5000);
++	for (i = 0; i < 9; i++)
++		accel->matrix.rotation[i] = matrix[i] == -1 ? "-1" : matrix[i] ? "1" : "0";
++	indio_dev->name = "apple-a9-aop-accel";
++	indio_dev->info = &a9_aop_accel_info;
++	indio_dev->modes = INDIO_DIRECT_MODE;
++	indio_dev->channels = a9_aop_accel_channels;
++	indio_dev->num_channels = ARRAY_SIZE(a9_aop_accel_channels);
++	ret = a9_aop_accel_report(indio_dev, config->first_report);
++	if (ret)
++		return ERR_PTR(ret);
++	ret = devm_iio_device_register(parent, indio_dev);
++	if (ret)
++		return ERR_PTR(ret);
++	return indio_dev;
++}
++
++MODULE_DESCRIPTION("Apple A9 AOP accelerometer consumer (requires negotiated SPU transport)");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/soc/apple/a9-aop-iio.h b/drivers/soc/apple/a9-aop-iio.h
+new file mode 100644
+index 0000000000..0bfe54c5fc
+--- /dev/null
++++ b/drivers/soc/apple/a9-aop-iio.h
+@@ -0,0 +1,36 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _A9_AOP_IIO_H
++#define _A9_AOP_IIO_H
++
++#include <linux/types.h>
++
++struct device;
++struct iio_dev;
++struct a9_spu_subpacket;
++
++/* Future negotiated SPU core calls these, never the passive observer.
++ * Each verification bit represents evidence, not a user bypass parameter.
++ */
++struct a9_aop_accel_config {
++	const u8 *arot;
++	size_t arot_size;
++	bool arot_layout_verified;
++	bool scale_verified;
++	bool calibration_verified;
++	bool firmware_applied_arot;
++	/* When firmware already applied ARot, require a measured residual
++	 * screen matrix. Otherwise the verified ARot matrix is exposed in IIO.
++	 */
++	const s8 *residual_matrix;
++	u32 report_interval_us;
++	bool interval_units_verified;
++	const struct a9_spu_subpacket *first_report;
++};
++
++struct iio_dev *a9_aop_accel_register(struct device *parent,
++				      const struct a9_aop_accel_config *config);
++int a9_aop_accel_report(struct iio_dev *indio_dev,
++			const struct a9_spu_subpacket *sub);
++void a9_aop_accel_invalidate(struct iio_dev *indio_dev);
++
++#endif
+diff --git a/drivers/soc/apple/a9-aop-protocol.h b/drivers/soc/apple/a9-aop-protocol.h
+new file mode 100644
+index 0000000000..029cf4b130
+--- /dev/null
++++ b/drivers/soc/apple/a9-aop-protocol.h
+@@ -0,0 +1,231 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Old A7IOPV2 / SPU v8, NOT the contemporary 96-bit ASC transport. */
++#ifndef _A9_AOP_PROTOCOL_H
++#define _A9_AOP_PROTOCOL_H
++
++#include <linux/errno.h>
++#include <linux/string.h>
++#include <linux/types.h>
++#include <linux/unaligned.h>
++
++#define A9_AOP_PAYLOAD_MASK 0x00ffffffffffffffULL
++#define A9_SPU_OUTER_SIZE 16
++#define A9_SPU_SUBHEADER_SIZE 24
++#define A9_SPU_ACCEL_REPORT 0xc2
++#define A9_SPU_NOTIFY 0x10
++#define A9_SPU_REPLY 0x20
++
++struct a9_spu_subpacket {
++	u8 category;
++	u16 subtype;
++	u16 tag;
++	u64 timestamp;
++	const u8 *payload;
++	u32 size;
++};
++
++struct a9_aop_motion {
++	u16 sequence;
++	u32 status;
++	s32 axes[3];
++};
++
++static inline int a9_aop_pack(u8 endpoint, u64 payload, u64 *wire)
++{
++	if (payload & ~A9_AOP_PAYLOAD_MASK)
++		return -ERANGE;
++	*wire = ((u64)endpoint << 56) | payload;
++	return 0;
++}
++
++static inline u8 a9_aop_endpoint(u64 wire)
++{
++	return wire >> 56;
++}
++
++static inline u64 a9_aop_payload(u64 wire)
++{
++	return wire & A9_AOP_PAYLOAD_MASK;
++}
++
++static inline int a9_aop_hello_reply(u64 wire, u64 *reply)
++{
++	u64 payload = a9_aop_payload(wire);
++	u16 min = payload & 0xffff, max = (payload >> 16) & 0xffff;
++
++	if (a9_aop_endpoint(wire) || ((payload >> 52) & 15) != 1 ||
++	    min > 12 || max < 12)
++		return -EPROTONOSUPPORT;
++	*reply = 0x00200000000c000cULL;
++	return 0;
++}
++
++/* Descriptor units are 64 bytes. No address translation is implied. */
++static inline int a9_spu_queue_descriptor(u64 wire, size_t backing_size,
++					  u16 *tag, size_t *offset, size_t *size)
++{
++	u64 payload = a9_aop_payload(wire);
++	u8 type = payload >> 48;
++
++	if (type < 0x8a || type > 0x8c)
++		return -EPROTO;
++	*tag = payload & 0xffff;
++	*size = ((payload >> 16) & 0xffff) * 64;
++	*offset = ((payload >> 32) & 0xffff) * 64;
++	if (!*size || *offset > backing_size || *size > backing_size - *offset)
++		return -EMSGSIZE;
++	return 0;
++}
++
++/* Returns 1 per subpacket, 0 at end, negative on malformed input. Callers
++ * validate the complete outer packet before dispatching any subpacket.
++ * Ring/channel envelopes must already have been removed by the transport.
++ */
++static inline int a9_spu_next(const u8 *packet, size_t length, size_t *cursor,
++			      struct a9_spu_subpacket *sub)
++{
++	const u8 *p;
++	u32 size;
++
++	if (length < A9_SPU_OUTER_SIZE || packet[0] != 2 ||
++	    *cursor < A9_SPU_OUTER_SIZE || *cursor > length)
++		return -EPROTO;
++	if (*cursor == length)
++		return 0;
++	if (length - *cursor < A9_SPU_SUBHEADER_SIZE)
++		return -EMSGSIZE;
++	p = packet + *cursor;
++	size = get_unaligned_le32(p);
++	if (p[4] != 2)
++		return -EPROTO;
++	if (size > length - *cursor - A9_SPU_SUBHEADER_SIZE)
++		return -EMSGSIZE;
++	sub->category = p[5];
++	sub->subtype = get_unaligned_le16(p + 6);
++	sub->tag = get_unaligned_le16(p + 8);
++	sub->timestamp = get_unaligned_le64(p + 10);
++	sub->size = size;
++	sub->payload = p + A9_SPU_SUBHEADER_SIZE;
++	*cursor += A9_SPU_SUBHEADER_SIZE + size;
++	return 1;
++}
++
++static inline int a9_spu_motion(const struct a9_spu_subpacket *sub,
++				struct a9_aop_motion *motion)
++{
++	if (sub->category >= 0x10 || sub->subtype != A9_SPU_ACCEL_REPORT)
++		return -EPROTO;
++	if (sub->size < 22)
++		return -EMSGSIZE;
++	motion->sequence = get_unaligned_le16(sub->payload);
++	motion->status = get_unaligned_le32(sub->payload + 2);
++	motion->axes[0] = (s32)get_unaligned_le32(sub->payload + 6);
++	motion->axes[1] = (s32)get_unaligned_le32(sub->payload + 10);
++	motion->axes[2] = (s32)get_unaligned_le32(sub->payload + 14);
++	return 0;
++}
++
++static inline int a9_spu_announcement(const struct a9_spu_subpacket *sub,
++				      char name[33], u32 *service_id)
++{
++	if (sub->category >= 0x10 || sub->subtype != 0xc0)
++		return -EPROTO;
++	if (sub->size < 40)
++		return -EMSGSIZE;
++	memcpy(name, sub->payload, 32);
++	name[32] = 0;
++	*service_id = get_unaligned_le32(sub->payload + 32);
++	return 0;
++}
++
++/* The value below is the property PAYLOAD only. Channel/ring framing,
++ * category=notify, subtype=4 and a unique transaction tag are added by the
++ * negotiated transport; wait for a correlated IOReturn before proceeding.
++ * Stream sequence: batch(0x16), raw(0x5c), report(0); report=0 stops.
++ */
++static inline void a9_spu_property32(u8 payload[12], u32 key, u32 value)
++{
++	put_unaligned_le32(0, payload);
++	put_unaligned_le32(key, payload + 4);
++	put_unaligned_le32(value, payload + 8);
++}
++
++/* Complete subtype4 notify subpacket, excluding the outer and queue headers.
++ * Timestamp is zero for AP commands; capacity follows the iOS builder (0xe4).
++ */
++static inline void a9_spu_property_notify(u8 packet[36], u16 tag, u32 key, u32 value)
++{
++	memset(packet, 0, 36);
++	put_unaligned_le32(12, packet);
++	packet[4] = 2;
++	packet[5] = A9_SPU_NOTIFY;
++	put_unaligned_le16(4, packet + 6);
++	put_unaligned_le16(tag, packet + 8);
++	put_unaligned_le32(0xe4, packet + 20);
++	a9_spu_property32(packet + 24, key, value);
++}
++
++static inline int a9_spu_property_reply(const struct a9_spu_subpacket *sub, u16 tag)
++{
++	if (sub->category != A9_SPU_REPLY || sub->subtype != 4 || sub->tag != tag)
++		return -EPROTO;
++	if (sub->size < 4)
++		return -EMSGSIZE;
++	return get_unaligned_le32(sub->payload) ? -EREMOTEIO : 0;
++}
++
++/* Build a stream plan, not traffic. The caller must measure interval units
++ * and supported rates, wait for EACH correlated reply, and stop on failure.
++ * Disabled plan is only report_interval=0; no raw/batch changes are invented.
++ */
++static inline int a9_spu_stream_plan(u8 payloads[3][12], bool units_verified,
++				     u32 batch, u32 raw, u32 report)
++{
++	if (!report) {
++		a9_spu_property32(payloads[0], 0, 0);
++		return 1;
++	}
++	if (!units_verified)
++		return -EOPNOTSUPP;
++	a9_spu_property32(payloads[0], 0x16, batch);
++	a9_spu_property32(payloads[1], 0x5c, raw);
++	a9_spu_property32(payloads[2], 0, report);
++	return 3;
++}
++
++/* Candidate ARot v1 layout. The caller MUST establish this layout from
++ * firmware arithmetic or six-pose evidence before using the result in IIO.
++ * No version word is treated as a coefficient, and padding must be zero.
++ */
++static inline int a9_aop_arot_v1(const u8 *blob, size_t length, s8 matrix[9])
++{
++	unsigned int row, col, nonzero;
++
++	if (length != 16 || get_unaligned_le32(blob) != 1)
++		return -EINVAL;
++	for (row = 0; row < 3; row++) {
++		nonzero = 0;
++		if (blob[4 + row * 4 + 3])
++			return -EINVAL;
++		for (col = 0; col < 3; col++) {
++			s8 value = (s8)blob[4 + row * 4 + col];
++
++			if (value < -1 || value > 1)
++				return -EINVAL;
++			matrix[row * 3 + col] = value;
++			nonzero += value != 0;
++		}
++		if (nonzero != 1)
++			return -EINVAL;
++	}
++	for (col = 0; col < 3; col++) {
++		nonzero = 0;
++		for (row = 0; row < 3; row++)
++			nonzero += matrix[row * 3 + col] != 0;
++		if (nonzero != 1)
++			return -EINVAL;
++	}
++	return 0;
++}
++
++#endif
+diff --git a/drivers/soc/apple/apple-a9-aop.c b/drivers/soc/apple/apple-a9-aop.c
+new file mode 100644
+index 0000000000..bc3b47cb8b
+--- /dev/null
++++ b/drivers/soc/apple/apple-a9-aop.c
+@@ -0,0 +1,230 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* J71t AOP passive bring-up. Deliberately no FIFO, IRQ, reset or write path. */
++#include <linux/debugfs.h>
++#include <linux/firmware.h>
++#include <linux/io.h>
++#include <linux/ktime.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/seq_file.h>
++#include <linux/soc/apple/pmgr-observe.h>
++
++#define AOP_REGS 5
++#define AOP_DOMAINS 5
++#define AOP_MAIN_FW "apple/aop/ipad6faop-20H350.bin"
++#define AOP_EXT_FW "apple/aop/ipad6faop_ext-20H350.bin"
++
++static bool debug;
++module_param(debug, bool, 0400);
++MODULE_PARM_DESC(debug, "Enable read-only J71t AOP debugfs (default off)");
++static bool attach;
++module_param(attach, bool, 0400);
++MODULE_PARM_DESC(attach, "Enable attach preflight only; hardware attach is blocked (default off)");
++
++static const char * const reg_names[AOP_REGS] = {
++	"cpu_control", "cpu_running", "inbox_control", "outbox_control", "idle_status",
++};
++
++static const resource_size_t reg_addresses[AOP_REGS] = {
++	0x210800044, 0x210800b88, 0x210804008, 0x210804020, 0x210804040,
++};
++
++/* Child -> parent lock order matches s800-0-3-pmgr.dtsi. */
++static const char * const domain_names[AOP_DOMAINS] = {
++	"aop_gpio", "aop", "aop_busif", "aop_cpu", "aop_filter",
++};
++
++struct a9_aop {
++	struct device *dev;
++	void __iomem *regs[AOP_REGS];
++	struct device_node *domains[AOP_DOMAINS];
++};
++
++struct a9_aop_snapshot {
++	struct a9_aop *aop;
++	u32 values[AOP_REGS];
++};
++
++static void a9_aop_read_status(void *data)
++{
++	struct a9_aop_snapshot *snapshot = data;
++	unsigned int i;
++
++	for (i = 0; i < AOP_REGS; i++)
++		snapshot->values[i] = readl(snapshot->aop->regs[i]);
++}
++
++static int a9_aop_status_show(struct seq_file *s, void *unused)
++{
++	struct a9_aop *aop = s->private;
++	struct apple_pmgr_observation states[AOP_DOMAINS];
++	struct a9_aop_snapshot snapshot = { .aop = aop };
++	unsigned int i;
++	int ret;
++
++	for (i = 0; i < AOP_DOMAINS; i++) {
++		states[i].raw = 0;
++		states[i].genpd_status = -1;
++	}
++	seq_printf(s, "format=1 boottime_ns=%llu hardware_writes=none\n", ktime_get_boottime_ns());
++	ret = apple_pmgr_observe(aop->domains, AOP_DOMAINS, states,
++				 a9_aop_read_status, &snapshot);
++	for (i = 0; i < AOP_DOMAINS; i++)
++		seq_printf(s, "domain=%s genpd=%d raw=0x%08x actual=%u target=%u auto=%u\n",
++			   domain_names[i], states[i].genpd_status, states[i].raw,
++			   (states[i].raw >> 4) & 15, states[i].raw & 15,
++			   !!(states[i].raw & BIT(28)));
++	seq_printf(s, "snapshot_errno=%d\n", ret);
++	if (ret) {
++		seq_puts(s, "wrapper=skipped reason=domain-off-transition-reset-or-unavailable\n");
++		return 0;
++	}
++	for (i = 0; i < AOP_REGS; i++)
++		seq_printf(s, "%s address=0x%llx value=0x%08x\n", reg_names[i],
++			   (unsigned long long)reg_addresses[i], snapshot.values[i]);
++	seq_printf(s, "cpu_running_bit=%u\n", snapshot.values[1] & 1);
++	seq_printf(s, "inbox_faults=%u outbox_faults=%u\n",
++		   (snapshot.values[2] >> 18) & 3, (snapshot.values[3] >> 18) & 3);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(a9_aop_status);
++
++static int a9_aop_preflight_show(struct seq_file *s, void *unused)
++{
++	struct a9_aop *aop = s->private;
++	struct apple_pmgr_observation states[AOP_DOMAINS] = {};
++	struct a9_aop_snapshot snapshot = { .aop = aop };
++	const struct firmware *fw;
++	static const char * const names[] = { AOP_MAIN_FW, AOP_EXT_FW };
++	static const size_t sizes[] = { 342336, 37024 };
++	unsigned int i;
++	int ret;
++
++	seq_puts(s, "hardware_writes=none fifo_reads=none irqs=none dma=none\n");
++	if (!attach) {
++		seq_puts(s, "result=disabled enable=apple_a9_aop.attach=1\n");
++		return 0;
++	}
++	ret = apple_pmgr_observe(aop->domains, AOP_DOMAINS, states,
++				 a9_aop_read_status, &snapshot);
++	if (ret) {
++		seq_printf(s, "result=blocked-domain-state errno=%d\n", ret);
++		return 0;
++	}
++	if ((snapshot.values[2] | snapshot.values[3]) & GENMASK(19, 18)) {
++		seq_puts(s, "result=blocked-mailbox-fault action=no-fifo-no-ack-no-reset\n");
++		return 0;
++	}
++	if (snapshot.values[1] & 1) {
++		seq_puts(s, "case=running result=blocked-retained-memory-and-host-ownership\n");
++		seq_puts(s, "action=retain-firmware-no-hello-no-fifo-no-reset\n");
++		return 0;
++	}
++	seq_puts(s, "case=stopped\n");
++	for (i = 0; i < ARRAY_SIZE(names); i++) {
++		ret = request_firmware_direct(&fw, names[i], aop->dev);
++		if (ret) {
++			seq_printf(s, "firmware=%s errno=%d result=blocked-firmware\n",
++				   names[i], ret);
++			return 0;
++		}
++		seq_printf(s, "firmware=%s size=%zu expected=%zu\n",
++			   names[i], fw->size, sizes[i]);
++		ret = fw->size == sizes[i] ? 0 : -EINVAL;
++		release_firmware(fw);
++		if (ret) {
++			seq_puts(s, "result=blocked-firmware-size\n");
++			return 0;
++		}
++	}
++	seq_puts(s, "result=blocked-memory-reservation-remap-and-patchbay\n");
++	seq_puts(s, "action=no-load-no-cpu-release-no-mailbox\n");
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(a9_aop_preflight);
++
++static void a9_aop_put_node(void *node)
++{
++	of_node_put(node);
++}
++
++static void a9_aop_remove_debugfs(void *dir)
++{
++	debugfs_remove_recursive(dir);
++}
++
++static int a9_aop_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct a9_aop *aop;
++	struct dentry *dir;
++	struct resource *res;
++	const char *label;
++	unsigned int i;
++	int ret;
++
++	/* No resource requests or MMIO on the ordinary boot path. */
++	if (!debug || !of_machine_is_compatible("apple,j71t"))
++		return -ENODEV;
++	if (of_find_property(dev->of_node, "power-domains", NULL) ||
++	    platform_get_resource(pdev, IORESOURCE_MEM, AOP_REGS))
++		return -EINVAL;
++	aop = devm_kzalloc(dev, sizeof(*aop), GFP_KERNEL);
++	if (!aop)
++		return -ENOMEM;
++	aop->dev = dev;
++	for (i = 0; i < AOP_REGS; i++) {
++		res = platform_get_resource(pdev, IORESOURCE_MEM, i);
++		if (!res || res->start != reg_addresses[i] || resource_size(res) != 4)
++			return -EINVAL;
++		aop->regs[i] = devm_ioremap_resource(dev, res);
++		if (IS_ERR(aop->regs[i]))
++			return PTR_ERR(aop->regs[i]);
++	}
++	if (of_count_phandle_with_args(dev->of_node, "apple,observe-domains", NULL) != AOP_DOMAINS)
++		return -EINVAL;
++	for (i = 0; i < AOP_DOMAINS; i++) {
++		aop->domains[i] = of_parse_phandle(dev->of_node, "apple,observe-domains", i);
++		if (!aop->domains[i])
++			return -EINVAL;
++		ret = devm_add_action_or_reset(dev, a9_aop_put_node, aop->domains[i]);
++		if (ret)
++			return ret;
++		if (of_property_read_string(aop->domains[i], "label", &label) ||
++		    strcmp(label, domain_names[i]))
++			return -EINVAL;
++	}
++	/* Remove debugfs before devres releases the maps and private data. */
++	dir = debugfs_create_dir("apple-a9-aop", NULL);
++	if (IS_ERR(dir))
++		return PTR_ERR(dir);
++	ret = devm_add_action_or_reset(dev, a9_aop_remove_debugfs, dir);
++	if (ret)
++		return ret;
++	debugfs_create_file("status", 0400, dir, aop, &a9_aop_status_fops);
++	debugfs_create_file("preflight", 0400, dir, aop, &a9_aop_preflight_fops);
++	dev_info(dev, "read-only debugfs ready; attach preflight %s; no power consumer\n",
++		 attach ? "enabled" : "disabled");
++	return 0;
++}
++
++static const struct of_device_id a9_aop_match[] = {
++	{ .compatible = "apple,j71t-aop-observer" },
++	{}
++};
++
++static struct platform_driver a9_aop_driver = {
++	.probe = a9_aop_probe,
++	.driver = {
++		.name = "apple-a9-aop",
++		.of_match_table = a9_aop_match,
++		.suppress_bind_attrs = true,
++	},
++};
++builtin_platform_driver(a9_aop_driver);
++
++MODULE_FIRMWARE(AOP_MAIN_FW);
++MODULE_FIRMWARE(AOP_EXT_FW);
++MODULE_DESCRIPTION("Apple J71t AOP read-only bring-up observer");
++MODULE_LICENSE("GPL");
+diff --git a/include/linux/soc/apple/pmgr-observe.h b/include/linux/soc/apple/pmgr-observe.h
+new file mode 100644
+index 0000000000..477b7fa223
+--- /dev/null
++++ b/include/linux/soc/apple/pmgr-observe.h
+@@ -0,0 +1,27 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_SOC_APPLE_PMGR_OBSERVE_H
++#define _LINUX_SOC_APPLE_PMGR_OBSERVE_H
++
++#include <linux/types.h>
++
++struct device_node;
++
++struct apple_pmgr_observation {
++	u32 raw;
++	int genpd_status;
++};
++
++/*
++ * Diagnostic only. Nodes must be in child-before-parent lock order, with no
++ * duplicates (maximum five). Takes no power/runtime-PM reference. read() must
++ * not sleep or acquire genpd locks; it runs with IRQs disabled and all domain
++ * locks held, only if every genpd and hardware actual/target state is ON and
++ * reset/disable/parent-off are clear. Hardware auto-PM remains untouched and is
++ * recorded in raw; locks exclude software transitions, not autonomous gating.
++ * -EHOSTDOWN means read() was skipped.
++ */
++int apple_pmgr_observe(struct device_node **nodes, unsigned int count,
++		       struct apple_pmgr_observation *states,
++		       void (*read)(void *), void *data);
++
++#endif
+-- 
+2.56.0
+

@@ -1,0 +1,39 @@
+From 79aef2ef96040b3e7a32edc35b587d036ba4e231 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 10:29:15 +0000
+Subject: [PATCH 39/55] power: supply: bq27xxx: hide unavailable cached design
+ charge
+
+The cache-only BQ27545 profile does not read design capacity and J71t
+has no monitored-battery design-charge data. Advertising the property
+unconditionally exposes a sysfs file that always returns EINVAL. Remove
+it from the cache property list. The power-supply core can still expose
+it when valid battery_info is supplied; do not invent a capacity or add
+gauge control/data-flash accesses.
+---
+ drivers/power/supply/bq27xxx_battery.c | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/power/supply/bq27xxx_battery.c b/drivers/power/supply/bq27xxx_battery.c
+index 46c595ef1a..239a29294a 100644
+--- a/drivers/power/supply/bq27xxx_battery.c
++++ b/drivers/power/supply/bq27xxx_battery.c
+@@ -785,8 +785,8 @@ static enum power_supply_property bq27545_props[] = {
+ 
+ /*
+  * Cache-only transports use this BQ27545 subset so property requests never
+- * initiate bus transactions. Design charge may be supplied as static board
+- * data through monitored-battery.
++ * initiate bus transactions. The power-supply core exposes design charge
++ * only when valid static monitored-battery data is available.
+  */
+ static const enum power_supply_property bq27545_cache_props[] = {
+ 	POWER_SUPPLY_PROP_STATUS,
+@@ -800,7 +800,6 @@ static const enum power_supply_property bq27545_cache_props[] = {
+ 	POWER_SUPPLY_PROP_TECHNOLOGY,
+ 	POWER_SUPPLY_PROP_CHARGE_NOW,
+ 	POWER_SUPPLY_PROP_CHARGE_FULL,
+-	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
+ 	POWER_SUPPLY_PROP_CYCLE_COUNT,
+ 	POWER_SUPPLY_PROP_POWER_AVG,
+ 	POWER_SUPPLY_PROP_HEALTH,

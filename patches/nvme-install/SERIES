@@ -1,0 +1,11 @@
+# linux-a9 nvme-install kernel series
+# Base: a9/pcie 946c7da17f (HoolockLinux hoolock 6831bc70 + patches/pcie/kernel/0001-0031)
+# Branch: a9/nvme-install, head d67fe465f2, tree /src/wt/nvme-install
+# Config: patches/nvme-install/nvme-install.config (CONFIG_NVME_PCI_WRITE_WINDOW=y)
+#
+# Recreate: git checkout -b a9/nvme-install 946c7da17f && git am patches/nvme-install/kernel/*.patch
+# Integrate (pcie's slot; the branch contains 946c7da17f):
+#   scripts/integrate.sh 64221b189e d67fe465f2 f9910570b7 6ca4db7756 fbe859a481
+#   and add patches/nvme-install/nvme-install.config to FRAGMENTS in scripts/integrate.sh
+# Trial merge of exactly that set: clean (2026-10-22).
+kernel/0001-nvme-pci-Add-a-boot-time-write-window-to-the-read-on.patch

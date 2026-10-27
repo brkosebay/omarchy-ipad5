@@ -1,0 +1,842 @@
+From 5fb5d26012ef16ba1f4c27611852ea6385d34663 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 11:46:07 +0000
+Subject: [PATCH 04/17] ASoC: apple: add S8000 (A9) MCA driver
+
+CPU DAI for the A9 MCA ("mca-version 4"), following iOS 16.7.10's
+AppleAE2MCA::_setIISConfig_v4: reset/flush with bounded polls, sample
+size, TX FIFO watermark, slot masks, TX config and the frame register;
+start sets TX enable then the frame run bit, stop resets TX.
+
+The MCA's MCLK control word is exported as a clock (iOS writes 0x58,
+nclk/2 with output enabled, for the codec's 12 MHz MCLK), and the
+i2s-switch route is applied from DT while the port runs.
+
+iOS moves samples with SmartIO DMA (endpoint 0x28). With "dmas" the
+generic dmaengine PCM is used. Without it a timer-driven PCM keeps the
+stream running so the clocks, codec and amplifiers can be tested, with
+an experimental CPU-fed FIFO mode if a FIFO port is given in DT.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ sound/soc/apple/Kconfig     |  11 +
+ sound/soc/apple/Makefile    |   2 +
+ sound/soc/apple/s8000-mca.c | 778 ++++++++++++++++++++++++++++++++++++
+ 3 files changed, 791 insertions(+)
+ create mode 100644 sound/soc/apple/s8000-mca.c
+
+diff --git a/sound/soc/apple/Kconfig b/sound/soc/apple/Kconfig
+index f1d071a99f..a03470c0fa 100644
+--- a/sound/soc/apple/Kconfig
++++ b/sound/soc/apple/Kconfig
+@@ -9,4 +9,15 @@ config SND_SOC_APPLE_MCA
+ 	  This option enables an ASoC platform driver for MCA peripherals found
+ 	  on Apple Silicon SoCs.
+ 
++config SND_SOC_APPLE_S8000_MCA
++	tristate "Apple S8000 (A9) MCA driver"
++	depends on ARCH_APPLE || COMPILE_TEST
++	depends on COMMON_CLK
++	select MFD_SYSCON
++	select SND_DMAENGINE_PCM
++	select SND_SOC_GENERIC_DMAENGINE_PCM
++	help
++	  ASoC CPU DAI for the "mca-version 4" serializer of the Apple A9
++	  (S8000/S8003), including its MCLK output and i2s-switch route.
++
+ endmenu
+diff --git a/sound/soc/apple/Makefile b/sound/soc/apple/Makefile
+index 252ba5fc18..0058680040 100644
+--- a/sound/soc/apple/Makefile
++++ b/sound/soc/apple/Makefile
+@@ -1,4 +1,6 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ snd-soc-apple-mca-y	:= mca.o
++snd-soc-apple-s8000-mca-y	:= s8000-mca.o
+ 
+ obj-$(CONFIG_SND_SOC_APPLE_MCA)	+= snd-soc-apple-mca.o
++obj-$(CONFIG_SND_SOC_APPLE_S8000_MCA)	+= snd-soc-apple-s8000-mca.o
+diff --git a/sound/soc/apple/s8000-mca.c b/sound/soc/apple/s8000-mca.c
+new file mode 100644
+index 0000000000..89d36a6b9b
+--- /dev/null
++++ b/sound/soc/apple/s8000-mca.c
+@@ -0,0 +1,778 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++/*
++ * Apple S8000/S8003 (A9) MCA, "mca-version 4", as an ASoC CPU DAI.
++ *
++ * Register layout and the programming sequence follow iOS 16.7.10's
++ * AppleAE2MCA::_setIISConfig_v4 (see docs/audio/playback-path.md in
++ * linux-a9). Also handles the two neighbours iOS drives from the MCA
++ * driver: the per-MCA MCLK control word (exported as a clock, the codec's
++ * MCLK) and the i2s-switch route (a syscon; route register values from DT).
++ *
++ * Data path: iOS feeds the MCA through SmartIO DMA (endpoint 0x28 for MCA0
++ * TX). With "dmas"/"dma-names = tx" the generic dmaengine PCM is used, which
++ * needs a cyclic-capable SIO DMA driver. Without it, a timer-driven PCM
++ * keeps the stream running and, if "apple,pio-fifo-offset" names a CPU
++ * writable FIFO port (unverified, see test plan), feeds it from the MCA's
++ * TX-low-water interrupt. Otherwise samples are discarded: the clocks, the
++ * codec and the speakers still run, which is what the first device test
++ * needs.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/clk-provider.h>
++#include <linux/debugfs.h>
++#include <linux/delay.h>
++#include <linux/hrtimer.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/mfd/syscon.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/regmap.h>
++#include <linux/seq_file.h>
++#include <linux/slab.h>
++#include <sound/dmaengine_pcm.h>
++#include <sound/pcm.h>
++#include <sound/pcm_params.h>
++#include <sound/soc.h>
++
++#define MCA_VERSION		0x00
++#define MCA_FIFO_SIZE		0x04
++#define  MCA_FIFO_SIZE_TX	GENMASK(9, 0)
++#define  MCA_FIFO_SIZE_RX	GENMASK(25, 16)
++#define MCA_SAMPLE		0x08
++#define MCA_RESET		0x0c
++#define  MCA_RESET_TX		BIT(0)
++#define  MCA_RESET_RX		BIT(1)
++#define MCA_FRAME		0x10
++#define  MCA_FRAME_MASTER	BIT(0)
++#define  MCA_FRAME_RUN		BIT(1)
++#define  MCA_FRAME_FMT		BIT(3)	/* set unless format flag bit 1 */
++#define  MCA_FRAME_DUTY		BIT(6)
++#define  MCA_FRAME_MCLK_DIV	GENMASK(11, 8)
++#define  MCA_FRAME_SLOTS	GENMASK(15, 12)
++#define  MCA_FRAME_WIDTH	GENMASK(23, 20)
++#define  MCA_FRAME_HALF		GENMASK(31, 24)
++#define MCA_PAD			0x14
++#define MCA_IRQ_STATUS		0x1c
++#define MCA_IRQ_MASK		0x20
++#define  MCA_IRQ_TX_UNDERFLOW	BIT(0)
++#define  MCA_IRQ_TX_OVERFLOW	BIT(1)
++#define  MCA_IRQ_TX_LOW_WATER	BIT(2)
++#define  MCA_IRQ_RX_UNDERFLOW	BIT(3)
++#define  MCA_IRQ_RX_OVERFLOW	BIT(4)
++#define  MCA_IRQ_RX_HIGH_WATER	BIT(5)
++#define  MCA_IRQ_FRAME_ERROR	BIT(6)
++#define  MCA_IRQ_BCLK		BIT(7)
++#define  MCA_IRQ_NO_BCLK	BIT(8)
++#define  MCA_IRQ_FSYNC		BIT(9)
++#define  MCA_IRQ_NO_FSYNC	BIT(10)
++#define  MCA_IRQ_SHORT_FSYNC	BIT(11)
++#define  MCA_IRQ_RATE		BIT(12)
++#define  MCA_IRQ_ALL		GENMASK(12, 0)
++#define  MCA_IRQ_ERRORS		(MCA_IRQ_TX_UNDERFLOW | MCA_IRQ_TX_OVERFLOW | \
++				 MCA_IRQ_RX_UNDERFLOW | MCA_IRQ_RX_OVERFLOW | \
++				 MCA_IRQ_FRAME_ERROR)
++#define  MCA_IRQ_MASK_IOS	0x1fe4	/* iOS v4, no frame-error override */
++#define MCA_FLUSH		0x24
++#define MCA_TX_CFG		0x60
++#define MCA_TX_FIFO_CFG		0x64
++#define MCA_TX_SLOTS		0x68
++#define MCA_TX_SLOTS_HI		0x6c
++#define MCA_RX_CFG		0x80
++#define MCA_RX_FIFO_CFG		0x84
++#define MCA_RX_SLOTS		0x88
++#define MCA_RX_SLOTS_HI		0x8c
++#define  MCA_XX_CFG_EN		BIT(0)
++
++#define MCA_POLL_US		10
++#define MCA_TIMEOUT_US		10000
++
++/* i2s-switch v3 reset values (AppleAE2I2SSwitch3 +0x580) */
++#define I2S_SW_NODE_DEFAULT	0x00181818
++#define I2S_SW_DSPC_DEFAULT	0x18
++#define I2S_SW_DSPC_OFFSET	0x38
++
++#define MCA_RATES	(SNDRV_PCM_RATE_8000 | SNDRV_PCM_RATE_11025 | \
++			 SNDRV_PCM_RATE_16000 | SNDRV_PCM_RATE_22050 | \
++			 SNDRV_PCM_RATE_32000 | SNDRV_PCM_RATE_44100 | \
++			 SNDRV_PCM_RATE_48000)
++#define MCA_FORMATS	(SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S32_LE)
++
++struct s8000_mca {
++	struct device *dev;
++	void __iomem *base;
++	void __iomem *mclk_reg;
++	struct regmap *sw;
++	u32 *sw_route;		/* offset, value pairs */
++	unsigned int sw_route_len;
++
++	struct clk_hw mclk_hw;
++	u32 mclk_ctl;
++	u32 mclk_rate;
++
++	u32 fifo_tx;
++	bool use_dma;
++	struct snd_dmaengine_dai_dma_data dma_tx;
++
++	/* computed in hw_params, written in prepare */
++	u32 sample, frame, tx_cfg, tx_fifo_cfg, tx_slots;
++
++	/* timer/PIO PCM */
++	spinlock_t lock;
++	struct snd_pcm_substream *substream;
++	struct hrtimer timer;
++	ktime_t period;
++	snd_pcm_uframes_t pos;
++	unsigned int pio_off;	/* 0 = no CPU FIFO port */
++	unsigned int pio_burst;
++	bool running;
++	bool warned_null;
++
++	unsigned long irq_count, err_count;
++	u32 last_status;
++	u32 irq_mask;		/* current MCA_IRQ_MASK value */
++};
++
++static inline void mca_write(struct s8000_mca *mca, u32 off, u32 val)
++{
++	writel_relaxed(val, mca->base + off);
++}
++
++static inline u32 mca_read(struct s8000_mca *mca, u32 off)
++{
++	return readl_relaxed(mca->base + off);
++}
++
++/* --- MCLK control word as a clock ----------------------------------------- */
++
++static struct s8000_mca *hw_to_mca(struct clk_hw *hw)
++{
++	return container_of(hw, struct s8000_mca, mclk_hw);
++}
++
++static int mca_mclk_prepare(struct clk_hw *hw)
++{
++	return pm_runtime_resume_and_get(hw_to_mca(hw)->dev);
++}
++
++static void mca_mclk_unprepare(struct clk_hw *hw)
++{
++	pm_runtime_put(hw_to_mca(hw)->dev);
++}
++
++static int mca_mclk_enable(struct clk_hw *hw)
++{
++	struct s8000_mca *mca = hw_to_mca(hw);
++
++	/* AppleAE2MCA _getMCLKClkCon: nclk/2 (0x18) | output enable (0x40) */
++	writel(mca->mclk_ctl, mca->mclk_reg);
++	return 0;
++}
++
++static void mca_mclk_disable(struct clk_hw *hw)
++{
++	writel(0, hw_to_mca(hw)->mclk_reg);
++}
++
++static unsigned long mca_mclk_recalc_rate(struct clk_hw *hw,
++					  unsigned long parent_rate)
++{
++	return hw_to_mca(hw)->mclk_rate;
++}
++
++static const struct clk_ops mca_mclk_ops = {
++	.prepare = mca_mclk_prepare,
++	.unprepare = mca_mclk_unprepare,
++	.enable = mca_mclk_enable,
++	.disable = mca_mclk_disable,
++	.recalc_rate = mca_mclk_recalc_rate,
++};
++
++/* --- i2s-switch ---------------------------------------------------------- */
++
++static void mca_route(struct s8000_mca *mca, bool on)
++{
++	unsigned int i;
++
++	if (!mca->sw)
++		return;
++
++	for (i = 0; i + 1 < mca->sw_route_len; i += 2) {
++		u32 off = mca->sw_route[i], val = mca->sw_route[i + 1];
++
++		if (!on)
++			val = off < I2S_SW_DSPC_OFFSET ? I2S_SW_NODE_DEFAULT :
++			      off == I2S_SW_DSPC_OFFSET ? I2S_SW_DSPC_DEFAULT : 0;
++		regmap_write(mca->sw, off, val);
++	}
++}
++
++/* --- DAI ------------------------------------------------------------------ */
++
++static int mca_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
++{
++	/* iOS runs MCA0 as the clock consumer of the CS42L81. */
++	if ((fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) != SND_SOC_DAIFMT_BC_FC)
++		return -EINVAL;
++	if ((fmt & SND_SOC_DAIFMT_FORMAT_MASK) != SND_SOC_DAIFMT_I2S)
++		return -EINVAL;
++	if ((fmt & SND_SOC_DAIFMT_INV_MASK) != SND_SOC_DAIFMT_NB_NF)
++		return -EINVAL;
++	return 0;
++}
++
++/* AppleAE2MCA::_getFIFODepth, TX direction */
++static u32 mca_tx_depth(struct s8000_mca *mca, unsigned int rate,
++			unsigned int channels)
++{
++	u32 per_ms = round_up(rate * channels / 2000, 4);
++	u32 min = (channels * 2 + 3) & 0x3fc;
++	u32 depth;
++
++	if (per_ms < min)
++		depth = min;
++	else
++		depth = min_t(u32, per_ms, mca->fifo_tx - 3);
++
++	depth &= ~3;
++	return max_t(u32, depth, 4);
++}
++
++static int mca_hw_params(struct snd_pcm_substream *substream,
++			 struct snd_pcm_hw_params *params,
++			 struct snd_soc_dai *dai)
++{
++	struct s8000_mca *mca = snd_soc_dai_get_drvdata(dai);
++	unsigned int bits = params_width(params);
++	unsigned int slot = params_physical_width(params);
++	unsigned int channels = params_channels(params);
++	unsigned int slots = 2, frame_bits = slot * slots, depth;
++	u32 width_code;
++
++	if (channels != 2)
++		return -EINVAL;
++
++	switch (slot) {
++	case 16: width_code = 1; break;
++	case 32: width_code = 4; break;
++	default: return -EINVAL;
++	}
++
++	/* _setIISConfig_v4 for: consumer, MCLK out, I2S, 2 slots */
++	mca->sample = (32 - bits) << 8 | (32 - bits);
++	depth = mca_tx_depth(mca, params_rate(params), channels);
++	mca->tx_fifo_cfg = depth | (depth - 1) << 16;
++	mca->tx_slots = GENMASK(slots - 1, 0);
++	/* bits 15:8 = data delay (1, I2S); 0x33 base; 0x4 for format 0 */
++	mca->tx_cfg = 1 << 8 | 0x33 | 0x4;
++	mca->frame = FIELD_PREP(MCA_FRAME_HALF, frame_bits / 2 - 1) |
++		     FIELD_PREP(MCA_FRAME_WIDTH, width_code) |
++		     FIELD_PREP(MCA_FRAME_SLOTS, slots - 1) |
++		     FIELD_PREP(MCA_FRAME_MCLK_DIV, 0) |
++		     MCA_FRAME_DUTY | MCA_FRAME_FMT;
++
++	mca->dma_tx.addr_width = slot == 16 ? DMA_SLAVE_BUSWIDTH_2_BYTES :
++					      DMA_SLAVE_BUSWIDTH_4_BYTES;
++	mca->dma_tx.maxburst = depth;
++
++	dev_dbg(mca->dev, "sample %#x frame %#x txcfg %#x txfifo %#x\n",
++		mca->sample, mca->frame, mca->tx_cfg, mca->tx_fifo_cfg);
++	return 0;
++}
++
++static int mca_prepare(struct snd_pcm_substream *substream,
++		       struct snd_soc_dai *dai)
++{
++	struct s8000_mca *mca = snd_soc_dai_get_drvdata(dai);
++	u32 val, mask = MCA_IRQ_MASK_IOS;
++	int ret;
++
++	mca->irq_mask = MCA_IRQ_ALL;
++	mca_write(mca, MCA_RESET, MCA_RESET_TX | MCA_RESET_RX);
++	ret = readl_relaxed_poll_timeout(mca->base + MCA_RESET, val,
++					 !(val & (MCA_RESET_TX | MCA_RESET_RX)),
++					 MCA_POLL_US, MCA_TIMEOUT_US);
++	if (ret) {
++		dev_err(mca->dev, "reset timed out (%#x)\n", val);
++		return ret;
++	}
++
++	mca_write(mca, MCA_FLUSH, 1);
++	ret = readl_relaxed_poll_timeout(mca->base + MCA_FLUSH, val, !(val & 1),
++					 MCA_POLL_US, MCA_TIMEOUT_US);
++	if (ret) {
++		dev_err(mca->dev, "flush timed out (%#x)\n", val);
++		return ret;
++	}
++
++	mca_write(mca, MCA_IRQ_MASK, MCA_IRQ_ALL);
++	mca_write(mca, MCA_IRQ_STATUS, MCA_IRQ_ALL);
++	mca_write(mca, MCA_SAMPLE, mca->sample);
++	mca_write(mca, MCA_TX_FIFO_CFG, mca->tx_fifo_cfg);
++	mca_write(mca, MCA_RX_FIFO_CFG, 0x00030004);
++	mca_write(mca, MCA_PAD, 0);
++	mca_write(mca, MCA_TX_SLOTS, mca->tx_slots);
++	mca_write(mca, MCA_TX_SLOTS_HI, 0);
++	mca_write(mca, MCA_RX_SLOTS, mca->tx_slots);
++	mca_write(mca, MCA_RX_SLOTS_HI, 0);
++	mca_write(mca, MCA_TX_CFG, mca->tx_cfg & ~MCA_XX_CFG_EN);
++	mca_write(mca, MCA_RX_CFG, 0x133 & ~MCA_XX_CFG_EN);
++	if (mca->pio_off)
++		mask &= ~MCA_IRQ_TX_LOW_WATER;
++	mca->irq_mask = mask;
++	mca_write(mca, MCA_IRQ_MASK, mask);
++	mca_write(mca, MCA_FRAME, mca->frame);
++
++	mca_route(mca, true);
++	return 0;
++}
++
++static int mca_hw_free(struct snd_pcm_substream *substream,
++		       struct snd_soc_dai *dai)
++{
++	struct s8000_mca *mca = snd_soc_dai_get_drvdata(dai);
++
++	mca_write(mca, MCA_FRAME, 0);
++	mca_route(mca, false);
++	return 0;
++}
++
++static int mca_trigger(struct snd_pcm_substream *substream, int cmd,
++		       struct snd_soc_dai *dai)
++{
++	struct s8000_mca *mca = snd_soc_dai_get_drvdata(dai);
++	u32 val;
++
++	switch (cmd) {
++	case SNDRV_PCM_TRIGGER_START:
++	case SNDRV_PCM_TRIGGER_RESUME:
++	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
++		mca_write(mca, MCA_IRQ_STATUS, MCA_IRQ_ALL);
++		if (mca->pio_off) {
++			mca->irq_mask &= ~MCA_IRQ_TX_LOW_WATER;
++			mca_write(mca, MCA_IRQ_MASK, mca->irq_mask);
++		}
++		mca_write(mca, MCA_TX_CFG, mca->tx_cfg | MCA_XX_CFG_EN);
++		mca_write(mca, MCA_FRAME, mca->frame | MCA_FRAME_RUN);
++		return 0;
++	case SNDRV_PCM_TRIGGER_STOP:
++	case SNDRV_PCM_TRIGGER_SUSPEND:
++	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
++		/* an empty FIFO would keep TX low-water firing until prepare */
++		mca->irq_mask |= MCA_IRQ_TX_LOW_WATER;
++		mca_write(mca, MCA_IRQ_MASK, mca->irq_mask);
++		mca_write(mca, MCA_TX_CFG, 0);
++		mca_write(mca, MCA_FRAME, mca->frame);
++		mca_write(mca, MCA_RESET, MCA_RESET_TX);
++		if (readl_relaxed_poll_timeout_atomic(mca->base + MCA_RESET, val,
++						      !(val & MCA_RESET_TX), 1,
++						      1000))
++			dev_warn(mca->dev, "TX reset timed out\n");
++		return 0;
++	}
++
++	return -EINVAL;
++}
++
++static int mca_dai_probe(struct snd_soc_dai *dai)
++{
++	struct s8000_mca *mca = snd_soc_dai_get_drvdata(dai);
++
++	snd_soc_dai_init_dma_data(dai, &mca->dma_tx, NULL);
++	return 0;
++}
++
++static const struct snd_soc_dai_ops mca_dai_ops = {
++	.probe = mca_dai_probe,
++	.set_fmt = mca_set_fmt,
++	.hw_params = mca_hw_params,
++	.prepare = mca_prepare,
++	.hw_free = mca_hw_free,
++	.trigger = mca_trigger,
++};
++
++static struct snd_soc_dai_driver mca_dai = {
++	.name = "s8000-mca",
++	.playback = {
++		.stream_name = "Playback",
++		.channels_min = 2,
++		.channels_max = 2,
++		.rates = MCA_RATES,
++		.formats = MCA_FORMATS,
++	},
++	.ops = &mca_dai_ops,
++};
++
++/* --- timer / PIO PCM (no SIO DMA) ----------------------------------------- */
++
++static const struct snd_pcm_hardware mca_pcm_hw = {
++	.info = SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_MMAP |
++		SNDRV_PCM_INFO_MMAP_VALID | SNDRV_PCM_INFO_BLOCK_TRANSFER,
++	.formats = MCA_FORMATS,
++	.rates = MCA_RATES,
++	.rate_min = 8000,
++	.rate_max = 48000,
++	.channels_min = 2,
++	.channels_max = 2,
++	.buffer_bytes_max = 512 * 1024,
++	.period_bytes_min = 256,
++	.period_bytes_max = 64 * 1024,
++	.periods_min = 2,
++	.periods_max = 128,
++};
++
++/* Called with mca->lock held; returns true when a period boundary passed. */
++static bool mca_pio_fill(struct s8000_mca *mca)
++{
++	struct snd_pcm_runtime *rt = mca->substream->runtime;
++	unsigned int ch = rt->channels, n = mca->pio_burst / ch, i, c;
++	snd_pcm_uframes_t old = mca->pos;
++
++	for (i = 0; i < n; i++) {
++		void *frame = rt->dma_area + frames_to_bytes(rt, mca->pos);
++
++		for (c = 0; c < ch; c++) {
++			u32 s;
++
++			if (rt->sample_bits == 16)
++				s = (u16)((s16 *)frame)[c];
++			else
++				s = ((u32 *)frame)[c];
++			writel_relaxed(s, mca->base + mca->pio_off);
++		}
++		if (++mca->pos >= rt->buffer_size)
++			mca->pos = 0;
++	}
++
++	return old / rt->period_size != mca->pos / rt->period_size;
++}
++
++static enum hrtimer_restart mca_timer_fn(struct hrtimer *t)
++{
++	struct s8000_mca *mca = container_of(t, struct s8000_mca, timer);
++	struct snd_pcm_substream *ss;
++	unsigned long flags;
++
++	spin_lock_irqsave(&mca->lock, flags);
++	ss = mca->running ? mca->substream : NULL;
++	if (ss) {
++		mca->pos += ss->runtime->period_size;
++		if (mca->pos >= ss->runtime->buffer_size)
++			mca->pos -= ss->runtime->buffer_size;
++	}
++	spin_unlock_irqrestore(&mca->lock, flags);
++
++	if (!ss)
++		return HRTIMER_NORESTART;
++
++	snd_pcm_period_elapsed(ss);
++	hrtimer_forward_now(t, mca->period);
++	return HRTIMER_RESTART;
++}
++
++static int mca_pcm_open(struct snd_soc_component *component,
++			struct snd_pcm_substream *substream)
++{
++	struct s8000_mca *mca = snd_soc_component_get_drvdata(component);
++
++	snd_soc_set_runtime_hwparams(substream, &mca_pcm_hw);
++	mca->substream = substream;
++
++	if (!mca->pio_off && !mca->warned_null) {
++		dev_warn(mca->dev,
++			 "no SIO DMA and no PIO FIFO port: samples are discarded (clocks and codec still run)\n");
++		mca->warned_null = true;
++	}
++	return 0;
++}
++
++static int mca_pcm_close(struct snd_soc_component *component,
++			 struct snd_pcm_substream *substream)
++{
++	struct s8000_mca *mca = snd_soc_component_get_drvdata(component);
++
++	hrtimer_cancel(&mca->timer);
++	mca->substream = NULL;
++	return 0;
++}
++
++static int mca_pcm_prepare(struct snd_soc_component *component,
++			   struct snd_pcm_substream *substream)
++{
++	struct s8000_mca *mca = snd_soc_component_get_drvdata(component);
++	struct snd_pcm_runtime *rt = substream->runtime;
++
++	mca->pos = 0;
++	mca->period = ns_to_ktime(div_u64((u64)rt->period_size * NSEC_PER_SEC,
++					  rt->rate));
++	return 0;
++}
++
++static int mca_pcm_trigger(struct snd_soc_component *component,
++			   struct snd_pcm_substream *substream, int cmd)
++{
++	struct s8000_mca *mca = snd_soc_component_get_drvdata(component);
++	unsigned long flags;
++
++	switch (cmd) {
++	case SNDRV_PCM_TRIGGER_START:
++	case SNDRV_PCM_TRIGGER_RESUME:
++	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
++		spin_lock_irqsave(&mca->lock, flags);
++		mca->running = true;
++		spin_unlock_irqrestore(&mca->lock, flags);
++		if (!mca->pio_off)
++			hrtimer_start(&mca->timer, mca->period,
++				      HRTIMER_MODE_REL_SOFT);
++		return 0;
++	case SNDRV_PCM_TRIGGER_STOP:
++	case SNDRV_PCM_TRIGGER_SUSPEND:
++	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
++		spin_lock_irqsave(&mca->lock, flags);
++		mca->running = false;
++		spin_unlock_irqrestore(&mca->lock, flags);
++		hrtimer_try_to_cancel(&mca->timer);
++		return 0;
++	}
++
++	return -EINVAL;
++}
++
++static snd_pcm_uframes_t mca_pcm_pointer(struct snd_soc_component *component,
++					 struct snd_pcm_substream *substream)
++{
++	struct s8000_mca *mca = snd_soc_component_get_drvdata(component);
++
++	return READ_ONCE(mca->pos);
++}
++
++static int mca_pcm_new(struct snd_soc_component *component,
++			     struct snd_soc_pcm_runtime *rtd)
++{
++	snd_pcm_set_managed_buffer_all(rtd->pcm, SNDRV_DMA_TYPE_VMALLOC, NULL,
++				       0, 0);
++	return 0;
++}
++
++static const struct snd_soc_component_driver mca_component_pio = {
++	.name = "s8000-mca",
++	.open = mca_pcm_open,
++	.close = mca_pcm_close,
++	.prepare = mca_pcm_prepare,
++	.trigger = mca_pcm_trigger,
++	.pointer = mca_pcm_pointer,
++	.pcm_new = mca_pcm_new,
++	.legacy_dai_naming = 1,
++};
++
++static const struct snd_soc_component_driver mca_component_dma = {
++	.name = "s8000-mca",
++	.legacy_dai_naming = 1,
++};
++
++static const struct snd_dmaengine_pcm_config mca_dma_config = {
++	.prepare_slave_config = snd_dmaengine_pcm_prepare_slave_config,
++	.pcm_hardware = &mca_pcm_hw,
++	.prealloc_buffer_size = 512 * 1024,
++};
++
++/* --- IRQ ------------------------------------------------------------------ */
++
++static irqreturn_t mca_irq(int irq, void *data)
++{
++	struct s8000_mca *mca = data;
++	struct snd_pcm_substream *elapsed = NULL;
++	u32 status = mca_read(mca, MCA_IRQ_STATUS) & ~mca->irq_mask;
++
++	if (!status)
++		return IRQ_NONE;
++
++	mca_write(mca, MCA_IRQ_STATUS, status);
++	mca->irq_count++;
++	mca->last_status = status;
++
++	if (status & MCA_IRQ_ERRORS) {
++		/*
++		 * Error bits re-latch every frame while the condition lasts
++		 * (e.g. TX underflow without a data path): count once, mask
++		 * them until the next prepare instead of storming.
++		 */
++		mca->err_count++;
++		mca->irq_mask |= status & MCA_IRQ_ERRORS;
++		mca_write(mca, MCA_IRQ_MASK, mca->irq_mask);
++		dev_dbg_ratelimited(mca->dev, "irq status %#x, masked\n", status);
++	}
++
++	if ((status & MCA_IRQ_TX_LOW_WATER) && mca->pio_off) {
++		spin_lock(&mca->lock);
++		if (mca->running && mca->substream && mca_pio_fill(mca))
++			elapsed = mca->substream;
++		spin_unlock(&mca->lock);
++	}
++
++	/* outside mca->lock: period_elapsed takes the stream lock */
++	if (elapsed)
++		snd_pcm_period_elapsed(elapsed);
++
++	return IRQ_HANDLED;
++}
++
++/* --- debugfs: register snapshot for the device test ----------------------- */
++
++static int mca_regs_show(struct seq_file *s, void *unused)
++{
++	struct s8000_mca *mca = dev_get_drvdata(s->private);
++	unsigned int off, val;
++	int ret;
++
++	ret = pm_runtime_resume_and_get(mca->dev);
++	if (ret)
++		return ret;
++
++	for (off = 0; off < 0x100; off += 4)
++		seq_printf(s, "mca+%#05x = %#010x\n", off, mca_read(mca, off));
++	seq_printf(s, "mclk     = %#010x\n", readl(mca->mclk_reg));
++	if (mca->sw) {
++		for (off = 0; off < 0x50; off += 4) {
++			regmap_read(mca->sw, off, &val);
++			seq_printf(s, "sw+%#04x  = %#010x\n", off, val);
++		}
++	}
++	seq_printf(s, "irqs %lu errors %lu last status %#x\n",
++		   mca->irq_count, mca->err_count, mca->last_status);
++
++	pm_runtime_put(mca->dev);
++	return 0;
++}
++
++/* --- probe ---------------------------------------------------------------- */
++
++static int s8000_mca_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct device_node *np = dev->of_node;
++	struct clk_init_data init = {};
++	const char *clk_name = "mca-mclk";
++	struct s8000_mca *mca;
++	u32 ver, fifo;
++	int irq, ret, n;
++
++	mca = devm_kzalloc(dev, sizeof(*mca), GFP_KERNEL);
++	if (!mca)
++		return -ENOMEM;
++	mca->dev = dev;
++	spin_lock_init(&mca->lock);
++	platform_set_drvdata(pdev, mca);
++
++	mca->base = devm_platform_ioremap_resource_byname(pdev, "mca");
++	if (IS_ERR(mca->base))
++		return PTR_ERR(mca->base);
++	mca->mclk_reg = devm_platform_ioremap_resource_byname(pdev, "mclk");
++	if (IS_ERR(mca->mclk_reg))
++		return PTR_ERR(mca->mclk_reg);
++
++	mca->sw = syscon_regmap_lookup_by_phandle_optional(np, "apple,i2s-switch");
++	if (IS_ERR(mca->sw))
++		return dev_err_probe(dev, PTR_ERR(mca->sw), "no i2s-switch\n");
++	n = of_property_count_u32_elems(np, "apple,i2s-switch-route");
++	if (mca->sw && n > 0) {
++		mca->sw_route = devm_kcalloc(dev, n, sizeof(u32), GFP_KERNEL);
++		if (!mca->sw_route)
++			return -ENOMEM;
++		of_property_read_u32_array(np, "apple,i2s-switch-route",
++					   mca->sw_route, n);
++		mca->sw_route_len = n;
++	}
++
++	mca->mclk_ctl = 0x58;
++	of_property_read_u32(np, "apple,mclk-control", &mca->mclk_ctl);
++	mca->mclk_rate = 12000000;
++	of_property_read_u32(np, "apple,mclk-frequency", &mca->mclk_rate);
++	of_property_read_u32(np, "apple,pio-fifo-offset", &mca->pio_off);
++	mca->pio_burst = 32;
++	of_property_read_u32(np, "apple,pio-burst", &mca->pio_burst);
++	if (mca->pio_off >= 0x4000 || (mca->pio_off & 3))
++		return dev_err_probe(dev, -EINVAL, "bad apple,pio-fifo-offset\n");
++
++	mca->irq_mask = MCA_IRQ_ALL;
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0)
++		return irq;
++	ret = devm_request_irq(dev, irq, mca_irq, 0, dev_name(dev), mca);
++	if (ret)
++		return ret;
++
++	hrtimer_setup(&mca->timer, mca_timer_fn, CLOCK_MONOTONIC,
++		      HRTIMER_MODE_REL_SOFT);
++
++	ret = devm_pm_runtime_enable(dev);
++	if (ret)
++		return ret;
++
++	ret = pm_runtime_resume_and_get(dev);
++	if (ret)
++		return dev_err_probe(dev, ret, "power up failed\n");
++	ver = mca_read(mca, MCA_VERSION);
++	fifo = mca_read(mca, MCA_FIFO_SIZE);
++	pm_runtime_put(dev);
++
++	mca->fifo_tx = FIELD_GET(MCA_FIFO_SIZE_TX, fifo);
++	dev_info(dev, "MCA version %u, FIFO tx %u rx %u%s\n", ver, mca->fifo_tx,
++		 (u32)FIELD_GET(MCA_FIFO_SIZE_RX, fifo),
++		 mca->pio_off ? ", PIO" : "");
++	if (ver != 4 || mca->fifo_tx != 0x40)
++		dev_warn(dev, "expected version 4 / FIFO 0x40 (iOS)\n");
++	if (mca->fifo_tx < 8)
++		mca->fifo_tx = 0x40;
++
++	/* MCLK control word -> codec MCLK */
++	of_property_read_string(np, "clock-output-names", &clk_name);
++	init.name = clk_name;
++	init.ops = &mca_mclk_ops;
++	mca->mclk_hw.init = &init;
++	ret = devm_clk_hw_register(dev, &mca->mclk_hw);
++	if (ret)
++		return ret;
++	ret = devm_of_clk_add_hw_provider(dev, of_clk_hw_simple_get, &mca->mclk_hw);
++	if (ret)
++		return ret;
++
++	mca->use_dma = of_property_present(np, "dmas");
++	ret = devm_snd_soc_register_component(dev, mca->use_dma ?
++					      &mca_component_dma :
++					      &mca_component_pio,
++					      &mca_dai, 1);
++	if (ret)
++		return ret;
++
++	if (mca->use_dma) {
++		ret = devm_snd_dmaengine_pcm_register(dev, &mca_dma_config, 0);
++		if (ret)
++			return dev_err_probe(dev, ret, "dmaengine PCM failed\n");
++	}
++
++	debugfs_create_devm_seqfile(dev, "s8000-mca-regs", NULL, mca_regs_show);
++	return 0;
++}
++
++static const struct of_device_id s8000_mca_of_match[] = {
++	{ .compatible = "apple,s8000-mca" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, s8000_mca_of_match);
++
++static struct platform_driver s8000_mca_driver = {
++	.driver = {
++		.name = "s8000-mca",
++		.of_match_table = s8000_mca_of_match,
++	},
++	.probe = s8000_mca_probe,
++};
++module_platform_driver(s8000_mca_driver);
++
++MODULE_DESCRIPTION("Apple S8000 (A9) MCA I2S driver");
++MODULE_LICENSE("Dual MIT/GPL");

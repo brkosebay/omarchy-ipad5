@@ -1,0 +1,77 @@
+From 6b8742d1cbc80ef3e0f3edc35d058104801f06bd Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 12:29:30 +0000
+Subject: [PATCH 13/17] arm64: dts: apple: j71t: add SmartIO and wire MCA0 TX
+ DMA
+
+Add the SIO power state (PMGR device index 12, 0x80160, after SIO_BUSIF
+and SIO_P), the SmartIO node (ADT /arm-io/sio, interrupts in ADT order,
+firmware apple/s8000-smartio.bin) and point MCA0 at endpoint 0x28 with
+the shim words from its ADT dma-channels.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ .../boot/dts/apple/s8003-j71t-audio.dtsi      | 42 +++++++++++++++++--
+ 1 file changed, 38 insertions(+), 4 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/apple/s8003-j71t-audio.dtsi b/arch/arm64/boot/dts/apple/s8003-j71t-audio.dtsi
+index 2a06f6c701..f4c2d76e16 100644
+--- a/arch/arm64/boot/dts/apple/s8003-j71t-audio.dtsi
++++ b/arch/arm64/boot/dts/apple/s8003-j71t-audio.dtsi
+@@ -33,7 +33,41 @@ j71t_codec_dai: simple-audio-card,codec {
+ 	};
+ };
+ 
++/*
++ * SmartIO coprocessor domain: PMGR device "SIO" is index 12 in the ADT, next
++ * to SIO_BUSIF (10, 0x80150) and SIO_P (11, 0x80158) -> 0x80160 (inferred).
++ */
++&pmgr {
++	ps_sio: power-controller@80160 {
++		compatible = "apple,s8000-pmgr-pwrstate", "apple,pmgr-pwrstate";
++		reg = <0x80160 4>;
++		#power-domain-cells = <0>;
++		#reset-cells = <0>;
++		label = "sio";
++		power-domains = <&ps_sio_p>;
++	};
++};
++
+ &{/soc} {
++	/* ADT /arm-io/sio: iop,s8000, iop-version 1 (AppleA7IOPV1) */
++	sio: dma-controller@20ae00000 {
++		compatible = "apple,s8000-sio";
++		reg = <0x2 0x0ae00000 0x0 0x10000>,
++		      <0x2 0x0a000000 0x0 0x2000>;
++		reg-names = "a7iop", "shim";
++		interrupt-parent = <&aic>;
++		/* ADT order; the driver takes index 2 (187) as the RX mailbox */
++		interrupts = <AIC_IRQ 185 IRQ_TYPE_LEVEL_HIGH>,
++			     <AIC_IRQ 184 IRQ_TYPE_LEVEL_HIGH>,
++			     <AIC_IRQ 187 IRQ_TYPE_LEVEL_HIGH>,
++			     <AIC_IRQ 186 IRQ_TYPE_LEVEL_HIGH>;
++		power-domains = <&ps_sio>;
++		resets = <&ps_sio>;
++		firmware-name = "apple/s8000-smartio.bin";
++		dma-channels = <64>;
++		#dma-cells = <1>;
++	};
++
+ 	i2s_switch: syscon@20a003000 {
+ 		compatible = "apple,s8000-i2s-switch", "syscon";
+ 		reg = <0x2 0x0a003000 0x0 0x1000>;
+@@ -62,10 +96,10 @@ mca0: mca@20a0a0000 {
+ 		apple,i2s-switch-route = <0x00 0x00000018>,
+ 					 <0x14 0x00080808>,
+ 					 <0x3c 0x00000010>;
+-		/* SIO DMA endpoint 0x28 (TX, ADT dma-channels[0]) once SIO lands:
+-		 * dmas = <&sio 0x28>;
+-		 * dma-names = "tx";
+-		 */
++		/* SmartIO MCA0_TX, ADT dma-channels: 0x28 {0x21|0x22, 0, 0x300, 0x180} */
++		dmas = <&sio 0x28>;
++		dma-names = "tx";
++		apple,sio-dma-config = <0x21 0x22 0 0x300 0x180>;
+ 	};
+ 
+ 	j71t_spi1: spi@20a084000 {

@@ -1,0 +1,319 @@
+From fbe859a481643821764ce4b09b727fe387d29531 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 13:25:12 +0000
+Subject: [PATCH 16/17] ASoC: apple: s8000-mca: fix IRQ storm on idle power-up,
+ gate debugfs MMIO
+
+A debugfs register dump at idle hard-locked CPU0 (integ10): the dump
+powered MCA0 up from a real power-off, the block came up with causes
+pending, and the handler kept returning IRQ_HANDLED. IRQ_STATUS bit 31
+reads as set while a cause is pending (seen as 0x80000008), and
+"status & ~irq_mask" let it through because irq_mask only covers bits
+12:0. The storm starved the timer, so the watchdog fired with CPU0 still
+answering backtrace IPIs at a register-only instruction.
+
+- Handler: only bits 12:0 are causes, as in iOS (status & 0x1fff,
+  "spurious intr"). A spurious entry re-syncs the hardware mask and
+  returns IRQ_NONE, so the kernel's spurious-IRQ guard bounds any rest.
+- Runtime PM: resume masks and clears every cause before the IRQ is
+  enabled. Suspend disables the IRQ synchronously before power-off, so
+  the handler never reads a gated block. hw_free re-masks everything.
+- debugfs s8000-mca-regs never changes the power state: it reads MCA
+  registers only while the device is already runtime active and
+  otherwise prints the software state. The MCLK word and i2s-switch
+  (power domain unknown) are read back only while the driver has them
+  programmed. s8000-mca-mclk reads report the cached word, with no MMIO.
+- Writing the mclk_ctl/route parameters does no MMIO; they apply at the
+  next prepare or clock enable, with the device active.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ sound/soc/apple/s8000-mca.c | 142 ++++++++++++++++++++++++++++++------
+ 1 file changed, 118 insertions(+), 24 deletions(-)
+
+diff --git a/sound/soc/apple/s8000-mca.c b/sound/soc/apple/s8000-mca.c
+index c596277555..31075b25df 100644
+--- a/sound/soc/apple/s8000-mca.c
++++ b/sound/soc/apple/s8000-mca.c
+@@ -30,6 +30,7 @@
+ #include <linux/kstrtox.h>
+ #include <linux/mfd/syscon.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+@@ -150,10 +151,15 @@ struct s8000_mca {
+ 	bool running;
+ 	bool warned_null;
+ 
+-	unsigned long irq_count, err_count;
++	int irq;
++	unsigned long irq_count, err_count, spurious_count;
+ 	u32 last_status;
+ 	u32 irq_mask;		/* current MCA_IRQ_MASK value */
++	u32 mclk_cur;		/* last MCLK word written (0 = off) */
++	bool mclk_on;		/* MCLK clock enabled: word written */
++	bool route_on;		/* i2s-switch route applied */
+ 	bool mclk_forced;	/* debugfs s8000-mca-mclk */
++	struct mutex dbg_lock;	/* debugfs s8000-mca-mclk */
+ 	u32 route_ovr[16];	/* parsed "route" parameter */
+ 	unsigned int route_ovr_len;
+ };
+@@ -195,7 +201,9 @@ static int mca_mclk_enable(struct clk_hw *hw)
+ 	struct s8000_mca *mca = hw_to_mca(hw);
+ 
+ 	/* AppleAE2MCA _getMCLKClkCon: nclk/2 (0x18) | output enable (0x40) */
+-	writel(mca_mclk_word(mca), mca->mclk_reg);
++	mca->mclk_cur = mca_mclk_word(mca);
++	writel(mca->mclk_cur, mca->mclk_reg);
++	mca->mclk_on = true;
+ 	return 0;
+ }
+ 
+@@ -203,8 +211,11 @@ static void mca_mclk_disable(struct clk_hw *hw)
+ {
+ 	struct s8000_mca *mca = hw_to_mca(hw);
+ 
+-	if (!mca->mclk_forced)
++	mca->mclk_on = false;
++	if (!mca->mclk_forced) {
+ 		writel(0, mca->mclk_reg);
++		mca->mclk_cur = 0;
++	}
+ }
+ 
+ static unsigned long mca_mclk_recalc_rate(struct clk_hw *hw,
+@@ -264,6 +275,7 @@ static void mca_route(struct s8000_mca *mca, bool on)
+ 			      off == I2S_SW_DSPC_OFFSET ? I2S_SW_DSPC_DEFAULT : 0;
+ 		regmap_write(mca->sw, off, val);
+ 	}
++	mca->route_on = on;
+ }
+ 
+ /* --- DAI ------------------------------------------------------------------ */
+@@ -391,6 +403,9 @@ static int mca_hw_free(struct snd_pcm_substream *substream,
+ {
+ 	struct s8000_mca *mca = snd_soc_dai_get_drvdata(dai);
+ 
++	/* back to the idle state runtime resume sets up: everything masked */
++	mca->irq_mask = MCA_IRQ_ALL;
++	mca_write(mca, MCA_IRQ_MASK, MCA_IRQ_ALL);
+ 	mca_write(mca, MCA_FRAME, 0);
+ 	mca_route(mca, false);
+ 	return 0;
+@@ -691,14 +706,29 @@ static irqreturn_t mca_irq(int irq, void *data)
+ {
+ 	struct s8000_mca *mca = data;
+ 	struct snd_pcm_substream *elapsed = NULL;
+-	u32 status = mca_read(mca, MCA_IRQ_STATUS) & ~mca->irq_mask;
++	u32 raw = mca_read(mca, MCA_IRQ_STATUS), status;
+ 
+-	if (!status)
++	/*
++	 * Only bits 12:0 are interrupt causes (iOS tests status & 0x1fff and
++	 * logs "spurious intr" otherwise). Bit 31 also reads as set while a
++	 * cause is pending (seen as 0x80000008), so it must not count as
++	 * handled. Otherwise a cause that is masked only in irq_mask, not in
++	 * the hardware mask, is "handled" forever. That IRQ storm is the
++	 * likely cause of the round-4 hard lockup.
++	 */
++	status = raw & MCA_IRQ_ALL & ~mca->irq_mask;
++	if (!status) {
++		/* resync the hardware mask, so a stale open mask cannot storm */
++		mca_write(mca, MCA_IRQ_MASK, mca->irq_mask);
++		mca_write(mca, MCA_IRQ_STATUS, raw & MCA_IRQ_ALL);
++		mca->spurious_count++;
++		mca->last_status = raw;
+ 		return IRQ_NONE;
++	}
+ 
+ 	mca_write(mca, MCA_IRQ_STATUS, status);
+ 	mca->irq_count++;
+-	mca->last_status = status;
++	mca->last_status = raw;
+ 
+ 	if (status & MCA_IRQ_ERRORS) {
+ 		/*
+@@ -726,35 +756,89 @@ static irqreturn_t mca_irq(int irq, void *data)
+ 	return IRQ_HANDLED;
+ }
+ 
++/* --- runtime PM ----------------------------------------------------------- */
++
++/*
++ * The IRQ is only enabled while the block is powered: the handler reads
++ * MCA registers, and an MMIO access to a power-gated Apple block can hang
++ * the CPU.
++ */
++static int mca_runtime_suspend(struct device *dev)
++{
++	struct s8000_mca *mca = dev_get_drvdata(dev);
++
++	disable_irq(mca->irq);
++	mca_write(mca, MCA_IRQ_MASK, MCA_IRQ_ALL);
++	return 0;
++}
++
++static int mca_runtime_resume(struct device *dev)
++{
++	struct s8000_mca *mca = dev_get_drvdata(dev);
++
++	/*
++	 * The power domain was just switched on, so the MCA may be at its
++	 * reset state, with causes like no-BCLK open in the hardware mask.
++	 * Mask and clear everything before the IRQ is enabled. Prepare
++	 * unmasks what a stream needs.
++	 */
++	mca->irq_mask = MCA_IRQ_ALL;
++	mca_write(mca, MCA_IRQ_MASK, MCA_IRQ_ALL);
++	mca_write(mca, MCA_IRQ_STATUS, MCA_IRQ_ALL);
++	enable_irq(mca->irq);
++	return 0;
++}
++
++static DEFINE_RUNTIME_DEV_PM_OPS(mca_pm_ops, mca_runtime_suspend,
++				 mca_runtime_resume, NULL);
++
+ /* --- debugfs: register snapshot for the device test ----------------------- */
+ 
++/*
++ * No debugfs access changes the power state or touches a suspended block:
++ * the MCA registers are read only while the device is already runtime
++ * active (stream running, or power/control = on). The MCLK word and the
++ * i2s-switch are read back only while the driver itself has them
++ * programmed. Their power domain is not known.
++ */
+ static int mca_regs_show(struct seq_file *s, void *unused)
+ {
+ 	struct s8000_mca *mca = dev_get_drvdata(s->private);
+ 	unsigned int off, val;
+-	int ret;
+ 
+-	ret = pm_runtime_resume_and_get(mca->dev);
+-	if (ret)
+-		return ret;
++	seq_printf(s, "irqs %lu errors %lu spurious %lu last status %#x irq_mask %#x\n",
++		   mca->irq_count, mca->err_count, mca->spurious_count,
++		   mca->last_status, mca->irq_mask);
++	seq_printf(s, "mclk word %#x (last written)%s%s, route %s\n",
++		   mca->mclk_cur, mca->mclk_on ? ", clock on" : "",
++		   mca->mclk_forced ? ", forced" : "",
++		   mca->route_on ? "applied" : "off");
++
++	if (pm_runtime_get_if_active(mca->dev) <= 0) {
++		seq_puts(s, "runtime-suspended: registers not read\n");
++		return 0;
++	}
+ 
+ 	for (off = 0; off < 0x100; off += 4)
+ 		seq_printf(s, "mca+%#05x = %#010x\n", off, mca_read(mca, off));
+-	seq_printf(s, "mclk     = %#010x\n", readl(mca->mclk_reg));
+-	if (mca->sw) {
++	if (mca->mclk_on || mca->mclk_forced)
++		seq_printf(s, "mclk     = %#010x\n", readl(mca->mclk_reg));
++	if (mca->sw && mca->route_on) {
+ 		for (off = 0; off < 0x50; off += 4) {
+ 			regmap_read(mca->sw, off, &val);
+ 			seq_printf(s, "sw+%#04x  = %#010x\n", off, val);
+ 		}
+ 	}
+-	seq_printf(s, "irqs %lu errors %lu last status %#x\n",
+-		   mca->irq_count, mca->err_count, mca->last_status);
+ 
+ 	pm_runtime_put(mca->dev);
+ 	return 0;
+ }
+ 
+-/* debugfs s8000-mca-mclk: "1"/"0" or a raw word forces MCLK for pad tests */
++/*
++ * debugfs s8000-mca-mclk: "1"/"0" or a raw word forces MCLK for pad tests.
++ * Forcing holds a runtime PM reference, so the MCA domain is on (and its
++ * IRQ masked by runtime resume) before the word is written.
++ */
+ static ssize_t mca_mclk_write(struct file *f, const char __user *ubuf,
+ 			      size_t len, loff_t *ppos)
+ {
+@@ -766,6 +850,7 @@ static ssize_t mca_mclk_write(struct file *f, const char __user *ubuf,
+ 	if (ret)
+ 		return ret;
+ 
++	guard(mutex)(&mca->dbg_lock);
+ 	if (val && !mca->mclk_forced) {
+ 		ret = pm_runtime_resume_and_get(mca->dev);
+ 		if (ret)
+@@ -773,15 +858,19 @@ static ssize_t mca_mclk_write(struct file *f, const char __user *ubuf,
+ 		mca->mclk_forced = true;
+ 	}
+ 	if (val) {
+-		writel(val == 1 ? mca_mclk_word(mca) : val, mca->mclk_reg);
++		mca->mclk_cur = val == 1 ? mca_mclk_word(mca) : val;
++		writel(mca->mclk_cur, mca->mclk_reg);
+ 	} else if (mca->mclk_forced) {
+-		writel(0, mca->mclk_reg);
++		/* back to what the clock wants: its word, or off */
++		mca->mclk_cur = mca->mclk_on ? mca_mclk_word(mca) : 0;
++		writel(mca->mclk_cur, mca->mclk_reg);
+ 		mca->mclk_forced = false;
+ 		pm_runtime_put(mca->dev);
+ 	}
+ 	return len;
+ }
+ 
++/* no MMIO: reports the last written word */
+ static ssize_t mca_mclk_read(struct file *f, char __user *ubuf, size_t len,
+ 			     loff_t *ppos)
+ {
+@@ -790,8 +879,7 @@ static ssize_t mca_mclk_read(struct file *f, char __user *ubuf, size_t len,
+ 	int n;
+ 
+ 	n = scnprintf(buf, sizeof(buf), "forced %d word %#x\n",
+-		      mca->mclk_forced,
+-		      mca->mclk_forced ? readl(mca->mclk_reg) : 0);
++		      mca->mclk_forced, mca->mclk_cur);
+ 	return simple_read_from_buffer(ubuf, len, ppos, buf, n);
+ }
+ 
+@@ -812,13 +900,16 @@ static int s8000_mca_probe(struct platform_device *pdev)
+ 	const char *clk_name = "mca-mclk";
+ 	struct s8000_mca *mca;
+ 	u32 ver, fifo;
+-	int irq, ret, n;
++	int ret, n;
+ 
+ 	mca = devm_kzalloc(dev, sizeof(*mca), GFP_KERNEL);
+ 	if (!mca)
+ 		return -ENOMEM;
+ 	mca->dev = dev;
+ 	spin_lock_init(&mca->lock);
++	ret = devm_mutex_init(dev, &mca->dbg_lock);
++	if (ret)
++		return ret;
+ 	platform_set_drvdata(pdev, mca);
+ 
+ 	mca->base = devm_platform_ioremap_resource_byname(pdev, "mca");
+@@ -852,10 +943,12 @@ static int s8000_mca_probe(struct platform_device *pdev)
+ 		return dev_err_probe(dev, -EINVAL, "bad apple,pio-fifo-offset\n");
+ 
+ 	mca->irq_mask = MCA_IRQ_ALL;
+-	irq = platform_get_irq(pdev, 0);
+-	if (irq < 0)
+-		return irq;
+-	ret = devm_request_irq(dev, irq, mca_irq, 0, dev_name(dev), mca);
++	mca->irq = platform_get_irq(pdev, 0);
++	if (mca->irq < 0)
++		return mca->irq;
++	/* enabled by runtime resume, once the hardware mask is set */
++	ret = devm_request_irq(dev, mca->irq, mca_irq, IRQF_NO_AUTOEN,
++			       dev_name(dev), mca);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -933,6 +1026,7 @@ static struct platform_driver s8000_mca_driver = {
+ 	.driver = {
+ 		.name = "s8000-mca",
+ 		.of_match_table = s8000_mca_of_match,
++		.pm = pm_ptr(&mca_pm_ops),
+ 	},
+ 	.probe = s8000_mca_probe,
+ };

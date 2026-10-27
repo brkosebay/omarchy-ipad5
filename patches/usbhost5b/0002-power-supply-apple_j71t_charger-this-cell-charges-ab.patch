@@ -1,0 +1,51 @@
+From e3fda1a31ddcada434e150402fc4cc673a708d80 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Tue, 27 Oct 2026 10:27:17 +0000
+Subject: [PATCH 2/4] power: supply: apple_j71t_charger: this cell charges
+ above 4.2 V
+
+The battery safety window ended at 4.2 V. This unit's cell is full above
+that: iOS reports 4256-4274 mV at 100 % (2026-10-27 capture), and Linux
+read 4249 mV at 98 % while charging. Near full, every guard pass returned
+-ERANGE, the policy restored the 100 mA handoff, the voltage sagged, and
+charging resumed 30 s later: "charging policy stepped down: -34" every
+30 s with the Mac cable, and after 15 s at 2100 mA with the camera adapter.
+
+The PMIC owns charge voltage and termination; the window only rejects
+implausible gauge samples. Raise the ceiling to 4.4 V.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ drivers/power/supply/apple_j71t_charger.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/power/supply/apple_j71t_charger.c b/drivers/power/supply/apple_j71t_charger.c
+index 923ad579b4..b96d071302 100644
+--- a/drivers/power/supply/apple_j71t_charger.c
++++ b/drivers/power/supply/apple_j71t_charger.c
+@@ -32,6 +32,15 @@
+ #define J71T_SAMPLE_GRACE_MS 60000
+ #define J71T_FAULT_RETRY_MS 60000
+ #define J71T_OWNER_RETRY_MS 30000
++/*
++ * Battery sanity window. This unit's cell charges above 4.2 V: iOS reports
++ * 4256-4274 mV at 100 % (2026-10-27 capture) and Linux saw 4249 mV at 98 %
++ * while charging. With a 4.2 V ceiling the policy stopped charging near full
++ * every 30 s. The PMIC owns charge voltage and termination; this window only
++ * rejects implausible gauge samples.
++ */
++#define J71T_VBAT_MIN_UV 3000000
++#define J71T_VBAT_MAX_UV 4400000
+ 
+ static const int j71t_budgets_ua[] = { 500000, 1000000, 2100000, 2400000 };
+ 
+@@ -259,7 +268,7 @@ static int j71t_battery_safe(struct j71t_charger *charger)
+ 	ret = power_supply_get_property(battery, POWER_SUPPLY_PROP_VOLTAGE_NOW, &value);
+ 	if (ret)
+ 		goto transient;
+-	if (value.intval < 3000000 || value.intval > 4200000) {
++	if (value.intval < J71T_VBAT_MIN_UV || value.intval > J71T_VBAT_MAX_UV) {
+ 		ret = -ERANGE;
+ 		goto out;
+ 	}

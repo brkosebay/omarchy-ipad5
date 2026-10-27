@@ -1,0 +1,6 @@
+0001-dt-bindings-soc-apple-describe-inherited-A9-AOP-ring.patch
+0002-soc-apple-add-zero-traffic-inherited-A9-AOP-ring-rea.patch
+0003-soc-apple-skip-unreadable-AOP-scan-pages-and-capture.patch
+0004-soc-apple-opt-into-reserved-DRAM-AOP-ring-discovery.patch
+0005-soc-apple-capture-explicit-inherited-AOP-buffer-rang.patch
+0006-soc-apple-add-guarded-probe-time-AOP-state-snapshot.patch

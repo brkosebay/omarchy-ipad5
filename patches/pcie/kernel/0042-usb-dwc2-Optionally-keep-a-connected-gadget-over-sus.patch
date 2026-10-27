@@ -1,0 +1,112 @@
+From ca94a3c6f9df2f397727eca306ce2f39ad66bf3e Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 15:35:15 +0000
+Subject: [PATCH 42/43] usb: dwc2: Optionally keep a connected gadget over
+ suspend-to-idle
+
+dwc2_suspend() disconnects the gadget and powers the PHY down. On the
+iPad 5 port the root filesystem is NBD over a USB gadget network, so a
+disconnect during system sleep can take the root away.
+
+Add dwc2.s2idle_keep_gadget (default off): in suspend-to-idle, a
+connected gadget is left running. Its interrupt is off while the system
+sleeps, so the host sees NAKs. The controller and its PHY are put on the
+wakeup path so that their power domains stay on
+(GENPD_FLAG_ACTIVE_WAKEUP).
+---
+ drivers/usb/dwc2/core.h     |  3 +++
+ drivers/usb/dwc2/platform.c | 36 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 39 insertions(+)
+
+diff --git a/drivers/usb/dwc2/core.h b/drivers/usb/dwc2/core.h
+index 767251aa1a..31809b4f92 100644
+--- a/drivers/usb/dwc2/core.h
++++ b/drivers/usb/dwc2/core.h
+@@ -876,6 +876,8 @@ struct dwc2_hregs_backup {
+  * @reset_phy_on_wake:	Quirk saying that we should assert PHY reset on a
+  *			remote wakeup.
+  * @phy_off_for_suspend: Status of whether we turned the PHY off at suspend.
++ * @kept_for_s2idle:    The gadget was left connected and running over
++ *                      suspend-to-idle (dwc2.s2idle_keep_gadget).
+  * @need_phy_for_wake:	Quirk saying that we should keep the PHY on at
+  *			suspend if we need USB to wake us up.
+  * @frame_number:       Frame number read from the core. For both device
+@@ -1074,6 +1076,7 @@ struct dwc2_hsotg {
+ 	unsigned int reset_phy_on_wake:1;
+ 	unsigned int need_phy_for_wake:1;
+ 	unsigned int phy_off_for_suspend:1;
++	unsigned int kept_for_s2idle:1;
+ 	u16 frame_number;
+ 
+ 	struct phy *phy;
+diff --git a/drivers/usb/dwc2/platform.c b/drivers/usb/dwc2/platform.c
+index ef0d730770..57b86ec14f 100644
+--- a/drivers/usb/dwc2/platform.c
++++ b/drivers/usb/dwc2/platform.c
+@@ -17,6 +17,7 @@
+ #include <linux/phy/phy.h>
+ #include <linux/platform_data/s3c-hsotg.h>
+ #include <linux/reset.h>
++#include <linux/suspend.h>
+ 
+ #include <linux/usb/of.h>
+ 
+@@ -646,6 +647,33 @@ static int dwc2_driver_probe(struct platform_device *dev)
+ 	return retval;
+ }
+ 
++static bool s2idle_keep_gadget;
++module_param(s2idle_keep_gadget, bool, 0644);
++MODULE_PARM_DESC(s2idle_keep_gadget,
++	"Leave a connected gadget running over suspend-to-idle instead of disconnecting it (default off)");
++
++/*
++ * Suspend-to-idle with dwc2.s2idle_keep_gadget: leave the controller and
++ * its PHY powered and the gadget connected. Its interrupt is off while the
++ * system sleeps, so the host sees NAKs and nothing else; a gadget network
++ * link (and anything on it, e.g. an NBD root) survives a short sleep.
++ * The controller and PHY are put on the wakeup path so that their power
++ * domains stay on (GENPD_FLAG_ACTIVE_WAKEUP).
++ */
++static bool dwc2_keep_gadget_for_s2idle(struct dwc2_hsotg *dwc2)
++{
++	if (!s2idle_keep_gadget || !pm_suspend_no_platform() ||
++	    !dwc2_is_device_mode(dwc2) || dwc2->lx_state != DWC2_L0)
++		return false;
++
++	device_set_wakeup_path(dwc2->dev);
++	if (dwc2->phy && dwc2->phy->dev.parent)
++		device_set_wakeup_path(dwc2->phy->dev.parent);
++	dwc2->kept_for_s2idle = 1;
++	dev_info(dwc2->dev, "s2idle: gadget stays connected\n");
++	return true;
++}
++
+ static int __maybe_unused dwc2_suspend(struct device *dev)
+ {
+ 	struct dwc2_hsotg *dwc2 = dev_get_drvdata(dev);
+@@ -655,6 +683,9 @@ static int __maybe_unused dwc2_suspend(struct device *dev)
+ 	if (!dwc2->ll_hw_enabled)
+ 		return 0;
+ 
++	if (dwc2_keep_gadget_for_s2idle(dwc2))
++		return 0;
++
+ 	is_device_mode = dwc2_is_device_mode(dwc2);
+ 	if (is_device_mode)
+ 		dwc2_hsotg_suspend(dwc2);
+@@ -735,6 +766,11 @@ static int __maybe_unused dwc2_resume(struct device *dev)
+ 	if (!dwc2->ll_hw_enabled)
+ 		return 0;
+ 
++	if (dwc2->kept_for_s2idle) {
++		dwc2->kept_for_s2idle = 0;
++		return 0;
++	}
++
+ 	if (dwc2->phy_off_for_suspend && dwc2->ll_hw_enabled) {
+ 		ret = __dwc2_lowlevel_hw_enable(dwc2);
+ 		if (ret)
+-- 
+2.56.0
+

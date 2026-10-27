@@ -1,0 +1,110 @@
+From 66ead9a45ffbe6ff677b5e2eb7c2b4cabd98aba6 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 11:16:14 +0000
+Subject: [PATCH 14/43] nvme-pci: apple-ans: Log bring-up phases, check the
+ link first
+
+Print CAP/VS/CC/CSTS and one line per step (stop, HMB programming,
+enable with the CSTS.RDY timeout) so a hang on the device can be read
+off the framebuffer, and refuse to touch the controller when the PCIe
+link is down instead of risking a stalled BAR access.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ drivers/nvme/host/pci-apple-ans.c | 36 +++++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/drivers/nvme/host/pci-apple-ans.c b/drivers/nvme/host/pci-apple-ans.c
+index 2b6a697b1e..b88c9db645 100644
+--- a/drivers/nvme/host/pci-apple-ans.c
++++ b/drivers/nvme/host/pci-apple-ans.c
+@@ -10,6 +10,7 @@
+ #include <linux/bitmap.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/gfp.h>
++#include <linux/io-64-nonatomic-lo-hi.h>
+ #include <linux/iopoll.h>
+ #include <linux/log2.h>
+ #include <linux/mempool.h>
+@@ -280,6 +281,23 @@ static void nvme_pci_apple_ans_config(struct nvme_dev *dev)
+ 	}
+ }
+ 
++/*
++ * A BAR access over a dead link can stall the CPU for good on the H8P/H9P
++ * root complex, so check the link before each step that touches the
++ * controller. The phase messages say where a hang happened.
++ */
++static int nvme_pci_apple_ans_check_link(struct nvme_dev *dev,
++					 const char *step)
++{
++	int up = apple_ans_link_up(dev->dev);
++
++	if (up > 0)
++		return 0;
++	dev_err(dev->dev, "Apple ANS: PCIe link down before %s, leaving the controller alone\n",
++		step);
++	return up < 0 ? up : -ENOLINK;
++}
++
+ static int nvme_pci_apple_ans_preinit(struct nvme_dev *dev)
+ {
+ 	struct apple_ans_nvme *ans = nvme_pci_apple_ans(dev);
+@@ -297,6 +315,10 @@ static int nvme_pci_apple_ans_preinit(struct nvme_dev *dev)
+ 	dev_info(dev->dev,
+ 		 "Apple ANS: core_mask=%#x log_size=%#x hmb_req=%#x align=%#x\n",
+ 		 core_mask, log_size, hmb_size, hmb_align);
++	dev_info(dev->dev, "Apple ANS: CAP=%#llx VS=%#x CC=%#x CSTS=%#x\n",
++		 lo_hi_readq(dev->bar + NVME_REG_CAP),
++		 readl(dev->bar + NVME_REG_VS), readl(dev->bar + NVME_REG_CC),
++		 readl(dev->bar + NVME_REG_CSTS));
+ 
+ 	/*
+ 	 * Check everything this needs from the loader and the host bridge
+@@ -317,8 +339,15 @@ static int nvme_pci_apple_ans_preinit(struct nvme_dev *dev)
+ 		return dev_err_probe(dev->dev, ret,
+ 				     "Apple ANS: failed to reset NVMMU DMA slots\n");
+ 
++	ret = nvme_pci_apple_ans_check_link(dev, "PCI config setup");
++	if (ret)
++		return ret;
+ 	nvme_pci_apple_ans_config(dev);
+ 
++	ret = nvme_pci_apple_ans_check_link(dev, "CC=0");
++	if (ret)
++		return ret;
++	dev_info(dev->dev, "Apple ANS: stopping controller (CC=0)\n");
+ 	writel(0, dev->bar + NVME_REG_CC);
+ 	ret = readl_poll_timeout(dev->bar + NVME_REG_CSTS, csts,
+ 				 !(csts & (NVME_CSTS_RDY | NVME_CSTS_CFS)),
+@@ -327,6 +356,7 @@ static int nvme_pci_apple_ans_preinit(struct nvme_dev *dev)
+ 		return dev_err_probe(dev->dev, ret,
+ 				     "Apple ANS: controller did not stop (CSTS=%#x)\n",
+ 				     csts);
++	dev_info(dev->dev, "Apple ANS: controller stopped (CSTS=%#x)\n", csts);
+ 
+ 	return 0;
+ }
+@@ -339,6 +369,8 @@ static int nvme_pci_apple_ans_prepare_enable(struct nvme_dev *dev)
+ 		return 0;
+ 	if (!ans->hmb_size)
+ 		return -EINVAL;
++	if (nvme_pci_apple_ans_check_link(dev, "HMB setup"))
++		return -ENOLINK;
+ 
+ 	writel(APPLE_ANS_REG_INIT_REGULAR, dev->bar + APPLE_ANS_REG_INIT);
+ 	writel(lower_32_bits(ans->hmb_dma),
+@@ -348,6 +380,10 @@ static int nvme_pci_apple_ans_prepare_enable(struct nvme_dev *dev)
+ 	writel(ans->hmb_size, dev->bar + APPLE_ANS_REG_HMB_SIZE);
+ 	readl(dev->bar + APPLE_ANS_REG_HMB_SIZE);
+ 
++	dev_info(dev->dev,
++		 "Apple ANS: HMB DMA %#llx size %#x programmed, enabling controller (RDY timeout %llus)\n",
++		 (u64)ans->hmb_dma, ans->hmb_size,
++		 (NVME_CAP_TIMEOUT(dev->ctrl.cap) + 1) / 2);
+ 	return 0;
+ }
+ 
+-- 
+2.56.0
+

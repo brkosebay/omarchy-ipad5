@@ -1,0 +1,8 @@
+APPLE A9 AOP EXPERIMENTAL DRIVER
+M:	Berkay Kosebay <brkosebay@users.noreply.github.com>
+S:	Maintained
+F:	Documentation/devicetree/bindings/soc/apple/apple,j71t-aop*.yaml
+F:	Documentation/driver-api/apple-a9-aop*.rst
+F:	arch/arm64/boot/dts/apple/s8003-j71t-aop*.dtsi
+F:	drivers/soc/apple/a9-aop*
+F:	drivers/soc/apple/apple-a9-aop*

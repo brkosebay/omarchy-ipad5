@@ -1,0 +1,62 @@
+From 170f9874ad5b8525ae825b83028258e9a837cbe7 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 23:11:29 +0000
+Subject: [PATCH 1/2] watchdog: apple_wdt: Add cold_restart parameter to refuse
+ SoC resets
+
+On iDevices booted through a bootrom exploit (checkm8 -> pongoOS -> m1n1),
+the restart handler's SoC reset boots the stock OS, and getting back
+into Linux takes a host computer and a manual DFU entry. A reboot that
+was meant to stay in Linux (kexec) but fails, a panic timeout or sysrq-b
+then silently leaves Linux.
+
+Add apple_wdt.cold_restart (default true, so nothing changes unless it is
+set). With cold_restart=0 the restart handler refuses with -EPERM; the
+watchdog core turns that into NOTIFY_BAD, which ends the restart chain,
+and machine_restart() halts with "Reboot failed -- System halted". It is
+writable at runtime so that a deliberate reboot into the stock OS can
+turn it back on first. A running watchdog still bites as before.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ drivers/watchdog/apple_wdt.c | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/drivers/watchdog/apple_wdt.c b/drivers/watchdog/apple_wdt.c
+index f533953294..c1b4bb64ba 100644
+--- a/drivers/watchdog/apple_wdt.c
++++ b/drivers/watchdog/apple_wdt.c
+@@ -53,6 +53,18 @@
+ 
+ #define APPLE_WDT_TIMEOUT_DEFAULT	30
+ 
++/*
++ * On iDevices booted through a bootrom exploit (checkm8 -> pongoOS -> m1n1),
++ * a SoC reset boots the stock OS, and getting back to Linux needs a host
++ * computer and a manual DFU entry. With cold_restart=0 the restart handler
++ * refuses, so a reboot that wasn't meant to leave Linux (a failed kexec, a
++ * panic timeout, sysrq-b) halts instead. Writable at runtime, so a
++ * deliberate "reboot to iOS" can turn it back on first.
++ */
++static bool cold_restart = true;
++module_param(cold_restart, bool, 0644);
++MODULE_PARM_DESC(cold_restart, "Allow restarts through a SoC reset (default: true)");
++
+ struct apple_wdt {
+ 	struct watchdog_device wdd;
+ 	void __iomem *regs;
+@@ -123,6 +135,11 @@ static int apple_wdt_restart(struct watchdog_device *wdd, unsigned long mode,
+ {
+ 	struct apple_wdt *wdt = to_apple_wdt(wdd);
+ 
++	if (!READ_ONCE(cold_restart)) {
++		pr_emerg("apple-wdt: SoC reset refused (apple_wdt.cold_restart=0), halting\n");
++		return -EPERM;
++	}
++
+ 	writel_relaxed(APPLE_WDT_CTRL_RESET_EN, wdt->regs + APPLE_WDT_WD1_CTRL);
+ 	writel_relaxed(0, wdt->regs + APPLE_WDT_WD1_BITE_TIME);
+ 	writel_relaxed(0, wdt->regs + APPLE_WDT_WD1_CUR_TIME);
+-- 
+2.56.0
+

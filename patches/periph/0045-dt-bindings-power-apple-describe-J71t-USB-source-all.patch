@@ -1,0 +1,82 @@
+From 4786cdb212db4d5b39044f78beed95732552bd0f Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 12:23:33 +0000
+Subject: [PATCH 45/55] dt-bindings: power: apple: describe J71t USB source
+ allowances
+
+Connect Tristar to its D2365 ADC and USB device controller. Opt in the
+J71t gadget current protocol explicitly; VBUS alone is not a high-
+current authorization.
+---
+ .../supply/apple,j71t-cbtl1610-power.yaml     | 19 ++++++++++++++++---
+ .../devicetree/bindings/usb/dwc2.yaml         |  6 ++++++
+ 2 files changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/power/supply/apple,j71t-cbtl1610-power.yaml b/Documentation/devicetree/bindings/power/supply/apple,j71t-cbtl1610-power.yaml
+index c9e21f039d..1b4b1d601b 100644
+--- a/Documentation/devicetree/bindings/power/supply/apple,j71t-cbtl1610-power.yaml
++++ b/Documentation/devicetree/bindings/power/supply/apple,j71t-cbtl1610-power.yaml
+@@ -4,14 +4,15 @@
+ $id: http://devicetree.org/schemas/power/supply/apple,j71t-cbtl1610-power.yaml#
+ $schema: http://devicetree.org/meta-schemas/core.yaml#
+ 
+-title: Apple J71t CBTL1610 USB source presence
++title: Apple J71t CBTL1610 USB source detection
+ 
+ maintainers:
+   - linux-a9 <linux-a9@localhost>
+ 
+ description: |
+-  Read-only VBUS presence for the CBTL1610 revision used by J71t. The driver
+-  does not configure accessory routing or determine a source current budget.
++  VBUS presence, Apple USB host allowances and bounded analog charger
++  signature detection for the CBTL1610 revision used by J71t. Temporary
++  data-pin monitoring restores the saved route after each measurement.
+ 
+ properties:
+   compatible:
+@@ -20,9 +21,19 @@ properties:
+   reg:
+     maxItems: 1
+ 
++  usb-controller:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description: USB device controller reporting host current allowances.
++
++  apple,pmic:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description: D2365 PMIC providing the brick-ID ADC input.
++
+ required:
+   - compatible
+   - reg
++  - usb-controller
++  - apple,pmic
+ 
+ additionalProperties: false
+ 
+@@ -34,5 +45,7 @@ examples:
+         power-controller@1a {
+             compatible = "apple,j71t-cbtl1610-power";
+             reg = <0x1a>;
++            usb-controller = <&usbdev>;
++            apple,pmic = <&pmic>;
+         };
+     };
+diff --git a/Documentation/devicetree/bindings/usb/dwc2.yaml b/Documentation/devicetree/bindings/usb/dwc2.yaml
+index 166d37cd92..37159d7a9c 100644
+--- a/Documentation/devicetree/bindings/usb/dwc2.yaml
++++ b/Documentation/devicetree/bindings/usb/dwc2.yaml
+@@ -78,6 +78,12 @@ properties:
+               - apple,t8015-dwc2
+           - const: apple,dwc2
+ 
++  apple,host-current-budget:
++    type: boolean
++    description: |
++      Enable Apple device-mode current-limit requests and source-budget
++      notifications, bounded to the J71t 2400 mA platform maximum.
++
+   reg:
+     maxItems: 1
+ 

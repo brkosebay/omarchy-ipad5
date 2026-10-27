@@ -1,0 +1,533 @@
+#!/usr/bin/env python3
+"""Touch gestures for Omarchy on the iPad (linux-a9).
+
+Reads the touchscreen next to Hyprland (no grab: apps still get every touch)
+and turns whole-hand gestures into ipad-tablet actions:
+
+  3 fingers swipe left / right    next / previous workspace
+  3 fingers swipe up / down       next / previous window on the workspace
+  3 fingers tap                   full screen on/off
+  3 fingers pinch in / out        floating on/off / full screen on/off
+  4 fingers swipe up              app grid (launcher)
+  4 fingers swipe down            close the window
+  4 fingers swipe left / right    next / previous workspace
+  4 fingers tap                   floating on/off
+  swipe up from the bottom edge   app grid (launcher)
+  swipe down from the top edge    on-screen keyboard on/off
+  swipe in from the left / right  previous / next workspace
+  long press (one finger, ~0.6 s, then lift)   right click there
+
+Directions are the desktop's, whichever way the iPad is turned: the transform
+comes from Hyprland (ipad-rotate), so the screen and the gestures turn
+together. Two-finger gestures are left to apps (scroll, zoom).
+
+Actions are shell commands; ~/.config/linux-a9/gestures.conf overrides them,
+one "name = command" per line (an empty command turns one off), e.g.
+  swipe3-up = ipad-tablet apps
+  longpress =
+Names: swipe3-left .. swipe4-down, tap3, tap4, pinch3-in, pinch3-out,
+pinch4-in, pinch4-out, edge-bottom, edge-top, edge-left, edge-right,
+longpress (the built-in right click: "rightclick").
+
+  ipad-gestures              run (linux-a9 ipad-gestures.service, a user unit)
+  ipad-gestures --debug      also print contacts and gestures
+  ipad-gestures --dry-run    recognise and print, run nothing
+  ipad-gestures --list       print the input devices and which is used
+
+Stop the service before a --debug run, or both act on every gesture:
+  systemctl --user stop ipad-gestures
+
+The device is the first direct-touch multitouch evdev node (Apple N1
+Touchscreen on the iPad, QEMU's virtio multitouch in tests);
+IPAD_GESTURES_DEVICE=/dev/input/eventN or a name substring picks another.
+It needs read access to the device and /dev/uinput (for the right click):
+/etc/udev/rules.d/70-linux-a9-tablet.rules grants both to the seat's user.
+"""
+
+import array
+import fcntl
+import glob
+import json
+import os
+import re
+import select
+import struct
+import subprocess
+import sys
+import time
+
+# --- evdev ABI (linux/input.h, linux/uinput.h; aarch64) ----------------------
+EV_SYN, EV_KEY, EV_REL, EV_ABS = 0, 1, 2, 3
+SYN_REPORT, SYN_DROPPED = 0, 3
+REL_X, REL_Y = 0, 1
+BTN_LEFT, BTN_RIGHT = 0x110, 0x111
+ABS_MT_SLOT, ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_TRACKING_ID = 0x2F, 0x35, 0x36, 0x39
+INPUT_PROP_DIRECT = 1
+EVENT = struct.Struct("llHHi")  # struct input_event: timeval, type, code, value
+
+
+def _ioc(direction, nr, size, kind=ord("E")):
+    return (direction << 30) | (size << 16) | (kind << 8) | nr
+
+
+def EVIOCGNAME(n):
+    return _ioc(2, 0x06, n)
+
+
+def EVIOCGPROP(n):
+    return _ioc(2, 0x09, n)
+
+
+def EVIOCGBIT(ev, n):
+    return _ioc(2, 0x20 + ev, n)
+
+
+def EVIOCGABS(code):
+    return _ioc(2, 0x40 + code, 24)
+
+
+UI_SET_EVBIT = _ioc(1, 100, 4, ord("U"))
+UI_SET_KEYBIT = _ioc(1, 101, 4, ord("U"))
+UI_SET_RELBIT = _ioc(1, 102, 4, ord("U"))
+UI_DEV_CREATE = _ioc(0, 1, 0, ord("U"))
+
+# --- tuning (logical desktop pixels, seconds) ----------------------------------
+SWIPE_MIN = 90         # multi-finger travel that counts as a swipe
+TAP_MAX_MOVE = 25      # multi-finger tap: no finger moved more than this
+TAP_MAX_TIME = 0.35
+PINCH_IN = 0.65        # spread ratio (end / start) for a pinch
+PINCH_OUT = 1.5
+EDGE_ZONE = 0.035      # fraction of the desktop's side that counts as its edge
+EDGE_MIN = 70          # how far an edge swipe has to come in
+LONG_TIME = 0.6
+LONG_SLOP = 14         # long press: the finger stays within this
+LONGPRESS_SKIP = r"(?i)chrom|brave|firefox|librewolf|zen|electron|code-oss|^code$"
+
+DEFAULT_ACTIONS = {
+    "swipe3-left": "ipad-tablet workspace next",
+    "swipe3-right": "ipad-tablet workspace prev",
+    "swipe3-up": "ipad-tablet cycle next",
+    "swipe3-down": "ipad-tablet cycle prev",
+    "swipe4-up": "ipad-tablet apps",
+    "swipe4-down": "ipad-tablet close",
+    "swipe4-left": "ipad-tablet workspace next",
+    "swipe4-right": "ipad-tablet workspace prev",
+    "tap3": "ipad-tablet fullscreen",
+    "tap4": "ipad-tablet float",
+    "pinch3-in": "ipad-tablet float",
+    "pinch3-out": "ipad-tablet fullscreen",
+    "pinch4-in": "ipad-tablet float",
+    "pinch4-out": "ipad-tablet fullscreen",
+    "edge-bottom": "ipad-tablet apps",
+    "edge-top": "ipad-tablet keyboard",
+    "edge-left": "ipad-tablet workspace prev",
+    "edge-right": "ipad-tablet workspace next",
+    "longpress": "rightclick",
+}
+
+DEBUG = "--debug" in sys.argv or "--dry-run" in sys.argv
+DRY = "--dry-run" in sys.argv
+
+
+def log(*args):
+    print("ipad-gestures:", *args, file=sys.stderr, flush=True)
+
+
+def debug(*args):
+    if DEBUG:
+        log(*args)
+
+
+def load_actions():
+    actions = dict(DEFAULT_ACTIONS)
+    home = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    path = os.path.join(home, "linux-a9", "gestures.conf")
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                actions[key.strip()] = value.strip()
+    except FileNotFoundError:
+        pass
+    return actions
+
+
+# --- Hyprland -------------------------------------------------------------------
+def hypr_env():
+    env = dict(os.environ)
+    run = env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    sig = env.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+    if not sig or not os.path.exists(f"{run}/hypr/{sig}/.socket.sock"):
+        dirs = sorted(glob.glob(f"{run}/hypr/*/.socket.sock"), key=os.path.getmtime, reverse=True)
+        if dirs:
+            env["HYPRLAND_INSTANCE_SIGNATURE"] = dirs[0].split("/")[-2]
+    return env
+
+
+def hyprctl_json(*args):
+    try:
+        out = subprocess.run(["hyprctl", *args, "-j"], env=hypr_env(), capture_output=True,
+                             text=True, timeout=3).stdout
+        return json.loads(out)
+    except Exception:
+        return None
+
+
+class Screen:
+    """The focused monitor's transform and logical geometry, cached."""
+
+    def __init__(self):
+        self.stamp = 0.0
+        self.transform = 3
+        self.x = self.y = 0
+        self.w, self.h = 1024, 768
+        self.state = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+                                  "linux-a9", "display")
+        self.state_mtime = None
+
+    def refresh(self, force=False):
+        try:
+            mtime = os.path.getmtime(self.state)
+        except OSError:
+            mtime = None
+        if not force and mtime == self.state_mtime and time.monotonic() - self.stamp < 30:
+            return
+        monitors = hyprctl_json("monitors")
+        if not monitors:
+            return
+        mon = next((m for m in monitors if m.get("focused")), monitors[0])
+        scale = mon.get("scale") or 1
+        self.transform = int(os.environ.get("IPAD_GESTURES_TRANSFORM", mon.get("transform", 0))) % 8
+        w, h = mon["width"] / scale, mon["height"] / scale
+        if self.transform % 2:
+            w, h = h, w
+        self.x, self.y, self.w, self.h = mon.get("x", 0), mon.get("y", 0), w, h
+        self.stamp, self.state_mtime = time.monotonic(), mtime
+        debug(f"monitor {mon.get('name')}: transform {self.transform}, logical {w:.0f}x{h:.0f} at {self.x},{self.y}")
+
+    def logical(self, u, v):
+        """Panel-normalised (u right, v down, portrait, home button at the
+        bottom) to desktop pixels. Transform 3 (landscape, home on the right)
+        puts the panel's right edge at the top; 1 is the opposite turn."""
+        t = self.transform & 3
+        if t == 0:
+            x, y = u, v
+        elif t == 1:
+            x, y = 1 - v, u
+        elif t == 2:
+            x, y = 1 - u, 1 - v
+        else:
+            x, y = v, 1 - u
+        if self.transform >= 4:  # flipped variants: mirror horizontally
+            x = 1 - x
+        return x * self.w, y * self.h
+
+
+# --- devices --------------------------------------------------------------------
+def bits(fd, ev, nbytes):
+    buf = array.array("B", [0] * nbytes)
+    try:
+        fcntl.ioctl(fd, EVIOCGBIT(ev, nbytes), buf)
+    except OSError:
+        return set()
+    return {i * 8 + b for i, byte in enumerate(buf) for b in range(8) if byte >> b & 1}
+
+
+def describe(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError as e:
+        return None, str(e)
+    try:
+        name = array.array("B", [0] * 256)
+        fcntl.ioctl(fd, EVIOCGNAME(256), name)
+        name = name.tobytes().split(b"\0")[0].decode(errors="replace")
+        props = array.array("B", [0] * 8)
+        try:
+            fcntl.ioctl(fd, EVIOCGPROP(8), props)
+        except OSError:
+            pass
+        direct = bool(props[0] >> INPUT_PROP_DIRECT & 1)
+        absbits = bits(fd, EV_ABS, 8)
+        mt = {ABS_MT_SLOT, ABS_MT_POSITION_X, ABS_MT_POSITION_Y} <= absbits
+        return {"path": path, "name": name, "direct": direct, "mt": mt}, None
+    finally:
+        os.close(fd)
+
+
+def find_device():
+    want = os.environ.get("IPAD_GESTURES_DEVICE", "")
+    found = []
+    for path in sorted(glob.glob("/dev/input/event*"), key=lambda p: int(re.sub(r"\D", "", p) or 0)):
+        info, _ = describe(path)
+        if info:
+            found.append(info)
+    if want.startswith("/dev/"):
+        return next((d for d in found if d["path"] == want), None)
+    if want:
+        return next((d for d in found if want.lower() in d["name"].lower()), None)
+    for d in found:
+        if d["mt"] and (d["direct"] or "touch" in d["name"].lower()):
+            return d
+    return None
+
+
+def absinfo(fd, code):
+    buf = array.array("i", [0] * 6)
+    fcntl.ioctl(fd, EVIOCGABS(code), buf)
+    return buf[1], buf[2]  # min, max
+
+
+class RightClicker:
+    """A uinput mouse with only a right button (and the motion axes libinput
+    wants to see before it calls it a pointer). The pointer is put on the
+    finger with hl.dsp.cursor.move first."""
+
+    def __init__(self):
+        self.fd = None
+        try:
+            fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        except OSError as e:
+            log(f"no /dev/uinput ({e.strerror}): long press won't right click")
+            return
+        try:
+            fcntl.ioctl(fd, UI_SET_EVBIT, EV_KEY)
+            fcntl.ioctl(fd, UI_SET_EVBIT, EV_REL)
+            fcntl.ioctl(fd, UI_SET_KEYBIT, BTN_LEFT)
+            fcntl.ioctl(fd, UI_SET_KEYBIT, BTN_RIGHT)
+            fcntl.ioctl(fd, UI_SET_RELBIT, REL_X)
+            fcntl.ioctl(fd, UI_SET_RELBIT, REL_Y)
+            # struct uinput_user_dev: name[80], id (bustype, vendor, product,
+            # version), ff_effects_max, absmax/min/fuzz/flat[64].
+            dev = struct.pack("80sHHHHi", b"linux-a9 long-press right click", 0x06, 0x1D6B, 0xA901, 1, 0)
+            os.write(fd, dev + bytes(4 * 64 * 4))
+            fcntl.ioctl(fd, UI_DEV_CREATE)
+            self.fd = fd
+        except OSError as e:
+            log(f"uinput setup failed ({e}): long press won't right click")
+            os.close(fd)
+
+    def click(self):
+        if self.fd is None:
+            return
+        for value in (1, 0):
+            os.write(self.fd, EVENT.pack(0, 0, EV_KEY, BTN_RIGHT, value) + EVENT.pack(0, 0, EV_SYN, SYN_REPORT, 0))
+            time.sleep(0.02)
+
+
+# --- recognition ------------------------------------------------------------------
+def centroid(points):
+    n = len(points)
+    return sum(p[0] for p in points) / n, sum(p[1] for p in points) / n
+
+
+def spread(points):
+    cx, cy = centroid(points)
+    return sum(((p[0] - cx) ** 2 + (p[1] - cy) ** 2) ** 0.5 for p in points) / len(points)
+
+
+class Recognizer:
+    """Fed one frame (the contacts in desktop pixels, keyed by tracking id)
+    per SYN_REPORT; returns a gesture name and its position when the last
+    finger lifts."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.active = False
+        self.t0 = 0.0
+        self.max_fingers = 0
+        self.first = {}       # tracking id -> first position
+        self.last = {}        # tracking id -> last position
+        self.moved = 0.0      # largest distance any finger travelled
+        self.group_start = None  # positions when the most fingers were first down
+        self.group_end = None    # positions the last time that many were down
+
+    def frame(self, now, contacts):
+        if not contacts:
+            if not self.active:
+                return None
+            result = self.classify(now)
+            self.reset()
+            return result
+        if not self.active:
+            self.active, self.t0 = True, now
+        for tid, pos in contacts.items():
+            start = self.first.setdefault(tid, pos)
+            self.last[tid] = pos
+            self.moved = max(self.moved, ((pos[0] - start[0]) ** 2 + (pos[1] - start[1]) ** 2) ** 0.5)
+        n = len(contacts)
+        points = list(contacts.values())
+        if n > self.max_fingers:
+            self.max_fingers, self.group_start = n, points
+        if n == self.max_fingers:
+            self.group_end = points
+        return None
+
+    def classify(self, now):
+        n, dt = self.max_fingers, now - self.t0
+        if n >= 3:
+            n = min(n, 4)
+            (sx, sy), (ex, ey) = centroid(self.group_start), centroid(self.group_end)
+            dx, dy = ex - sx, ey - sy
+            s0, s1 = spread(self.group_start), spread(self.group_end)
+            ratio = s1 / s0 if s0 > 1 else 1.0
+            travel = max(abs(dx), abs(dy))
+            if ratio < PINCH_IN and travel < SWIPE_MIN:
+                return f"pinch{n}-in", None
+            if ratio > PINCH_OUT and travel < SWIPE_MIN:
+                return f"pinch{n}-out", None
+            if travel >= SWIPE_MIN:
+                if abs(dx) > abs(dy):
+                    return f"swipe{n}-{'right' if dx > 0 else 'left'}", None
+                return f"swipe{n}-{'down' if dy > 0 else 'up'}", None
+            if dt <= TAP_MAX_TIME and self.moved <= TAP_MAX_MOVE:
+                return f"tap{n}", None
+            return None
+        if n == 1 and len(self.first) == 1:
+            (tid,) = self.first.keys()
+            (sx, sy), (ex, ey) = self.first[tid], self.last[tid]
+            dx, dy = ex - sx, ey - sy
+            w, h = SCREEN.w, SCREEN.h
+            ex_zone, ey_zone = EDGE_ZONE * w, EDGE_ZONE * h
+            if sy >= h - ey_zone and -dy >= EDGE_MIN and abs(dx) < -dy:
+                return "edge-bottom", None
+            if sy <= ey_zone and dy >= EDGE_MIN and abs(dx) < dy:
+                return "edge-top", None
+            if sx <= ex_zone and dx >= EDGE_MIN and abs(dy) < dx:
+                return "edge-left", None
+            if sx >= w - ex_zone and -dx >= EDGE_MIN and abs(dy) < -dx:
+                return "edge-right", None
+            if dt >= LONG_TIME and self.moved <= LONG_SLOP:
+                return "longpress", (sx, sy)
+        return None
+
+
+# --- actions ------------------------------------------------------------------------
+def run_action(name, pos, actions, clicker):
+    command = actions.get(name, "")
+    debug(f"gesture {name}" + (f" at {pos[0]:.0f},{pos[1]:.0f}" if pos else "") + f" -> {command or '(none)'}")
+    if DRY or not command:
+        return
+    env = hypr_env()
+    if command == "rightclick":
+        active = hyprctl_json("activewindow") or {}
+        if re.search(LONGPRESS_SKIP, active.get("class", "") or ""):
+            debug(f"long press left to {active.get('class')} (it has its own)")
+            return
+        x, y = SCREEN.x + pos[0], SCREEN.y + pos[1]
+        subprocess.run(["hyprctl", "dispatch", f"hl.dsp.cursor.move({{ x = {x:.0f}, y = {y:.0f} }})"],
+                       env=env, capture_output=True, timeout=3)
+        clicker.click()
+        return
+    subprocess.Popen(["bash", "-c", command], env=env, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+SCREEN = Screen()
+
+
+def serve(dev, actions, clicker):
+    fd = os.open(dev["path"], os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        xmin, xmax = absinfo(fd, ABS_MT_POSITION_X)
+        ymin, ymax = absinfo(fd, ABS_MT_POSITION_Y)
+        log(f"using {dev['path']} ({dev['name']}), x {xmin}..{xmax}, y {ymin}..{ymax}")
+        SCREEN.refresh(force=True)
+        # A slot keeps its last position across contacts: evdev only reports
+        # an axis that changed, so a finger landing on the same row as the
+        # slot's previous one sends no Y at all.
+        slots, pos, slot = {}, {}, 0
+        rec = Recognizer()
+        poll = select.poll()
+        poll.register(fd, select.POLLIN)
+        last_debug = 0.0
+        while True:
+            if not poll.poll(1000):
+                continue
+            try:
+                data = os.read(fd, EVENT.size * 64)
+            except BlockingIOError:
+                continue
+            for off in range(0, len(data) - EVENT.size + 1, EVENT.size):
+                _, _, etype, code, value = EVENT.unpack_from(data, off)
+                if etype == EV_ABS:
+                    if code == ABS_MT_SLOT:
+                        slot = value
+                    elif code == ABS_MT_TRACKING_ID:
+                        if value < 0:
+                            slots.pop(slot, None)
+                        else:
+                            slots[slot] = value
+                    elif code == ABS_MT_POSITION_X:
+                        pos.setdefault(slot, [None, None])[0] = value
+                    elif code == ABS_MT_POSITION_Y:
+                        pos.setdefault(slot, [None, None])[1] = value
+                elif etype == EV_SYN and code == SYN_DROPPED:
+                    slots.clear()
+                    pos.clear()
+                    rec.reset()
+                elif etype == EV_SYN and code == SYN_REPORT:
+                    now = time.monotonic()
+                    if not rec.active and slots:
+                        SCREEN.refresh()
+                    contacts = {}
+                    for s, tid in slots.items():
+                        x, y = pos.get(s, (None, None))
+                        if x is None or y is None:
+                            continue
+                        u = (x - xmin) / max(1, xmax - xmin)
+                        v = (y - ymin) / max(1, ymax - ymin)
+                        contacts[tid] = SCREEN.logical(u, v)
+                    if DEBUG and contacts and now - last_debug > 0.1:
+                        last_debug = now
+                        debug("contacts " + " ".join(f"{x:.0f},{y:.0f}" for x, y in contacts.values()))
+                    result = rec.frame(now, contacts)
+                    if result:
+                        run_action(result[0], result[1], actions, clicker)
+    finally:
+        os.close(fd)
+
+
+def main():
+    if "-h" in sys.argv or "--help" in sys.argv:
+        print(__doc__)
+        return 0
+    if "--list" in sys.argv:
+        chosen = find_device()
+        for path in sorted(glob.glob("/dev/input/event*")):
+            info, err = describe(path)
+            if info:
+                mark = "*" if chosen and chosen["path"] == path else " "
+                print(f"{mark} {path}: {info['name']} (multitouch {info['mt']}, direct {info['direct']})")
+            else:
+                print(f"  {path}: {err}")
+        return 0
+    actions = load_actions()
+    clicker = RightClicker() if not DRY and actions.get("longpress") == "rightclick" else None
+    warned = False
+    while True:
+        dev = find_device()
+        if not dev:
+            if not warned:
+                log("no touchscreen readable yet (udev rule? the input group?); retrying")
+                warned = True
+            time.sleep(5)
+            continue
+        warned = False
+        try:
+            serve(dev, actions, clicker)
+        except OSError as e:
+            log(f"{dev['path']}: {e}; looking for the touchscreen again")
+            time.sleep(2)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(0)

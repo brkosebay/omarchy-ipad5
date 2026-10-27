@@ -1,0 +1,637 @@
+From fccffe153982bcbaab5aa531aa41826a0b4b4b69 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 02:36:19 +0000
+Subject: [PATCH 4/5] ASoC: apple: s8000-mca: add capture over SmartIO (MCA0
+ RX)
+
+Add a capture stream when the node has a SmartIO "rx" DMA channel
+(MCA0 RX is endpoint 0x29). The generic dmaengine PCM fails the whole
+card for a DAI stream without a channel, so without "rx" the DAI keeps
+only playback, as before.
+
+RX uses iOS's _setIISConfig_v4 values: RX_CFG 0x132 (0x133 to run),
+RX_FIFO_CFG 0x00030004 and slot mask 3. iOS requests the SmartIO depth
+with the same per-millisecond formula for both directions; the DMA
+driver's validFIFODepth then gives RX min(request, trigger), 192 bytes
+at 48 kHz. Each direction gets its own shim record.
+
+TX and RX share the frame, the IRQ mask and the run bit, so they are
+now handled per direction. The first prepared direction programs the
+whole block as before; the second one only resets and programs its own
+half (RESET bit 0 for TX, bit 1 for RX). The frame stops when the last
+direction stops, and the route and frame are torn down when the last
+one is freed. A direction's FIFO error causes are unmasked only while
+it is prepared: playback alone now leaves the RX causes masked (iOS
+unmasks them too). Trigger and the IRQ handler serialize the shared
+state with a spinlock. debugfs reports the first-error timing per
+direction ("last playback stream", "last capture stream").
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ sound/soc/apple/s8000-mca.c | 363 +++++++++++++++++++++++++++---------
+ 1 file changed, 280 insertions(+), 83 deletions(-)
+
+diff --git a/sound/soc/apple/s8000-mca.c b/sound/soc/apple/s8000-mca.c
+index 48f9da532c..bc5553bd83 100644
+--- a/sound/soc/apple/s8000-mca.c
++++ b/sound/soc/apple/s8000-mca.c
+@@ -9,13 +9,19 @@
+  * MCLK) and the i2s-switch route (a syscon; route register values from DT).
+  *
+  * Data path: iOS feeds the MCA through SmartIO DMA (endpoint 0x28 for MCA0
+- * TX). With "dmas"/"dma-names = tx" the generic dmaengine PCM runs on the
+- * apple-sio-dma driver; the SmartIO shim record (ADT dma-channels words) is
+- * passed as the slave config's peripheral_config. Without DMA (or with
+- * nodma=1), a timer-driven PCM keeps the stream running and, if
+- * "apple,pio-fifo-offset" names a CPU writable FIFO port (unverified, see
+- * test plan), feeds it from the MCA's TX-low-water interrupt. Otherwise
+- * samples are discarded: clocks, codec and speakers still run.
++ * TX, 0x29 for MCA0 RX). With "dmas"/"dma-names = tx[, rx]" the generic
++ * dmaengine PCM runs on the apple-sio-dma driver; the SmartIO shim record
++ * (ADT dma-channels words) is passed as the slave config's
++ * peripheral_config. Capture exists only with an "rx" channel. Without DMA
++ * (or with nodma=1), a timer-driven playback PCM keeps the stream running
++ * and, if "apple,pio-fifo-offset" names a CPU writable FIFO port
++ * (unverified, see test plan), feeds it from the MCA's TX-low-water
++ * interrupt. Otherwise samples are discarded: clocks, codec and speakers
++ * still run.
++ *
++ * TX and RX share the frame (clocks, slot width, run bit) and the IRQ: the
++ * first prepared direction programs the whole block, the other one only
++ * resets and programs its own half, and the frame stops with the last.
+  */
+ 
+ #include <linux/bitfield.h>
+@@ -80,7 +86,14 @@
+ #define  MCA_IRQ_ERRORS		(MCA_IRQ_TX_UNDERFLOW | MCA_IRQ_TX_OVERFLOW | \
+ 				 MCA_IRQ_RX_UNDERFLOW | MCA_IRQ_RX_OVERFLOW | \
+ 				 MCA_IRQ_FRAME_ERROR)
+-#define  MCA_IRQ_MASK_IOS	0x1fe4	/* iOS v4, no frame-error override */
++/*
++ * iOS v4 unmasks only the four FIFO error causes (mask 0x1fe4); split per
++ * direction so a direction's causes are only open while it is prepared.
++ */
++#define  MCA_IRQ_TX_CAUSES	(MCA_IRQ_TX_UNDERFLOW | MCA_IRQ_TX_OVERFLOW)
++#define  MCA_IRQ_RX_CAUSES	(MCA_IRQ_RX_UNDERFLOW | MCA_IRQ_RX_OVERFLOW)
++#define  MCA_IRQ_TX_ALL		GENMASK(2, 0)
++#define  MCA_IRQ_RX_ALL		GENMASK(5, 3)
+ #define MCA_FLUSH		0x24
+ #define MCA_TX_CFG		0x60
+ #define MCA_TX_FIFO_CFG		0x64
+@@ -92,6 +105,11 @@
+ #define MCA_RX_SLOTS_HI		0x8c
+ #define  MCA_XX_CFG_EN		BIT(0)
+ 
++/* iOS _setIISConfig_v4 values for MCA0 (playback-path.md section 3) */
++#define MCA_TX_CFG_I2S		(BIT(8) | 0x33 | 0x4)	/* enable: 0x137 */
++#define MCA_RX_CFG_I2S		(BIT(8) | 0x33)		/* enable: 0x133 */
++#define MCA_RX_FIFO_CFG_IOS	0x00030004	/* RX depth 4 (mcaKeepDMABusy) */
++
+ static bool nodma;
+ module_param(nodma, bool, 0444);
+ MODULE_PARM_DESC(nodma, "ignore dmas, use the timer PCM (clock/codec tests)");
+@@ -132,13 +150,22 @@ struct s8000_mca {
+ 
+ 	u32 fifo_tx;
+ 	bool use_dma;
+-	struct snd_dmaengine_dai_dma_data dma_tx;
++	bool capture;		/* SmartIO "rx" channel present */
++	struct snd_soc_dai_driver dai_drv;
++	struct snd_dmaengine_dai_dma_data dma_tx, dma_rx;
+ 	/* SmartIO shim words from DT: xfer 16-bit, xfer 32-bit, timeout, fifo, trigger */
+ 	u32 sio_dt[5];
+-	struct apple_sio_dma_config sio_cfg;
++	struct apple_sio_dma_config sio_cfg[2];	/* per SNDRV_PCM_STREAM_* */
+ 
+ 	/* computed in hw_params, written in prepare */
+-	u32 sample, frame, tx_cfg, tx_fifo_cfg, tx_slots;
++	u32 sample, frame, tx_cfg, tx_fifo_cfg, tx_slots, rx_slots;
++
++	/*
++	 * BIT(SNDRV_PCM_STREAM_*): prepared (prepare .. hw_free) and running
++	 * (trigger start .. stop). Under hw_lock with frame RUN and irq_mask.
++	 */
++	spinlock_t hw_lock;
++	unsigned int prep_mask, run_mask;
+ 
+ 	/* timer/PIO PCM */
+ 	spinlock_t lock;
+@@ -158,11 +185,13 @@ struct s8000_mca {
+ 	u32 mclk_cur;		/* last MCLK word written (0 = off) */
+ 	bool mclk_on;		/* MCLK clock enabled: word written */
+ 	bool route_on;		/* i2s-switch route applied */
+-	/* last stream: tells a start-up underflow from recurring ones */
+-	ktime_t start_time;
+-	s64 first_err_us;	/* first error IRQ after start, -1 = none */
+-	u32 first_err_status;
+-	u32 stop_status;	/* raw IRQ_STATUS at stop; masked causes latch too */
++	/* last stream per direction: a start-up underflow vs recurring ones */
++	struct {
++		ktime_t start_time;
++		s64 first_err_us;	/* first error IRQ after start, -1 = none */
++		u32 first_err_status;
++		u32 stop_status;	/* raw IRQ_STATUS at stop */
++	} last[2];
+ 	bool mclk_forced;	/* debugfs s8000-mca-mclk */
+ 	struct mutex dbg_lock;	/* debugfs s8000-mca-mclk */
+ 	u32 route_ovr[16];	/* parsed "route" parameter */
+@@ -319,6 +348,9 @@ static int mca_hw_params(struct snd_pcm_substream *substream,
+ 			 struct snd_soc_dai *dai)
+ {
+ 	struct s8000_mca *mca = snd_soc_dai_get_drvdata(dai);
++	struct snd_dmaengine_dai_dma_data *dma =
++		substream->stream == SNDRV_PCM_STREAM_PLAYBACK ? &mca->dma_tx :
++								 &mca->dma_rx;
+ 	unsigned int bits = params_width(params);
+ 	unsigned int slot = params_physical_width(params);
+ 	unsigned int channels = params_channels(params);
+@@ -334,36 +366,69 @@ static int mca_hw_params(struct snd_pcm_substream *substream,
+ 	default: return -EINVAL;
+ 	}
+ 
+-	/* _setIISConfig_v4 for: consumer, MCLK out, I2S, 2 slots */
++	/*
++	 * _setIISConfig_v4 for: consumer, MCLK out, I2S, 2 slots. The DAI is
++	 * symmetric, so both directions compute the same values for both
++	 * halves; prepare writes the half (or the block) it owns.
++	 */
+ 	mca->sample = (32 - bits) << 8 | (32 - bits);
+ 	depth = mca_tx_depth(mca, params_rate(params), channels);
+ 	mca->tx_fifo_cfg = depth | (depth - 1) << 16;
+ 	mca->tx_slots = GENMASK(slots - 1, 0);
++	mca->rx_slots = GENMASK(slots - 1, 0);
+ 	/* bits 15:8 = data delay (1, I2S); 0x33 base; 0x4 for format 0 */
+-	mca->tx_cfg = 1 << 8 | 0x33 | 0x4;
++	mca->tx_cfg = MCA_TX_CFG_I2S;
+ 	mca->frame = FIELD_PREP(MCA_FRAME_HALF, frame_bits / 2 - 1) |
+ 		     FIELD_PREP(MCA_FRAME_WIDTH, width_code) |
+ 		     FIELD_PREP(MCA_FRAME_SLOTS, slots - 1) |
+ 		     FIELD_PREP(MCA_FRAME_MCLK_DIV, 0) |
+ 		     MCA_FRAME_DUTY | MCA_FRAME_FMT;
+ 
+-	mca->dma_tx.addr_width = slot == 16 ? DMA_SLAVE_BUSWIDTH_2_BYTES :
+-					      DMA_SLAVE_BUSWIDTH_4_BYTES;
+-	mca->dma_tx.maxburst = depth;
++	dma->addr_width = slot == 16 ? DMA_SLAVE_BUSWIDTH_2_BYTES :
++				       DMA_SLAVE_BUSWIDTH_4_BYTES;
++	/* informational: the SmartIO limit comes from mca_prepare_slave_config */
++	dma->maxburst = substream->stream == SNDRV_PCM_STREAM_PLAYBACK ? depth :
++			MCA_RX_FIFO_CFG_IOS & 0xffff;
+ 
+ 	dev_dbg(mca->dev, "sample %#x frame %#x txcfg %#x txfifo %#x\n",
+ 		mca->sample, mca->frame, mca->tx_cfg, mca->tx_fifo_cfg);
+ 	return 0;
+ }
+ 
+-static int mca_prepare(struct snd_pcm_substream *substream,
+-		       struct snd_soc_dai *dai)
++static u32 mca_dir_causes(struct s8000_mca *mca, bool tx)
+ {
+-	struct s8000_mca *mca = snd_soc_dai_get_drvdata(dai);
+-	u32 val, mask = MCA_IRQ_MASK_IOS;
++	if (!tx)
++		return MCA_IRQ_RX_CAUSES;
++	return MCA_IRQ_TX_CAUSES | (mca->pio_off ? MCA_IRQ_TX_LOW_WATER : 0);
++}
++
++static void mca_write_tx(struct s8000_mca *mca)
++{
++	mca_write(mca, MCA_TX_FIFO_CFG, mca->tx_fifo_cfg);
++	mca_write(mca, MCA_TX_SLOTS, mca->tx_slots);
++	mca_write(mca, MCA_TX_SLOTS_HI, 0);
++	mca_write(mca, MCA_TX_CFG, mca->tx_cfg & ~MCA_XX_CFG_EN);
++}
++
++static void mca_write_rx(struct s8000_mca *mca)
++{
++	mca_write(mca, MCA_RX_FIFO_CFG, MCA_RX_FIFO_CFG_IOS);
++	mca_write(mca, MCA_RX_SLOTS, mca->rx_slots);
++	mca_write(mca, MCA_RX_SLOTS_HI, 0);
++	mca_write(mca, MCA_RX_CFG, MCA_RX_CFG_I2S & ~MCA_XX_CFG_EN);
++}
++
++/* the whole block, as _setIISConfig_v4: only while no direction is prepared */
++static int mca_init_block(struct s8000_mca *mca)
++{
++	unsigned long flags;
++	u32 val;
+ 	int ret;
+ 
++	spin_lock_irqsave(&mca->hw_lock, flags);
+ 	mca->irq_mask = MCA_IRQ_ALL;
++	spin_unlock_irqrestore(&mca->hw_lock, flags);
++
+ 	mca_write(mca, MCA_RESET, MCA_RESET_TX | MCA_RESET_RX);
+ 	ret = readl_relaxed_poll_timeout(mca->base + MCA_RESET, val,
+ 					 !(val & (MCA_RESET_TX | MCA_RESET_RX)),
+@@ -385,21 +450,70 @@ static int mca_prepare(struct snd_pcm_substream *substream,
+ 	mca_write(mca, MCA_IRQ_STATUS, MCA_IRQ_ALL);
+ 	mca_write(mca, MCA_SAMPLE, mca->sample);
+ 	mca_write(mca, MCA_TX_FIFO_CFG, mca->tx_fifo_cfg);
+-	mca_write(mca, MCA_RX_FIFO_CFG, 0x00030004);
++	mca_write(mca, MCA_RX_FIFO_CFG, MCA_RX_FIFO_CFG_IOS);
+ 	mca_write(mca, MCA_PAD, 0);
+ 	mca_write(mca, MCA_TX_SLOTS, mca->tx_slots);
+ 	mca_write(mca, MCA_TX_SLOTS_HI, 0);
+-	mca_write(mca, MCA_RX_SLOTS, mca->tx_slots);
++	mca_write(mca, MCA_RX_SLOTS, mca->rx_slots);
+ 	mca_write(mca, MCA_RX_SLOTS_HI, 0);
+ 	mca_write(mca, MCA_TX_CFG, mca->tx_cfg & ~MCA_XX_CFG_EN);
+-	mca_write(mca, MCA_RX_CFG, 0x133 & ~MCA_XX_CFG_EN);
+-	if (mca->pio_off)
+-		mask &= ~MCA_IRQ_TX_LOW_WATER;
+-	mca->irq_mask = mask;
+-	mca_write(mca, MCA_IRQ_MASK, mask);
+-	mca_write(mca, MCA_FRAME, mca->frame);
+-
+-	mca_route(mca, true);
++	mca_write(mca, MCA_RX_CFG, MCA_RX_CFG_I2S & ~MCA_XX_CFG_EN);
++	return 0;
++}
++
++/* one direction while the other is prepared or running: leave the frame */
++static int mca_init_dir(struct s8000_mca *mca, bool tx)
++{
++	u32 bit = tx ? MCA_RESET_TX : MCA_RESET_RX, val;
++	int ret;
++
++	mca_write(mca, MCA_RESET, bit);
++	ret = readl_relaxed_poll_timeout(mca->base + MCA_RESET, val,
++					 !(val & bit), MCA_POLL_US,
++					 MCA_TIMEOUT_US);
++	if (ret) {
++		dev_err(mca->dev, "%s reset timed out (%#x)\n",
++			tx ? "TX" : "RX", val);
++		return ret;
++	}
++
++	mca_write(mca, MCA_SAMPLE, mca->sample);
++	if (tx)
++		mca_write_tx(mca);
++	else
++		mca_write_rx(mca);
++	mca_write(mca, MCA_IRQ_STATUS, tx ? MCA_IRQ_TX_ALL : MCA_IRQ_RX_ALL);
++	return 0;
++}
++
++static int mca_prepare(struct snd_pcm_substream *substream,
++		       struct snd_soc_dai *dai)
++{
++	struct s8000_mca *mca = snd_soc_dai_get_drvdata(dai);
++	int dir = substream->stream;
++	bool tx = dir == SNDRV_PCM_STREAM_PLAYBACK, first;
++	unsigned long flags;
++	int ret;
++
++	/* ASoC serializes prepare/hw_free of the card's streams (pcm_mutex) */
++	spin_lock_irqsave(&mca->hw_lock, flags);
++	first = !(mca->prep_mask & ~BIT(dir));
++	spin_unlock_irqrestore(&mca->hw_lock, flags);
++
++	ret = first ? mca_init_block(mca) : mca_init_dir(mca, tx);
++	if (ret)
++		return ret;
++
++	spin_lock_irqsave(&mca->hw_lock, flags);
++	mca->prep_mask |= BIT(dir);
++	mca->irq_mask &= ~mca_dir_causes(mca, tx);
++	mca_write(mca, MCA_IRQ_MASK, mca->irq_mask);
++	if (first)
++		mca_write(mca, MCA_FRAME, mca->frame);
++	spin_unlock_irqrestore(&mca->hw_lock, flags);
++
++	if (first)
++		mca_route(mca, true);
+ 	return 0;
+ }
+ 
+@@ -407,12 +521,26 @@ static int mca_hw_free(struct snd_pcm_substream *substream,
+ 		       struct snd_soc_dai *dai)
+ {
+ 	struct s8000_mca *mca = snd_soc_dai_get_drvdata(dai);
++	int dir = substream->stream;
++	unsigned long flags;
++	bool last;
++
++	spin_lock_irqsave(&mca->hw_lock, flags);
++	mca->prep_mask &= ~BIT(dir);
++	last = !mca->prep_mask;
++	if (last) {
++		/* back to the idle state runtime resume sets up: everything masked */
++		mca->irq_mask = MCA_IRQ_ALL;
++		mca_write(mca, MCA_FRAME, 0);
++	} else {
++		mca->irq_mask |= dir == SNDRV_PCM_STREAM_PLAYBACK ?
++				 MCA_IRQ_TX_ALL : MCA_IRQ_RX_ALL;
++	}
++	mca_write(mca, MCA_IRQ_MASK, mca->irq_mask);
++	spin_unlock_irqrestore(&mca->hw_lock, flags);
+ 
+-	/* back to the idle state runtime resume sets up: everything masked */
+-	mca->irq_mask = MCA_IRQ_ALL;
+-	mca_write(mca, MCA_IRQ_MASK, MCA_IRQ_ALL);
+-	mca_write(mca, MCA_FRAME, 0);
+-	mca_route(mca, false);
++	if (last)
++		mca_route(mca, false);
+ 	return 0;
+ }
+ 
+@@ -420,37 +548,60 @@ static int mca_trigger(struct snd_pcm_substream *substream, int cmd,
+ 		       struct snd_soc_dai *dai)
+ {
+ 	struct s8000_mca *mca = snd_soc_dai_get_drvdata(dai);
+-	u32 val;
++	int dir = substream->stream;
++	bool tx = dir == SNDRV_PCM_STREAM_PLAYBACK;
++	u32 reset = tx ? MCA_RESET_TX : MCA_RESET_RX, val;
++	unsigned long flags;
++	int ret;
+ 
+ 	switch (cmd) {
+ 	case SNDRV_PCM_TRIGGER_START:
+ 	case SNDRV_PCM_TRIGGER_RESUME:
+ 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+-		mca->start_time = ktime_get();
+-		mca->first_err_us = -1;
+-		mca->stop_status = 0;
+-		mca_write(mca, MCA_IRQ_STATUS, MCA_IRQ_ALL);
+-		if (mca->pio_off) {
++		spin_lock_irqsave(&mca->hw_lock, flags);
++		mca->last[dir].start_time = ktime_get();
++		mca->last[dir].first_err_us = -1;
++		mca->last[dir].stop_status = 0;
++		/* the other direction's pending causes are not ours to clear */
++		mca_write(mca, MCA_IRQ_STATUS, !mca->run_mask ? MCA_IRQ_ALL :
++			  tx ? MCA_IRQ_TX_ALL : MCA_IRQ_RX_ALL);
++		if (tx && mca->pio_off) {
+ 			mca->irq_mask &= ~MCA_IRQ_TX_LOW_WATER;
+ 			mca_write(mca, MCA_IRQ_MASK, mca->irq_mask);
+ 		}
+-		mca_write(mca, MCA_TX_CFG, mca->tx_cfg | MCA_XX_CFG_EN);
++		if (tx)
++			mca_write(mca, MCA_TX_CFG, mca->tx_cfg | MCA_XX_CFG_EN);
++		else
++			mca_write(mca, MCA_RX_CFG, MCA_RX_CFG_I2S | MCA_XX_CFG_EN);
++		mca->run_mask |= BIT(dir);
+ 		mca_write(mca, MCA_FRAME, mca->frame | MCA_FRAME_RUN);
++		spin_unlock_irqrestore(&mca->hw_lock, flags);
+ 		return 0;
+ 	case SNDRV_PCM_TRIGGER_STOP:
+ 	case SNDRV_PCM_TRIGGER_SUSPEND:
+ 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+-		/* an empty FIFO would keep TX low-water firing until prepare */
+-		mca->stop_status = mca_read(mca, MCA_IRQ_STATUS);
+-		mca->irq_mask |= MCA_IRQ_TX_LOW_WATER;
+-		mca_write(mca, MCA_IRQ_MASK, mca->irq_mask);
+-		mca_write(mca, MCA_TX_CFG, 0);
+-		mca_write(mca, MCA_FRAME, mca->frame);
+-		mca_write(mca, MCA_RESET, MCA_RESET_TX);
+-		if (readl_relaxed_poll_timeout_atomic(mca->base + MCA_RESET, val,
+-						      !(val & MCA_RESET_TX), 1,
+-						      1000))
+-			dev_warn(mca->dev, "TX reset timed out\n");
++		spin_lock_irqsave(&mca->hw_lock, flags);
++		mca->last[dir].stop_status = mca_read(mca, MCA_IRQ_STATUS);
++		if (tx) {
++			/* an empty FIFO would keep TX low-water firing until prepare */
++			mca->irq_mask |= MCA_IRQ_TX_LOW_WATER;
++			mca_write(mca, MCA_IRQ_MASK, mca->irq_mask);
++			mca_write(mca, MCA_TX_CFG, 0);
++		} else {
++			mca_write(mca, MCA_RX_CFG, 0);
++		}
++		mca->run_mask &= ~BIT(dir);
++		if (!mca->run_mask)
++			mca_write(mca, MCA_FRAME, mca->frame);
++		/* TX stops with RESET = 1, RX with RESET = 2 (iOS) */
++		mca_write(mca, MCA_RESET, reset);
++		ret = readl_relaxed_poll_timeout_atomic(mca->base + MCA_RESET,
++							val, !(val & reset), 1,
++							1000);
++		spin_unlock_irqrestore(&mca->hw_lock, flags);
++		if (ret)
++			dev_warn(mca->dev, "%s reset timed out\n",
++				 tx ? "TX" : "RX");
+ 		return 0;
+ 	}
+ 
+@@ -461,7 +612,8 @@ static int mca_dai_probe(struct snd_soc_dai *dai)
+ {
+ 	struct s8000_mca *mca = snd_soc_dai_get_drvdata(dai);
+ 
+-	snd_soc_dai_init_dma_data(dai, &mca->dma_tx, NULL);
++	snd_soc_dai_init_dma_data(dai, &mca->dma_tx,
++				  mca->capture ? &mca->dma_rx : NULL);
+ 	return 0;
+ }
+ 
+@@ -474,7 +626,8 @@ static const struct snd_soc_dai_ops mca_dai_ops = {
+ 	.trigger = mca_trigger,
+ };
+ 
+-static struct snd_soc_dai_driver mca_dai = {
++/* template; probe drops .capture without a SmartIO "rx" channel */
++static const struct snd_soc_dai_driver mca_dai = {
+ 	.name = "s8000-mca",
+ 	.playback = {
+ 		.stream_name = "Playback",
+@@ -483,7 +636,17 @@ static struct snd_soc_dai_driver mca_dai = {
+ 		.rates = MCA_RATES,
+ 		.formats = MCA_FORMATS,
+ 	},
++	.capture = {
++		.stream_name = "Capture",
++		.channels_min = 2,
++		.channels_max = 2,
++		.rates = MCA_RATES,
++		.formats = MCA_FORMATS,
++	},
+ 	.ops = &mca_dai_ops,
++	/* one frame (clocks, slot width) for both directions */
++	.symmetric_rate = 1,
++	.symmetric_sample_bits = 1,
+ };
+ 
+ /* --- timer / PIO PCM (no SIO DMA) ----------------------------------------- */
+@@ -683,6 +846,7 @@ static int mca_prepare_slave_config(struct snd_pcm_substream *substream,
+ {
+ 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+ 	struct s8000_mca *mca = snd_soc_dai_get_drvdata(snd_soc_rtd_to_cpu(rtd, 0));
++	struct apple_sio_dma_config *cfg = &mca->sio_cfg[substream->stream];
+ 	unsigned int bytes = params_physical_width(params) / 8;
+ 	unsigned int per_ms;
+ 	int ret;
+@@ -693,20 +857,22 @@ static int mca_prepare_slave_config(struct snd_pcm_substream *substream,
+ 
+ 	/*
+ 	 * AppleSmartIODMA shim record as AppleAE2MCA sets it up: transfer
+-	 * width from the dma-channels entry (16 or 32 bit), and the FIFO
+-	 * depth it requests: sample width * samples per ms, rounded to 4
+-	 * (the DMA driver applies SmartIO's validFIFODepth clamp).
++	 * width from the dma-channels entry (16 or 32 bit; the RX entries
++	 * have the same words), and the FIFO depth it requests for either
++	 * direction: sample width * samples per ms, rounded to 4. The DMA
++	 * driver applies SmartIO's validFIFODepth: TX at least trigger + 4,
++	 * RX at most the trigger (192 B at 48 kHz, under 0x180).
+ 	 */
+ 	per_ms = round_up(params_rate(params) * params_channels(params) / 1000, 4);
+-	mca->sio_cfg = (struct apple_sio_dma_config) {
++	*cfg = (struct apple_sio_dma_config) {
+ 		.xfer = bytes == 2 ? mca->sio_dt[0] : mca->sio_dt[1],
+ 		.timeout = mca->sio_dt[2],
+ 		.fifo = mca->sio_dt[3],
+ 		.trigger = mca->sio_dt[4],
+ 		.limit = bytes * per_ms,
+ 	};
+-	sc->peripheral_config = &mca->sio_cfg;
+-	sc->peripheral_size = sizeof(mca->sio_cfg);
++	sc->peripheral_config = cfg;
++	sc->peripheral_size = sizeof(*cfg);
+ 	return 0;
+ }
+ 
+@@ -722,8 +888,11 @@ static irqreturn_t mca_irq(int irq, void *data)
+ {
+ 	struct s8000_mca *mca = data;
+ 	struct snd_pcm_substream *elapsed = NULL;
+-	u32 raw = mca_read(mca, MCA_IRQ_STATUS), status;
++	u32 raw, status;
++	int dir;
+ 
++	spin_lock(&mca->hw_lock);
++	raw = mca_read(mca, MCA_IRQ_STATUS);
+ 	/*
+ 	 * Only bits 12:0 are interrupt causes (iOS tests status & 0x1fff and
+ 	 * logs "spurious intr" otherwise). Bit 31 also reads as set while a
+@@ -739,6 +908,7 @@ static irqreturn_t mca_irq(int irq, void *data)
+ 		mca_write(mca, MCA_IRQ_STATUS, raw & MCA_IRQ_ALL);
+ 		mca->spurious_count++;
+ 		mca->last_status = raw;
++		spin_unlock(&mca->hw_lock);
+ 		return IRQ_NONE;
+ 	}
+ 
+@@ -750,18 +920,26 @@ static irqreturn_t mca_irq(int irq, void *data)
+ 		/*
+ 		 * Error bits re-latch every frame while the condition lasts
+ 		 * (e.g. TX underflow without a data path): count once, mask
+-		 * them until the next prepare instead of storming.
++		 * them until the direction's next prepare instead of storming.
+ 		 */
+ 		mca->err_count++;
+-		if (mca->first_err_us < 0) {
+-			mca->first_err_us = ktime_us_delta(ktime_get(),
+-							   mca->start_time);
+-			mca->first_err_status = raw;
++		for (dir = 0; dir < 2; dir++) {
++			u32 mine = dir == SNDRV_PCM_STREAM_PLAYBACK ?
++				   MCA_IRQ_TX_ALL : MCA_IRQ_RX_ALL;
++
++			if (!(status & mine & MCA_IRQ_ERRORS) ||
++			    mca->last[dir].first_err_us >= 0)
++				continue;
++			mca->last[dir].first_err_us =
++				ktime_us_delta(ktime_get(),
++					       mca->last[dir].start_time);
++			mca->last[dir].first_err_status = raw;
+ 		}
+ 		mca->irq_mask |= status & MCA_IRQ_ERRORS;
+ 		mca_write(mca, MCA_IRQ_MASK, mca->irq_mask);
+ 		dev_dbg_ratelimited(mca->dev, "irq status %#x, masked\n", status);
+ 	}
++	spin_unlock(&mca->hw_lock);
+ 
+ 	if ((status & MCA_IRQ_TX_LOW_WATER) && mca->pio_off) {
+ 		spin_lock(&mca->lock);
+@@ -826,6 +1004,7 @@ static int mca_regs_show(struct seq_file *s, void *unused)
+ {
+ 	struct s8000_mca *mca = dev_get_drvdata(s->private);
+ 	unsigned int off, val;
++	int dir;
+ 
+ 	seq_printf(s, "irqs %lu errors %lu spurious %lu last status %#x irq_mask %#x\n",
+ 		   mca->irq_count, mca->err_count, mca->spurious_count,
+@@ -834,13 +1013,21 @@ static int mca_regs_show(struct seq_file *s, void *unused)
+ 		   mca->mclk_cur, mca->mclk_on ? ", clock on" : "",
+ 		   mca->mclk_forced ? ", forced" : "",
+ 		   mca->route_on ? "applied" : "off");
+-	if (mca->first_err_us >= 0)
+-		seq_printf(s, "last stream: first error %lld us after start (status %#x), status at stop %#x\n",
+-			   mca->first_err_us, mca->first_err_status,
+-			   mca->stop_status);
+-	else
+-		seq_printf(s, "last stream: no error IRQ, status at stop %#x\n",
+-			   mca->stop_status);
++	seq_printf(s, "capture %s, prepared %#x running %#x (bit 0 playback, 1 capture)\n",
++		   mca->capture ? "yes" : "no", mca->prep_mask, mca->run_mask);
++	for (dir = 0; dir < 2; dir++) {
++		const char *name = dir == SNDRV_PCM_STREAM_PLAYBACK ?
++				   "playback" : "capture";
++
++		if (mca->last[dir].first_err_us >= 0)
++			seq_printf(s, "last %s stream: first error %lld us after start (status %#x), status at stop %#x\n",
++				   name, mca->last[dir].first_err_us,
++				   mca->last[dir].first_err_status,
++				   mca->last[dir].stop_status);
++		else
++			seq_printf(s, "last %s stream: no error IRQ, status at stop %#x\n",
++				   name, mca->last[dir].stop_status);
++	}
+ 
+ 	if (pm_runtime_get_if_active(mca->dev) <= 0) {
+ 		seq_puts(s, "runtime-suspended: registers not read\n");
+@@ -935,6 +1122,7 @@ static int s8000_mca_probe(struct platform_device *pdev)
+ 		return -ENOMEM;
+ 	mca->dev = dev;
+ 	spin_lock_init(&mca->lock);
++	spin_lock_init(&mca->hw_lock);
+ 	ret = devm_mutex_init(dev, &mca->dbg_lock);
+ 	if (ret)
+ 		return ret;
+@@ -971,7 +1159,8 @@ static int s8000_mca_probe(struct platform_device *pdev)
+ 		return dev_err_probe(dev, -EINVAL, "bad apple,pio-fifo-offset\n");
+ 
+ 	mca->irq_mask = MCA_IRQ_ALL;
+-	mca->first_err_us = -1;
++	mca->last[SNDRV_PCM_STREAM_PLAYBACK].first_err_us = -1;
++	mca->last[SNDRV_PCM_STREAM_CAPTURE].first_err_us = -1;
+ 	mca->irq = platform_get_irq(pdev, 0);
+ 	if (mca->irq < 0)
+ 		return mca->irq;
+@@ -997,10 +1186,14 @@ static int s8000_mca_probe(struct platform_device *pdev)
+ 
+ 	mca->fifo_tx = FIELD_GET(MCA_FIFO_SIZE_TX, fifo);
+ 	mca->use_dma = of_property_present(np, "dmas") && !nodma;
+-	dev_info(dev, "MCA version %u, FIFO tx %u rx %u, %s\n", ver,
++	/* the generic PCM fails the card if a DAI stream has no channel */
++	mca->capture = mca->use_dma &&
++		       of_property_match_string(np, "dma-names", "rx") >= 0;
++	dev_info(dev, "MCA version %u, FIFO tx %u rx %u, %s%s\n", ver,
+ 		 mca->fifo_tx, (u32)FIELD_GET(MCA_FIFO_SIZE_RX, fifo),
+ 		 mca->use_dma ? "SmartIO DMA" :
+-		 mca->pio_off ? "PIO (experimental)" : "timer PCM, no data path");
++		 mca->pio_off ? "PIO (experimental)" : "timer PCM, no data path",
++		 mca->capture ? ", capture" : "");
+ 	if (ver != 4 || mca->fifo_tx != 0x40)
+ 		dev_warn(dev, "expected version 4 / FIFO 0x40 (iOS)\n");
+ 	if (mca->fifo_tx < 8)
+@@ -1027,10 +1220,14 @@ static int s8000_mca_probe(struct platform_device *pdev)
+ 	of_property_read_u32_array(np, "apple,sio-dma-config", mca->sio_dt,
+ 				   ARRAY_SIZE(mca->sio_dt));
+ 
++	mca->dai_drv = mca_dai;
++	if (!mca->capture)
++		memset(&mca->dai_drv.capture, 0, sizeof(mca->dai_drv.capture));
++
+ 	ret = devm_snd_soc_register_component(dev, mca->use_dma ?
+ 					      &mca_component_dma :
+ 					      &mca_component_pio,
+-					      &mca_dai, 1);
++					      &mca->dai_drv, 1);
+ 	if (ret)
+ 		return ret;
+ 
+-- 
+2.56.0
+

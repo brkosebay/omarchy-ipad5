@@ -1,0 +1,12 @@
+{
+  "branch": "a9/periph",
+  "base": "64221b189e77eb7de61f5c38d30de2fd53927de5",
+  "head": "46864bf1264874b31f9eff73dda5f1b529ca013a",
+  "incremental_after": "patches/periph/0055-*",
+  "patches": {
+    "0001-usb-dwc2-enter-L0-before-resuming-clock-gated-gadget.patch": "603105cd37c75260cf3ee0bd17140044897cce7d44b829eaa40bc78bcc1cf632",
+    "0002-usb-gadget-ecm-refresh-carrier-notifications-after-r.patch": "b26e7c97d706c34ad9007dfcb024befa8a09861186fa6ef4b2bd8a6f81b34003"
+  },
+  "device_access": false,
+  "hardware_tested": false
+}

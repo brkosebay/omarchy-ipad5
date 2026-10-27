@@ -1,0 +1,33 @@
+#!/bin/bash
+# Apply linux-a9's local Omarchy patches to the installed runtime, idempotently.
+# The patches are upstream-format (Omarchy repo paths). On an installed system
+# bin/ lives under /usr and the rest Omarchy ships (install/, default/) under
+# /usr/share/omarchy; test/ isn't installed and is skipped. Run by the pacman
+# hook 90-linux-a9-omarchy-patches.hook and once by the image build.
+set -uo pipefail
+
+dir=/usr/local/share/linux-a9/omarchy-patches
+parts=("/usr bin/*" "/usr/share/omarchy install/*" "/usr/share/omarchy default/*")
+status=0
+
+for patch in "$dir"/*.patch; do
+  [[ -f $patch ]] || continue
+  name=${patch##*/}
+  for part in "${parts[@]}"; do
+    root=${part%% *}
+    include=${part#* }
+    # Does this patch touch anything under this part of the tree?
+    [[ -n $(git -C "$root" apply --include="$include" --numstat "$patch" 2>/dev/null) ]] || continue
+    if git -C "$root" apply --include="$include" --reverse --check "$patch" 2>/dev/null; then
+      echo "linux-a9: $name ($include) already applied"
+    elif git -C "$root" apply --include="$include" --check "$patch" 2>/dev/null; then
+      git -C "$root" apply --include="$include" "$patch" && echo "linux-a9: applied $name ($include)"
+    else
+      echo "linux-a9: WARNING: $name ($include) no longer applies to the installed Omarchy;" >&2
+      echo "linux-a9: check whether upstream has fixed it, then drop the patch." >&2
+      status=1
+    fi
+  done
+done
+
+exit "$status"

@@ -1,0 +1,50 @@
+From 54a19d61fefc56fef92bdde0f0c3a42004d0061e Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Fri, 23 Oct 2026 11:06:51 +0000
+Subject: [PATCH] PCI: apple-h9p: add an armed one-shot j71t resume panic test
+
+---
+ drivers/pci/controller/pcie-apple-h9p.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/drivers/pci/controller/pcie-apple-h9p.c b/drivers/pci/controller/pcie-apple-h9p.c
+index 4ba83d8861..99d4b83f38 100644
+--- a/drivers/pci/controller/pcie-apple-h9p.c
++++ b/drivers/pci/controller/pcie-apple-h9p.c
+@@ -171,6 +171,25 @@ module_param_named(suspend, h9p_suspend, uint, 0644);
+ MODULE_PARM_DESC(suspend,
+ 	"System sleep: 0 refuse (default), 1 keep links up, 2 also put Wi-Fi's port in L2, 3 every port in L2 (experimental)");
+ 
++/* Orchestrator-only fault injection; never enabled by a normal boot. */
++static bool panic_resume_once;
++module_param(panic_resume_once, bool, 0600);
++MODULE_PARM_DESC(panic_resume_once,
++		 "j71t: deliberately panic before one PCIe resume, only with kdump armed");
++
++static void apple_h9p_crash_resume_test(struct device *dev)
++{
++	if (!of_machine_is_compatible("apple,j71t") ||
++	    !READ_ONCE(panic_resume_once))
++		return;
++	WRITE_ONCE(panic_resume_once, false);
++	if (!kexec_crash_loaded()) {
++		dev_warn(dev, "resume panic test refused: no capture kernel armed\n");
++		return;
++	}
++	panic("j71t: deliberate panic before PCIe resume");
++}
++
+ /* Retrain attempts per port on resume (PERST# asserted in between) */
+ #define H9P_WAKE_LINK_TRIES		2
+ 
+@@ -2577,6 +2596,7 @@ static int apple_h9p_pcie_resume_noirq(struct device *dev)
+ 	if (!pcie)
+ 		return 0;
+ 
++	apple_h9p_crash_resume_test(dev);
+ 	ports = pcie->resume_ports;
+ 	for_each_set_bit(port, &ports, H9P_NUM_PORTS) {
+ 		bool asleep = pcie->down_ports & BIT(port);
+-- 
+2.56.0
+

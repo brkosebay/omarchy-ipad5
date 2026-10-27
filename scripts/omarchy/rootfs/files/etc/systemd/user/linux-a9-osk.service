@@ -1,0 +1,16 @@
+# linux-a9: squeekboard, hidden until ipad-osk shows it (the keyboard button
+# on the bar). Started with the session so it appears without a cold start.
+[Unit]
+Description=linux-a9 on-screen keyboard (squeekboard)
+PartOf=graphical-session.target
+After=graphical-session.target
+ConditionPathExists=/usr/bin/squeekboard
+
+[Service]
+ExecStartPre=-/usr/bin/gsettings set org.gnome.desktop.a11y.applications screen-keyboard-enabled false
+ExecStart=/usr/bin/squeekboard
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

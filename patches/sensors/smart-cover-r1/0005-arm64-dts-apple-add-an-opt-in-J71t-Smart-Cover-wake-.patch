@@ -1,0 +1,77 @@
+From 60c6f2f07baa0876788f1069e30210cc4e60f125 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Sat, 24 Oct 2026 14:02:20 +0000
+Subject: [PATCH 5/5] arm64: dts: apple: add an opt-in J71t Smart Cover wake
+ DTB
+
+Build s8003-j71t-smart-cover.dtb, which opts the PMIC GPIO block into
+serving the hall events and turns both cover switches into IRQ-driven,
+wake-capable gpio-keys on PMIC events 0x30 and 0x3a. Use the 14 ms
+debounce iOS applies to the halls. The default s8003-j71t.dtb keeps the
+polled switches and no PMIC event register access.
+
+Signed-off-by: linux-a9 <linux-a9@localhost>
+---
+ arch/arm64/boot/dts/apple/Makefile            |  1 +
+ .../boot/dts/apple/s8003-j71t-smart-cover.dts | 37 +++++++++++++++++++
+ 2 files changed, 38 insertions(+)
+ create mode 100644 arch/arm64/boot/dts/apple/s8003-j71t-smart-cover.dts
+
+diff --git a/arch/arm64/boot/dts/apple/Makefile b/arch/arm64/boot/dts/apple/Makefile
+index 9fea43f760..bc908dd5b4 100644
+--- a/arch/arm64/boot/dts/apple/Makefile
++++ b/arch/arm64/boot/dts/apple/Makefile
+@@ -28,6 +28,7 @@ dtb-$(CONFIG_ARCH_APPLE) += s8003-j72t.dtb
+ dtb-$(CONFIG_ARCH_APPLE) += s8003-n66m.dtb
+ dtb-$(CONFIG_ARCH_APPLE) += s8003-n69.dtb
+ dtb-$(CONFIG_ARCH_APPLE) += s8003-n71m.dtb
++dtb-$(CONFIG_ARCH_APPLE) += s8003-j71t-smart-cover.dtb
+ dtb-$(CONFIG_ARCH_APPLE) += s8001-j127.dtb
+ dtb-$(CONFIG_ARCH_APPLE) += s8001-j128.dtb
+ dtb-$(CONFIG_ARCH_APPLE) += s8001-j98a.dtb
+diff --git a/arch/arm64/boot/dts/apple/s8003-j71t-smart-cover.dts b/arch/arm64/boot/dts/apple/s8003-j71t-smart-cover.dts
+new file mode 100644
+index 0000000000..14cba5be2c
+--- /dev/null
++++ b/arch/arm64/boot/dts/apple/s8003-j71t-smart-cover.dts
+@@ -0,0 +1,37 @@
++// SPDX-License-Identifier: GPL-2.0+ OR MIT
++/*
++ * iPad 5 (J71t) with the Smart Cover halls on PMIC event IRQs, so that the
++ * cover can wake the system. Opt-in: s8003-j71t.dtb keeps the polled
++ * switches and never touches the PMIC event registers.
++ *
++ * The PMIC event line (AP GPIO 76) comes from s800x-ipad5.dtsi.
++ */
++
++#include "s8003-j71t.dts"
++
++&periph_pmu_gpio {
++	apple,enable-hall-irqs;
++};
++
++/* iOS AppleM68Buttons debounces both halls with its 14000 us default. */
++&{/smart-cover} {
++	compatible = "gpio-keys";
++	/delete-property/ poll-interval;
++
++	lid-switch {
++		interrupts-extended = <&{/soc/i2c@20a110000/pmic@3c} 0x30>;
++		debounce-interval = <14>;
++		wakeup-source;
++	};
++};
++
++&{/smart-cover-aux} {
++	compatible = "gpio-keys";
++	/delete-property/ poll-interval;
++
++	cover-switch {
++		interrupts-extended = <&{/soc/i2c@20a110000/pmic@3c} 0x3a>;
++		debounce-interval = <14>;
++		wakeup-source;
++	};
++};
+-- 
+2.56.0
+

@@ -1,0 +1,80 @@
+From e22fc2eb3fbff42d4d6f8dc7a8f9d0f065c12572 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 11:57:36 +0000
+Subject: [PATCH 6/9] spi: apple: preserve N1 inter-word and chip-select
+ timings
+
+---
+ arch/arm64/boot/dts/apple/s8003-j71t-touch.dtsi |  3 +++
+ drivers/input/touchscreen/apple_n1.c            |  3 +++
+ drivers/spi/spi-apple-s8000.c                   | 14 ++++++++++++--
+ 3 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/apple/s8003-j71t-touch.dtsi b/arch/arm64/boot/dts/apple/s8003-j71t-touch.dtsi
+index 4a9006d11ebd6b764a0554911643f2ed58caeb12..2c25a692db5461edd597a34d997725160e1d34e9 100644
+--- a/arch/arm64/boot/dts/apple/s8003-j71t-touch.dtsi
++++ b/arch/arm64/boot/dts/apple/s8003-j71t-touch.dtsi
+@@ -58,6 +58,9 @@ touchscreen@0 {
+ 			reg = <0>;
+ 			/* N1 selects 83 ns; controller rounds up to divider 6. */
+ 			spi-max-frequency = <12048192>;
++			/* This pinned SPI core applies GPIO CS setup twice. */
++			spi-cs-setup-delay-ns = <5000>;
++			spi-cs-hold-delay-ns = <10000>;
+ 			interrupt-parent = <&pinctrl_ap>;
+ 			interrupts = <65 IRQ_TYPE_EDGE_FALLING>;
+ 			attn-gpios = <&pinctrl_ap 65 GPIO_ACTIVE_LOW>;
+diff --git a/drivers/input/touchscreen/apple_n1.c b/drivers/input/touchscreen/apple_n1.c
+index fa3ac70e5dd1625bb9ffab408807c2d45b18c68c..c37c4bdaf106fd1f77aaf5cb55ec42f83757a899 100644
+--- a/drivers/input/touchscreen/apple_n1.c
++++ b/drivers/input/touchscreen/apple_n1.c
+@@ -692,6 +692,9 @@ static int n1_probe(struct spi_device *spi)
+ 		return -ENOMEM;
+ 	spi_set_drvdata(spi, n1);
+ 	spi->bits_per_word = 8;
++	/* Selected iOS device tuple +12: minimum 5000ns inter-word delay. */
++	spi->word_delay.value = 5;
++	spi->word_delay.unit = SPI_DELAY_UNIT_USECS;
+ 	ret = spi_setup(spi);
+ 	if (ret)
+ 		return ret;
+diff --git a/drivers/spi/spi-apple-s8000.c b/drivers/spi/spi-apple-s8000.c
+index aaf01e917db1df9d105d3e7d22d07f01a060dbe8..fb5efa5696e4c5b7b01ae8dd642dd811c148355b 100644
+--- a/drivers/spi/spi-apple-s8000.c
++++ b/drivers/spi/spi-apple-s8000.c
+@@ -72,8 +72,9 @@ static int s8000_spi_transfer_one(struct spi_controller *ctlr,
+ 	unsigned int sent = 0, received = 0, iterations = 0;
+ 	u32 speed = transfer->speed_hz ?: device->max_speed_hz;
+ 	u32 divisor, cfg, status, tx_level, rx_level;
++	u64 word_delay_cycles;
+ 	ktime_t deadline;
+-	int ret = 0;
++	int word_delay_ns, ret = 0;
+ 
+ 	if (!transfer->len)
+ 		return 0;
+@@ -84,6 +85,15 @@ static int s8000_spi_transfer_one(struct spi_controller *ctlr,
+ 	if (!divisor || divisor > S8000_DIV_MAX)
+ 		return -EINVAL;
+ 	transfer->effective_speed_hz = rate / divisor;
++	/* The SPI core merges the device minimum into transfer->word_delay. */
++	word_delay_ns = spi_delay_to_ns(&transfer->word_delay, transfer);
++	if (word_delay_ns < 0)
++		return word_delay_ns;
++	/* WORD_DELAY counts input-clock cycles, not divided SCK cycles. */
++	word_delay_cycles = DIV_ROUND_UP_ULL((u64)rate * word_delay_ns,
++					    NSEC_PER_SEC);
++	if (word_delay_cycles > U32_MAX)
++		return -EINVAL;
+ 	cfg = S8000_CFG_BASE;
+ 	if (device->mode & SPI_CPHA)
+ 		cfg |= S8000_CFG_CPHA;
+@@ -93,7 +103,7 @@ static int s8000_spi_transfer_one(struct spi_controller *ctlr,
+ 	/* spi-version 1 has FIFO counts in STATUS, unlike the M1 controller. */
+ 	writel(0, spi->base + S8000_CTRL);
+ 	writel(divisor, spi->base + S8000_CLKDIV);
+-	writel(0, spi->base + S8000_WORD_DELAY);
++	writel(word_delay_cycles, spi->base + S8000_WORD_DELAY);
+ 	writel(S8000_STATUS_CLEAR, spi->base + S8000_STATUS);
+ 	writel(cfg, spi->base + S8000_CFG);
+ 	writel(S8000_CTRL_ENABLE, spi->base + S8000_CTRL);

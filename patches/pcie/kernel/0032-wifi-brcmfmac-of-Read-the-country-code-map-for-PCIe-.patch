@@ -1,0 +1,52 @@
+From 4408074bc811ac8ff9753db90c1dcb24a4be515c Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 14:16:38 +0000
+Subject: [PATCH 32/43] wifi: brcmfmac: of: Read the country code map for PCIe
+ DT nodes too
+
+The binding allows brcm,ccode-map and brcm,ccode-map-trivial on the
+PCIe compatibles (pci14e4,*), but brcmf_of_probe() only parsed them for
+"brcm,bcm4329-fmac" nodes. Without a map, brcmf_translate_country_code()
+refuses every country cfg80211 sets on chips outside the ISO fallback
+list (e.g. the BCM4355), so the firmware stays at its NVRAM default
+(Apple iPad 5: ccode=XZ).
+
+Parse the map for any DT node. The properties are optional;
+nodes without them behave as before.
+---
+ .../wireless/broadcom/brcm80211/brcmfmac/of.c    | 16 ++++++++++++----
+ 1 file changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/of.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/of.c
+index 03efae36a0..3dd4a64060 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/of.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/of.c
+@@ -121,13 +121,21 @@ int brcmf_of_probe(struct device *dev, enum brcmf_bus_type bus_type,
+ 
+ 	brcmf_dbg(INFO, "%s LPO clock\n", clk ? "enable" : "no");
+ 
++	/*
++	 * The binding allows the country code map on the PCIe compatibles
++	 * (pci14e4,*) too, and without one the firmware never leaves its
++	 * NVRAM default country (e.g. "XZ") when cfg80211 sets a country.
++	 */
++	if (np) {
++		err = brcmf_of_get_country_codes(dev, settings);
++		if (err)
++			brcmf_err("failed to get OF country code map (err=%d)\n",
++				  err);
++	}
++
+ 	if (!np || !of_device_is_compatible(np, "brcm,bcm4329-fmac"))
+ 		return 0;
+ 
+-	err = brcmf_of_get_country_codes(dev, settings);
+-	if (err)
+-		brcmf_err("failed to get OF country code map (err=%d)\n", err);
+-
+ 	err = of_get_mac_address(np, settings->mac);
+ 	if (err == -EPROBE_DEFER)
+ 		return err;
+-- 
+2.56.0
+

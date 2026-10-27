@@ -1,0 +1,198 @@
+From 39c86d64a3ae7ecf00751fe6ba87c3d5aa0bc878 Mon Sep 17 00:00:00 2001
+From: linux-a9 <linux-a9@localhost>
+Date: Thu, 22 Oct 2026 11:44:13 +0000
+Subject: [PATCH 5/9] input: apple_n1: harden descriptor and runtime readiness
+ checks
+
+---
+ drivers/input/touchscreen/apple_n1.c | 93 +++++++++++++++++-----------
+ 1 file changed, 58 insertions(+), 35 deletions(-)
+
+diff --git a/drivers/input/touchscreen/apple_n1.c b/drivers/input/touchscreen/apple_n1.c
+index 9ad9803596d307d4b28bb9809e901efb30a9f5b3..fa3ac70e5dd1625bb9ffab408807c2d45b18c68c 100644
+--- a/drivers/input/touchscreen/apple_n1.c
++++ b/drivers/input/touchscreen/apple_n1.c
+@@ -53,7 +53,6 @@ struct apple_n1 {
+ 	u16 max_packet;
+ 	s16 x_min, x_max, y_min, y_max;
+ 	u8 sequence;
+-	unsigned int errors;
+ 	unsigned int traced_frames;
+ 	bool powered;
+ 	bool irq_enabled;
+@@ -339,7 +338,8 @@ static int n1_command16(struct apple_n1 *n1, u8 command, u8 argument)
+ 	return 0;
+ }
+ 
+-static int n1_get_report(struct apple_n1 *n1, u8 id, u8 *data, size_t expected)
++/* data has N1_REPORT_MAX bytes; accept descriptor extensions Apple ignores. */
++static int n1_get_report(struct apple_n1 *n1, u8 id, u8 *data, size_t minimum)
+ {
+ 	u16 length, checksum;
+ 	size_t transfer_length;
+@@ -350,7 +350,7 @@ static int n1_get_report(struct apple_n1 *n1, u8 id, u8 *data, size_t expected)
+ 	if (ret)
+ 		return ret;
+ 	length = get_unaligned_le16(n1->rx + 3);
+-	if (n1->rx[2] || length != expected || length > N1_REPORT_MAX)
++	if (n1->rx[2] || length < minimum || length > N1_REPORT_MAX)
+ 		return -EPROTO;
+ 	command = length < 12 ? 0xe6 : 0xe7;
+ 	transfer_length = length < 12 ? 16 : length + 5;
+@@ -384,33 +384,41 @@ static int n1_get_report(struct apple_n1 *n1, u8 id, u8 *data, size_t expected)
+ 
+ static int n1_discover(struct apple_n1 *n1)
+ {
+-	u8 family[1], sensor[5], region[8], parameters[6], surface[16];
+-	int ret;
++	u8 family, sensor[5], descriptor[N1_REPORT_MAX];
++	const u8 *surface = descriptor;
++	int ret, attempt;
+ 
+ 	ret = n1_wake(n1);
+ 	if (ret)
+ 		return ret;
+-	ret = n1_command16(n1, 0xe2, 0);
++	for (attempt = 0; attempt < 4; attempt++) {
++		ret = n1_command16(n1, 0xe2, 0);
++		if (!ret)
++			break;
++		usleep_range(3000, 4000);
++	}
+ 	if (ret)
+ 		return ret;
+ 	n1->max_packet = get_unaligned_le16(n1->rx + 3);
+ 	if (n1->rx[2] != 1 || n1->max_packet < 16 || n1->max_packet > N1_FRAME_MAX)
+ 		return -EPROTO;
+-	ret = n1_get_report(n1, 0xd1, family, sizeof(family));
++	ret = n1_get_report(n1, 0xd1, descriptor, 1);
+ 	if (ret)
+ 		return ret;
+-	ret = n1_get_report(n1, 0xd3, sensor, sizeof(sensor));
++	family = descriptor[0];
++	ret = n1_get_report(n1, 0xd3, descriptor, sizeof(sensor));
+ 	if (ret)
+ 		return ret;
++	memcpy(sensor, descriptor, sizeof(sensor));
+ 	if (sensor[0] != 1)
+ 		return -EPROTO;
+-	ret = n1_get_report(n1, 0xd0, region, sizeof(region));
++	ret = n1_get_report(n1, 0xd0, descriptor, 8);
+ 	if (ret)
+ 		return ret;
+-	ret = n1_get_report(n1, 0xa1, parameters, sizeof(parameters));
++	ret = n1_get_report(n1, 0xa1, descriptor, 6);
+ 	if (ret)
+ 		return ret;
+-	ret = n1_get_report(n1, 0xd9, surface, sizeof(surface));
++	ret = n1_get_report(n1, 0xd9, descriptor, 16);
+ 	if (ret)
+ 		return ret;
+ 	/* Values from the live J71t descriptor, not display pixels. */
+@@ -425,7 +433,7 @@ static int n1_discover(struct apple_n1 *n1)
+ 		return -EPROTO;
+ 	dev_info(&n1->spi->dev,
+ 		 "N1 ready: interface 1, max packet %u, family %u, %ux%u, FW %#x, surface 14745x19657\n",
+-		 n1->max_packet, family[0], sensor[1], sensor[2],
++		 n1->max_packet, family, sensor[1], sensor[2],
+ 		 get_unaligned_be16(sensor + 3));
+ 	return 0;
+ }
+@@ -557,6 +565,28 @@ static void n1_release_contacts(struct apple_n1 *n1)
+ 	input_sync(n1->input);
+ }
+ 
++static int n1_irq_frame(struct apple_n1 *n1)
++{
++	int attempt, ret, asserted;
++
++	/* Retry while this falling-edge IRQ is masked: a failed read may leave
++	 * ATN asserted, so waiting for another falling edge would lose recovery.
++	 */
++	for (attempt = 0; attempt < 3; attempt++) {
++		ret = n1_read_frame(n1, true);
++		if (ret > 0)
++			return ret;
++		if (!ret) {
++			asserted = gpiod_get_value_cansleep(n1->atn);
++			if (!asserted)
++				return 0;
++			ret = asserted < 0 ? asserted : -EPROTO;
++		}
++		usleep_range(1000, 2000);
++	}
++	return ret;
++}
++
+ static irqreturn_t n1_irq(int irq, void *data)
+ {
+ 	struct apple_n1 *n1 = data;
+@@ -564,31 +594,24 @@ static irqreturn_t n1_irq(int irq, void *data)
+ 
+ 	/* A stuck ATN cannot monopolize the IRQ thread. */
+ 	for (i = 0; i < 8; i++) {
+-		ret = n1_read_frame(n1, true);
+-		if (ret < 0)
++		ret = n1_irq_frame(n1);
++		if (ret <= 0)
+ 			break;
+-		if (!ret) {
+-			asserted = gpiod_get_value_cansleep(n1->atn);
+-			if (asserted <= 0)
+-				break;
+-			ret = -EPROTO;
++		asserted = gpiod_get_value_cansleep(n1->atn);
++		if (asserted < 0) {
++			ret = asserted;
+ 			break;
+ 		}
+-		asserted = gpiod_get_value_cansleep(n1->atn);
+-		if (asserted <= 0)
++		if (!asserted)
+ 			break;
+ 	}
+ 	if (ret < 0 || i == 8) {
+ 		n1_release_contacts(n1);
+ 		dev_err_ratelimited(&n1->spi->dev, "frame/ATN error %d; rebind to recover\n",
+ 				    ret < 0 ? ret : -EOVERFLOW);
+-		if (++n1->errors >= 3 || i == 8) {
+-			disable_irq_nosync(irq);
+-			n1->irq_enabled = false;
+-			dev_err(&n1->spi->dev, "IRQ disabled after bounded error budget\n");
+-		}
+-	} else {
+-		n1->errors = 0;
++		disable_irq_nosync(irq);
++		n1->irq_enabled = false;
++		dev_err(&n1->spi->dev, "IRQ disabled after bounded error budget\n");
+ 	}
+ 	return IRQ_HANDLED;
+ }
+@@ -755,13 +778,6 @@ static int n1_probe(struct spi_device *spi)
+ 		ret = -ENODEV;
+ 		goto power_off;
+ 	}
+-	ret = gpiod_get_value_cansleep(n1->atn);
+-	if (ret) {
+-		if (ret > 0)
+-			ret = -EBUSY;
+-		dev_err(dev, "ATN did not deassert after bounded initial drain\n");
+-		goto power_off;
+-	}
+ 	dev_info(dev, "HBPP detected; N1 controller %#x (stage %u)\n", version, stage);
+ 	if (stage == 1)
+ 		goto power_off;
+@@ -826,6 +842,13 @@ static int n1_probe(struct spi_device *spi)
+ 			ret = -EOVERFLOW;
+ 		goto power_off;
+ 	}
++	ret = gpiod_get_value_cansleep(n1->atn);
++	if (ret) {
++		if (ret > 0)
++			ret = -EBUSY;
++		dev_err(dev, "ATN did not deassert after bounded initial drain\n");
++		goto power_off;
++	}
+ 	n1->irq_enabled = true;
+ 	enable_irq(spi->irq);
+ 	dev_info(dev, "touchscreen reporting enabled\n");

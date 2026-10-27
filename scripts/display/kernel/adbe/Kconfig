@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config DRM_APPLE_ADBE
+	tristate "DRM support for the Apple A9 display pipe"
+	depends on DRM && OF && ARM64 && MMU
+	depends on ARCH_APPLE || COMPILE_TEST
+	select APERTURE_HELPERS
+	select DRM_CLIENT_SELECTION
+	select DRM_GEM_DMA_HELPER
+	select DRM_KMS_HELPER
+	help
+	  KMS driver for the A9 (S8000/S8003) disp0 pipe that iBoot leaves
+	  running. It adopts the boot mode, takes the framebuffer over from
+	  simpledrm, and adds page flips through the pipe's parameter FIFO
+	  and vblank interrupts. It never programs timings, clocks, power or
+	  the eDP link. Scanout buffers are DMA (CMA) allocations.
+
+	  Built in, it replaces simpledrm during boot. Booting with
+	  apple_adbe_drm.enable=0 keeps simpledrm instead.
+
+	  If M is selected, the module is called apple_adbe_drm.
+
+config APPLE_ADBE_PROBE
+	tristate "Apple A9 display pipe probe and FIFO measurements"
+	depends on ARM64 && OF && DEBUG_FS
+	help
+	  Observe the A9 iBoot display without taking over simpledrm. By
+	  default the probe only reads registers and polls the frame counter.
+	  Module parameters opt into one bounded IRQ test, a read-only DART
+	  snapshot, a parameter FIFO re-send of the live plane, or one
+	  auto-reverting flip to a second buffer. No link training, power
+	  management or IOMMU programming is done.
+
+	  If unsure, say N. The module is called apple_adbe_probe.

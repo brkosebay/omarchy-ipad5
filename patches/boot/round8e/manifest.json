@@ -1,0 +1,11 @@
+{
+  "base": "9c11ab8866e1bb6b66f0893f55a8337324e9dfc3",
+  "head": "bfe22c60a0035c23d3ff711fa82e69b8e0b8db92",
+  "branch": "a9/boot",
+  "incremental_after": "patches/boot/round8d",
+  "patches": {
+    "0001-nvme-PCI-apple-ans-pair-warm-port-state-and-retry-mi.patch": "db96f731ad8f846453e34b1ce113535a178352b774ce08b3fdf27fbbb49d6823"
+  },
+  "device_access": false,
+  "hardware_tested": false
+}

@@ -1,0 +1,1092 @@
+#!/usr/bin/env python3
+"""Kernel updates on the iPad 5 without the Mac (docs/boot/kernel-updates.md).
+Installed as /usr/local/bin/linux-a9-update by scripts/boot/install-device.sh.
+
+  linux-a9-update check [URL]            is a newer bundle published? (SOURCE in update.conf)
+  linux-a9-update fetch [URL|FILE] [--insecure]
+                                         download a bundle and its .sig into the cache
+  linux-a9-update install BUNDLE [--name NAME] [--cmdline ARGS] [--insecure] [--no-preflight]
+                                         verify and stage it as a new entry; default unchanged
+  linux-a9-update update [URL] [--yes] [--boot] [--insecure]
+                                         check + fetch + install, then offer a trial boot
+  linux-a9-update list                   entries, default/previous/running/trial, results
+  linux-a9-update status                 trial state, last result, configuration
+  linux-a9-update boot ENTRY [--yes]     one-shot trial: warm reboot into ENTRY. It becomes
+                                         the default only if its health checks pass there
+  linux-a9-update rollback [--reboot] [--yes] [--force]
+                                         cancel a pending trial, or make the previous entry
+                                         the default again
+  linux-a9-update gc [--keep N] [--dry-run]
+                                         delete old entries installed by this tool
+  linux-a9-update health                 linux-a9-update-health.service, not for interactive use
+
+A kernel that hangs before userspace cannot roll itself back: it never becomes
+the default, but getting out of it needs a cold boot from the Mac (DFU).
+Only /boot/linux-a9 is written; NVRAM, syscfg, boot firmware and the NVMe
+namespaces are never touched.
+"""
+import fcntl
+import gzip
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+
+BASE = '/boot/linux-a9'
+RUN = '/run/linux-a9'
+LIB = '/usr/local/lib/linux-a9'
+ETC = '/etc/linux-a9'
+PROC = '/proc'
+SYSFS = '/sys'
+KEXEC = '/usr/local/bin/linux-a9-kexec'
+
+STATE_DIR = BASE + '/update'
+CACHE = STATE_DIR + '/cache'
+STATE = STATE_DIR + '/state.json'
+TRIAL = STATE_DIR + '/trial'  # exists only while a trial is pending (unit condition)
+CONF = ETC + '/update.conf'
+SIGNERS = ETC + '/update-signers'
+HEALTH_D = ETC + '/health.d'
+
+FORMAT = 'linux-a9-kernel-bundle'
+INDEX_FORMAT = 'linux-a9-kernel-index'
+NAMESPACE = 'linux-a9-kernel'  # ssh-keygen -Y namespace and principal
+NAME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
+BUNDLE_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*\.tar\.zst')
+MEMBER_RE = re.compile(r'(manifest\.json|Image|Image\.gz|initramfs\.gz|dtbs/[A-Za-z0-9][A-Za-z0-9._-]*\.dtb)')
+MAX_BUNDLE = 256 << 20
+MAX_INDEX = 1 << 20
+# Derived per boot by linux-a9-kexec or one-shot; never stored in an entry.
+STRIP_KEYS = {'linux_a9.entry', 'BOOT_IMAGE', 'initrd', 'elfcorehdr', 'reset_devices'}
+
+DEFAULTS = {
+    'SOURCE': 'https://github.com/brkosebay/linux/releases/latest/download/linux-a9-latest.json',
+    'KEEP': '3',                    # entries installed by this tool kept by gc (protected ones extra)
+    'PROTECT': '',                  # entry names gc never deletes (e.g. the Mac payload's entry)
+    'MIN_FREE_MB': '512',           # free space on /boot/linux-a9 required after an install
+    'REQUIRE_SIGNATURE': '0',       # 1: local bundles need a valid .sig too
+    'ALLOW_HTTP': '0',              # 1: plain http mirrors (a signature is still required)
+    'REQUIRE_KEYS': 'omarchy.root nvme.write_window',  # the entry cmdline must keep these
+    'RECOMMENDED_ARGS': '1',        # apply the bundle's recommended arguments
+    'CMDLINE_EXTRA': '',            # appended to every installed entry (replaces same keys)
+    'HEALTH_TIMEOUT': '300',        # seconds the trial boot has to pass all checks
+    'HEALTH_UNITS': 'sshd.service', # must be active
+    'HEALTH_NETWORK': '1',          # a non-loopback interface with a global address
+    'HEALTH_NETWORK_IFACES': '',    # restrict that to these interfaces (e.g. "wlan0")
+    'HEALTH_ROOT': 'nvme',          # / on /dev/nvme*, read-write, and an fsync'd write works
+    'HEALTH_FAILED_UNITS_OK': '1',  # 0: any failed unit fails the trial
+    'AUTO_REBOOT_ON_FAILURE': '0',  # 1: a failed trial warm-reboots into the default at once
+}
+
+
+class Fail(Exception):
+    pass
+
+
+def log(msg):
+    print(f'linux-a9-update: {msg}', file=sys.stderr)
+    try:
+        subprocess.run(['logger', '-t', 'linux-a9-update', '--', msg],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def load_conf():
+    conf = dict(DEFAULTS)
+    try:
+        text = open(CONF).read()
+    except FileNotFoundError:
+        return conf
+    for n, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        k, sep, v = line.partition('=')
+        if not sep or not re.fullmatch(r'[A-Z_]+', k):
+            raise Fail(f'{CONF}:{n}: expected KEY=value')
+        conf[k] = ' '.join(shlex.split(v, comments=True))
+    return conf
+
+
+def conf_int(conf, k):
+    try:
+        return int(conf[k])
+    except ValueError:
+        raise Fail(f'{CONF}: {k} must be a number')
+
+
+def need_root():
+    if os.geteuid() != 0:
+        os.execvp('sudo', ['sudo', '--', os.path.abspath(sys.argv[0])] + sys.argv[1:])
+
+
+class Lock:
+    def __init__(self, name):
+        os.makedirs(RUN, exist_ok=True)
+        self.f = open(os.path.join(RUN, name), 'w')
+
+    def __enter__(self):
+        deadline = time.monotonic() + 120
+        while True:
+            try:
+                fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise Fail(f'another {os.path.basename(self.f.name)} holder is running')
+                time.sleep(0.5)
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+def fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_atomic(path, data):
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix='.tmp.')
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data if isinstance(data, bytes) else data.encode())
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o644)
+        os.rename(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+    fsync_dir(d)
+
+
+def now():
+    return time.strftime('%Y-%m-%dT%H:%M:%S%z')
+
+
+def load_state():
+    try:
+        s = json.load(open(STATE))
+    except FileNotFoundError:
+        s = {}
+    except ValueError:
+        raise Fail(f'{STATE} is corrupt; move it away to start a fresh history')
+    s.setdefault('entries', {})
+    s.setdefault('history', [])
+    s.setdefault('trial', None)
+    return s
+
+
+def save_state(s, event=None, entry=None, detail=None):
+    if event:
+        s['history'].append({'time': now(), 'event': event, 'entry': entry, 'detail': detail})
+        s['history'] = s['history'][-50:]
+    write_atomic(STATE, json.dumps(s, indent=2) + '\n')
+
+
+def set_status(s, entry, status, note=None):
+    e = s['entries'].setdefault(entry, {})
+    e['status'] = status
+    e['status_time'] = now()
+    if note is not None:
+        e['note'] = note
+
+
+# ---- device facts ---------------------------------------------------------
+
+def cmdline_tokens():
+    return open(PROC + '/cmdline').read().split()
+
+
+def running_entry():
+    for w in cmdline_tokens():
+        if w.startswith('linux_a9.entry='):
+            return w.split('=', 1)[1]
+    return None
+
+
+def boot_id():
+    return open(PROC + '/sys/kernel/random/boot_id').read().strip()
+
+
+def board():
+    try:
+        return open(PROC + '/device-tree/compatible', 'rb').read().split(b'\0')[0].decode()
+    except OSError:
+        raise Fail('cannot read the board compatible from /proc/device-tree')
+
+
+def link_entry(name):
+    """Entry name a default/previous symlink points to, or None."""
+    try:
+        target = os.readlink(os.path.join(BASE, name))
+    except OSError:
+        return None
+    return os.path.basename(target.rstrip('/'))
+
+
+def entry_path(name):
+    if not NAME_RE.fullmatch(name or ''):
+        raise Fail(f'invalid entry name: {name!r}')
+    return os.path.join(BASE, 'entries', name)
+
+
+def entries():
+    try:
+        return sorted(n for n in os.listdir(BASE + '/entries')
+                      if NAME_RE.fullmatch(n) and os.path.isdir(os.path.join(BASE, 'entries', n)))
+    except FileNotFoundError:
+        return []
+
+
+def tool_version():
+    try:
+        return int(open(LIB + '/VERSION').read().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def kexec(*args, check=True):
+    r = subprocess.run([KEXEC, *args])
+    if check and r.returncode:
+        raise Fail(f'linux-a9-kexec {" ".join(args)} failed')
+    return r.returncode
+
+
+# ---- downloads and signatures ---------------------------------------------
+
+def is_remote(src):
+    return urllib.parse.urlsplit(src).scheme in ('http', 'https')
+
+
+def check_scheme(url, conf, insecure):
+    scheme = urllib.parse.urlsplit(url).scheme
+    if scheme == 'https' or scheme == 'file':
+        return
+    if scheme == 'http' and (insecure or conf['ALLOW_HTTP'] == '1'):
+        return
+    raise Fail(f'refusing {url}: only https (http needs ALLOW_HTTP=1 or --insecure)')
+
+
+def download(url, dest, limit, conf, insecure):
+    check_scheme(url, conf, insecure)
+    req = urllib.request.Request(url, headers={'User-Agent': 'linux-a9-update'})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            final = r.geturl()
+            if urllib.parse.urlsplit(url).scheme == 'https' and urllib.parse.urlsplit(final).scheme != 'https':
+                raise Fail(f'{url} redirected to non-https {final}')
+            n = 0
+            with open(dest, 'wb') as f:
+                while True:
+                    chunk = r.read(1 << 20)
+                    if not chunk:
+                        break
+                    n += len(chunk)
+                    if n > limit:
+                        raise Fail(f'{url} is larger than {limit >> 20} MiB')
+                    f.write(chunk)
+                f.flush()
+                os.fsync(f.fileno())
+    except (OSError, ValueError) as e:
+        raise Fail(f'download of {url} failed: {e}')
+
+
+def fetch_index(url, conf, insecure=False):
+    tmp = tempfile.NamedTemporaryFile(prefix='linux-a9-index.', delete=False)
+    tmp.close()
+    try:
+        download(url, tmp.name, MAX_INDEX, conf, insecure)
+        try:
+            idx = json.load(open(tmp.name))
+        except ValueError:
+            raise Fail(f'{url} is not a bundle index (JSON)')
+    finally:
+        os.unlink(tmp.name)
+    if not isinstance(idx, dict) or idx.get('format') != INDEX_FORMAT or idx.get('format_version') != 1:
+        raise Fail(f'{url}: unknown index format')
+    if not BUNDLE_RE.fullmatch(str(idx.get('bundle'))) or not NAME_RE.fullmatch(str(idx.get('name'))):
+        raise Fail(f'{url}: bad bundle or name in index')
+    if not re.fullmatch(r'[0-9a-f]{64}', str(idx.get('sha256'))):
+        raise Fail(f'{url}: bad sha256 in index')
+    if not isinstance(idx.get('min_tool_version', 0), int):
+        raise Fail(f'{url}: bad min_tool_version in index')
+    return idx
+
+
+def verify_signature(bundle, sig):
+    if not os.path.isfile(SIGNERS):
+        raise Fail(f'no {SIGNERS}: install the project public key (scripts/boot/install-device.sh)')
+    with open(bundle, 'rb') as f:
+        r = subprocess.run(['ssh-keygen', '-Y', 'verify', '-f', SIGNERS, '-I', NAMESPACE,
+                            '-n', NAMESPACE, '-s', sig], stdin=f, capture_output=True, text=True)
+    if r.returncode:
+        raise Fail(f'bad signature on {os.path.basename(bundle)}: {(r.stderr or r.stdout).strip()}')
+
+
+def signature_policy(bundle, conf, insecure):
+    """Verify BUNDLE's sibling .sig as policy demands; returns a short description."""
+    sig = bundle + '.sig'
+    origin = {}
+    try:
+        origin = json.load(open(bundle + '.origin'))
+    except (OSError, ValueError):
+        pass
+    remote = bool(origin.get('remote'))
+    must = not insecure and ((remote and not origin.get('insecure')) or conf['REQUIRE_SIGNATURE'] == '1')
+    if os.path.isfile(sig):
+        if os.path.isfile(SIGNERS) or must:
+            verify_signature(bundle, sig)
+            return 'verified'
+        log(f'warning: {sig} not checked: no {SIGNERS}')
+        return 'unchecked (no signers file)'
+    if must:
+        raise Fail(f'{os.path.basename(bundle)} is unsigned ({"remote" if remote else "REQUIRE_SIGNATURE=1"}); '
+                   'refusing without --insecure')
+    if origin.get('insecure'):
+        return 'none (fetched with --insecure)'
+    return 'none (local bundle)'
+
+
+# ---- bundles --------------------------------------------------------------
+
+def extract_bundle(bundle, dest):
+    """Stream-extract allowlisted regular files of BUNDLE into DEST; no tar paths are trusted."""
+    if os.path.getsize(bundle) > MAX_BUNDLE:
+        raise Fail('bundle too large')
+    p = subprocess.Popen(['zstd', '-dcq', '--', bundle], stdout=subprocess.PIPE)
+    seen, total = set(), 0
+    try:
+        with tarfile.open(fileobj=p.stdout, mode='r|') as tf:
+            for m in tf:
+                if not MEMBER_RE.fullmatch(m.name) or not m.isreg() or m.name in seen:
+                    raise Fail(f'bundle member not allowed: {m.name!r}')
+                seen.add(m.name)
+                total += m.size
+                if total > 4 * MAX_BUNDLE:
+                    raise Fail('bundle expands too much')
+                out = os.path.join(dest, m.name)
+                os.makedirs(os.path.dirname(out), exist_ok=True)
+                src = tf.extractfile(m)
+                with open(out, 'wb') as f:
+                    shutil.copyfileobj(src, f)
+    except tarfile.TarError as e:
+        raise Fail(f'bad bundle archive: {e}')
+    finally:
+        p.stdout.close()
+        rc = p.wait()
+    if rc:
+        raise Fail('bundle is not valid zstd')
+    if 'manifest.json' not in seen:
+        raise Fail('bundle has no manifest.json')
+    return seen
+
+
+def check_manifest(dest, seen):
+    try:
+        m = json.load(open(os.path.join(dest, 'manifest.json')))
+    except ValueError:
+        raise Fail('manifest.json is not JSON')
+    if m.get('format') != FORMAT or m.get('format_version') != 1:
+        raise Fail(f'unknown bundle format {m.get("format")!r} v{m.get("format_version")!r}')
+    if not NAME_RE.fullmatch(str(m.get('name'))):
+        raise Fail('bad name in manifest')
+    need = m.get('min_tool_version', 0)
+    if not isinstance(need, int):
+        raise Fail('bad min_tool_version in manifest')
+    if need > tool_version():
+        raise Fail(f'bundle needs device tools v{need}, these are v{tool_version()}: '
+                   'run scripts/boot/install-device.sh from a newer checkout first')
+    files = m.get('files')
+    if not isinstance(files, dict) or set(files) != seen - {'manifest.json'}:
+        raise Fail('manifest file list does not match the bundle contents')
+    for f, info in files.items():
+        if sha256_file(os.path.join(dest, f)) != info.get('sha256'):
+            raise Fail(f'{f}: sha256 mismatch')
+    for f in ('initramfs.gz',):
+        if f not in files:
+            raise Fail(f'bundle has no {f}')
+    if not ('Image.gz' in files) ^ ('Image' in files):
+        raise Fail('bundle needs exactly one of Image, Image.gz')
+    cl = m.get('cmdline') or {}
+    for k in ('required', 'recommended', 'remove'):
+        v = cl.get(k, [])
+        if not isinstance(v, list) or not all(isinstance(t, str) and t and not re.search(r'[\s\0]', t) for t in v):
+            raise Fail(f'bad cmdline.{k} in manifest')
+    return m
+
+
+def check_payloads(dest, m):
+    img = os.path.join(dest, 'Image.gz' if 'Image.gz' in m['files'] else 'Image')
+    try:
+        with (gzip.open(img) if img.endswith('.gz') else open(img, 'rb')) as f:
+            head = f.read(64)
+        with gzip.open(os.path.join(dest, 'initramfs.gz')) as f:
+            rd = f.read(6)
+    except (OSError, EOFError) as e:
+        raise Fail(f'corrupt kernel or initramfs: {e}')
+    if len(head) < 64 or head[56:60] != b'ARM\x64':
+        raise Fail('kernel is not an arm64 Image')
+    if rd not in (b'070701', b'070702'):
+        raise Fail('initramfs is not a cpio archive')
+
+
+def key_of(tok):
+    return tok.split('=', 1)[0]
+
+
+def put_arg(out, tok):
+    k = key_of(tok)
+    hits = [i for i, t in enumerate(out) if key_of(t) == k]
+    if hits:
+        out[hits[0]] = tok
+        for i in reversed(hits[1:]):
+            del out[i]
+    else:
+        out.append(tok)
+
+
+def base_cmdline():
+    """The known-good default entry's cmdline, else the running one."""
+    d = link_entry('default')
+    if d:
+        try:
+            text = open(os.path.join(BASE, 'entries', d, 'cmdline')).read()
+            if text.strip():
+                return text.split(), f'entry {d}'
+        except OSError:
+            pass
+    return cmdline_tokens(), '/proc/cmdline'
+
+
+def build_cmdline(m, conf, override=None):
+    if override is not None:
+        tokens, source = override.split(), '--cmdline'
+    else:
+        tokens, source = base_cmdline()
+    out = [t for t in tokens if key_of(t) not in STRIP_KEYS and not t.startswith('linux_a9.phoenix')]
+    for r in m['cmdline'].get('remove', []):
+        out = [t for t in out if t != r and ('=' in r or key_of(t) != r)]
+    for t in m['cmdline'].get('required', []):
+        put_arg(out, t)
+    if conf['RECOMMENDED_ARGS'] == '1':
+        for t in m['cmdline'].get('recommended', []):
+            put_arg(out, t)
+    for t in conf['CMDLINE_EXTRA'].split():
+        put_arg(out, t)
+    missing = [k for k in conf['REQUIRE_KEYS'].split() if not any(key_of(t) == k for t in out)]
+    if missing:
+        raise Fail(f'the new cmdline (from {source}) lacks {" ".join(missing)}: the NVMe root would not '
+                   'mount writable. Pass --cmdline with the full known-good arguments')
+    return ' '.join(out), source
+
+
+def preflight_dtb(name, dtb):
+    run = running_entry()
+    old = os.path.join(BASE, 'entries', run or '', 'dtb')
+    if not run or not os.path.isfile(old):
+        raise Fail('the running pristine dtb is unknown (no staged entry named by linux_a9.entry=): '
+                   'linux-a9-kexec could not load this entry. Stage the cold-boot entry first '
+                   '(docs/boot/warm-reboot.md) or pass --no-preflight')
+    if open(old, 'rb').read() == open(dtb, 'rb').read():
+        return 'same dtb as the running kernel (running FDT reused)'
+    os.makedirs(RUN, exist_ok=True)
+    out = os.path.join(RUN, f'preflight-{name}.dtb')
+    try:
+        r = subprocess.run(['python3', LIB + '/linux-a9-fdt-merge', '--old', old, '--running',
+                            SYSFS + '/firmware/fdt', '--new', dtb, '-o', out],
+                           capture_output=True, text=True)
+    finally:
+        if os.path.exists(out):
+            os.unlink(out)
+    if r.returncode:
+        raise Fail(f'its dtb cannot be merged with the running one ({r.stderr.strip()}): '
+                   'this kernel needs a cold boot through m1n1')
+    return 'dtb differs; three-way merge preflight passed'
+
+
+def do_install(bundle, conf, name=None, cmdline=None, insecure=False, preflight=True, quiet_next=False):
+    bundle = os.path.abspath(bundle)
+    if not os.path.isfile(bundle):
+        raise Fail(f'no such bundle: {bundle}')
+    sigstate = signature_policy(bundle, conf, insecure)
+    os.makedirs(BASE + '/entries', exist_ok=True)
+    os.makedirs(RUN, exist_ok=True)
+    work = tempfile.mkdtemp(prefix='update.', dir=RUN)
+    try:
+        seen = extract_bundle(bundle, work)
+        m = check_manifest(work, seen)
+        check_payloads(work, m)
+        b = board()
+        dtb = (m.get('boards') or {}).get(b)
+        if dtb not in m['files']:
+            raise Fail(f'bundle has no dtb for this board ({b}); it has {", ".join(m.get("boards") or {}) or "none"}')
+        name = name or m['name']
+        d = entry_path(name)
+        args, source = build_cmdline(m, conf, cmdline)
+        k = m.get('kernel') or {}
+        image = 'Image.gz' if 'Image.gz' in m['files'] else 'Image'
+        stage = {image: os.path.join(work, image), 'dtb': os.path.join(work, dtb),
+                 'initramfs.gz': os.path.join(work, 'initramfs.gz'),
+                 'manifest.json': os.path.join(work, 'manifest.json')}
+        texts = {'cmdline': args + '\n', 'COMMIT': f'{k.get("commit", "unknown")} {k.get("subject", "")}'.rstrip() + '\n'}
+        sums = {f: sha256_file(p) for f, p in stage.items()}
+        sums.update({f: hashlib.sha256(t.encode()).hexdigest() for f, t in texts.items()})
+        sumtext = ''.join(f'{h}  ./{f}\n' for f, h in sorted(sums.items()))
+        bsum = sha256_file(bundle)
+        with Lock('install.lock'):
+            if os.path.isdir(d):
+                try:
+                    same = open(os.path.join(d, 'SHA256SUMS')).read() == sumtext
+                except OSError:
+                    same = False
+                if not same:
+                    raise Fail(f'entry {name} exists with different contents (entries are immutable): '
+                               'install with --name NEW-NAME')
+                if subprocess.run(['sha256sum', '-c', '--quiet', 'SHA256SUMS'], cwd=d).returncode:
+                    raise Fail(f'entry {name} exists but fails its checksums')
+                print(f'{name} is already installed (identical)')
+                return name
+            if preflight:
+                pf = preflight_dtb(name, stage['dtb'])
+            else:
+                pf = 'skipped (--no-preflight)'
+            need = sum(os.path.getsize(p) for p in stage.values())
+            st = os.statvfs(BASE)
+            free = st.f_bavail * st.f_frsize - need
+            if free < conf_int(conf, 'MIN_FREE_MB') << 20:
+                raise Fail(f'not enough space: {free >> 20} MiB would be left on {BASE} '
+                           f'(MIN_FREE_MB={conf["MIN_FREE_MB"]}); try linux-a9-update gc')
+            new = tempfile.mkdtemp(prefix='.new.', dir=BASE + '/entries')
+            try:
+                for f, p in stage.items():
+                    shutil.copyfile(p, os.path.join(new, f))
+                for f, t in list(texts.items()) + [('SHA256SUMS', sumtext)]:
+                    with open(os.path.join(new, f), 'w') as fh:
+                        fh.write(t)
+                if subprocess.run(['sha256sum', '-c', '--quiet', 'SHA256SUMS'], cwd=new).returncode:
+                    raise Fail('staged copy fails its checksums')
+                for f in os.listdir(new):
+                    os.chmod(os.path.join(new, f), 0o644)
+                    fd = os.open(os.path.join(new, f), os.O_RDONLY)
+                    os.fsync(fd)
+                    os.close(fd)
+                os.chmod(new, 0o755)
+                fsync_dir(new)
+                # install.lock (shared with upload-entry.sh) keeps d absent until here
+                os.rename(new, d)
+            except BaseException:
+                shutil.rmtree(new, ignore_errors=True)
+                raise
+            fsync_dir(BASE + '/entries')
+        with Lock('update.lock'):
+            s = load_state()
+            s['entries'][name] = {'status': 'installed', 'status_time': now(), 'installed_at': now(),
+                                  'bundle': os.path.basename(bundle), 'bundle_sha256': bsum,
+                                  'commit': k.get('commit'), 'release': k.get('release'),
+                                  'signature': sigstate, 'cmdline_from': source}
+            save_state(s, 'installed', name, f'signature {sigstate}; {pf}')
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    if bundle.startswith(CACHE + '/'):
+        for f in (bundle, bundle + '.sig', bundle + '.origin'):
+            if os.path.exists(f):
+                os.unlink(f)
+    log(f'installed {name} ({k.get("release") or k.get("commit", "")[:12]}); signature {sigstate}; {pf}')
+    print(f'cmdline (from {source}): {args}')
+    if not quiet_next:
+        print(f'next: sudo linux-a9-update boot {name}   (one-shot trial; the default stays '
+              f'{link_entry("default") or "unset"} until {name} passes its health checks)')
+    return name
+
+
+def resolve_source(src, conf, insecure):
+    """(bundle_url, sig_url, sha256 or None, index or None) for SRC (an index or a bundle URL)."""
+    src = src or conf['SOURCE']
+    path = urllib.parse.urlsplit(src).path
+    if path.endswith('.json'):
+        # Its sha256 binds the download to the index; the .sig authenticates the bundle.
+        idx = fetch_index(src, conf, insecure)
+        if idx.get('min_tool_version', 0) > tool_version():
+            raise Fail(f'{idx["name"]} needs device tools v{idx["min_tool_version"]}, these are '
+                       f'v{tool_version()}: update them with scripts/boot/install-device.sh')
+        url = urllib.parse.urljoin(src, idx['bundle'])
+        sig = urllib.parse.urljoin(src, idx['signature']) if idx.get('signature') else url + '.sig'
+        return url, sig, idx['sha256'], idx
+    return src, src + '.sig', None, None
+
+
+def do_fetch(src, conf, insecure=False):
+    if src and not urllib.parse.urlsplit(src).scheme:
+        src = 'file://' + urllib.parse.quote(os.path.abspath(src))
+    url, sigurl, want, idx = resolve_source(src, conf, insecure)
+    name = os.path.basename(urllib.parse.unquote(urllib.parse.urlsplit(url).path))
+    if not BUNDLE_RE.fullmatch(name):
+        raise Fail(f'not a bundle name: {name!r} (expected *.tar.zst)')
+    remote = is_remote(url)
+    os.makedirs(CACHE, exist_ok=True)
+    dest = os.path.join(CACHE, name)
+    part = dest + '.part'
+    try:
+        download(url, part, MAX_BUNDLE, conf, insecure)
+        got = sha256_file(part)
+        if want and got != want:
+            raise Fail(f'{name}: sha256 {got} does not match the index ({want})')
+        sig = None
+        try:
+            download(sigurl, part + '.sig', 64 << 10, conf, insecure)
+            sig = part + '.sig'
+        except Fail as e:
+            if remote and not insecure:
+                raise Fail(f'no signature for {name} ({e}); refusing without --insecure')
+            log(f'warning: no signature for {name}')
+        if sig and (remote and not insecure or os.path.isfile(SIGNERS)):
+            verify_signature(part, sig)
+        for f in (dest + '.sig', dest + '.origin'):
+            if os.path.exists(f):
+                os.unlink(f)
+        if sig:
+            os.rename(sig, dest + '.sig')
+        write_atomic(dest + '.origin', json.dumps({'url': url, 'remote': remote, 'insecure': insecure,
+                                                  'sha256': got, 'fetched': now()}) + '\n')
+        os.rename(part, dest)
+    finally:
+        for f in (part, part + '.sig'):
+            if os.path.exists(f):
+                os.unlink(f)
+    print(dest)
+    return dest, idx
+
+
+def installed_as(idx, s):
+    for n, e in s['entries'].items():
+        if e.get('bundle_sha256') == idx['sha256'] and os.path.isdir(os.path.join(BASE, 'entries', n)):
+            return n
+    d = os.path.join(BASE, 'entries', idx['name'])
+    try:
+        m = json.load(open(os.path.join(d, 'manifest.json')))
+        if m.get('kernel', {}).get('commit') == idx.get('commit'):
+            return idx['name']
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def do_check(src, conf, insecure=False):
+    src = src or conf['SOURCE']
+    idx = fetch_index(src, conf, insecure)
+    s = load_state()
+    have = installed_as(idx, s)
+    print(f'source:    {src}')
+    print(f'latest:    {idx["name"]} ({idx.get("release") or idx.get("commit", "")[:12]}, {idx.get("created", "?")}, '
+          f'{"signed" if idx.get("signature") else "UNSIGNED"})')
+    if idx.get('min_tool_version', 0) > tool_version():
+        print(f'           needs device tools v{idx["min_tool_version"]}; these are v{tool_version()}')
+    if have:
+        st = s['entries'].get(have, {}).get('status', 'staged')
+        mark = ' (default)' if link_entry('default') == have else ''
+        print(f'installed: yes, as entry {have}: {st}{mark}')
+    else:
+        print('installed: no: linux-a9-update update')
+    return idx, have
+
+
+# ---- trial boots, health, rollback ----------------------------------------
+
+def do_boot(name, yes=False):
+    d = entry_path(name)
+    if not os.path.isdir(d):
+        raise Fail(f'no entry {name}')
+    default = link_entry('default')
+    if name == default:
+        raise Fail(f'{name} is already the default: use linux-a9-kexec reboot')
+    if not yes and sys.stdin.isatty():
+        a = input(f'Warm reboot into {name} once? The default stays {default} until {name} passes its '
+                  'health checks. If it hangs before userspace, recovering needs the Mac (DFU). [y/N] ')
+        if a.strip().lower() != 'y':
+            raise Fail('cancelled')
+    with Lock('update.lock'):
+        s = load_state()
+        old = s.get('trial')
+        # Load first: a failed load must not leave a phantom trial behind.
+        kexec('load', name)
+        if old and old.get('entry') != name:
+            set_status(s, old['entry'], 'abandoned', f'replaced by a trial of {name}')
+        s['trial'] = {'entry': name, 'default': default, 'requested_boot_id': boot_id(),
+                      'requested_from': running_entry(), 'requested_at': now(), 'id': os.urandom(8).hex()}
+        set_status(s, name, 'trial-booting')
+        save_state(s, 'trial-boot', name, f'default stays {default}')
+        write_atomic(TRIAL, name + '\n')
+    os.sync()
+    log(f'trial boot of {name}; default stays {default}')
+    r = subprocess.run(['systemctl', 'kexec'])
+    if r.returncode:
+        subprocess.run(['kexec', '-u'])
+        with Lock('update.lock'):
+            s = load_state()
+            s['trial'] = None
+            set_status(s, name, 'installed')
+            save_state(s, 'trial-cancelled', name, 'systemctl kexec failed')
+            os.unlink(TRIAL)
+        raise Fail('systemctl kexec failed; the trial was cancelled and unloaded')
+
+
+def sh(*cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        return subprocess.CompletedProcess(cmd, 127, '', str(e))
+
+
+def health_checks(conf):
+    """[(name, ok, detail)] for one pass of the configured checks."""
+    out = []
+    r = sh('systemctl', 'is-active', 'multi-user.target')
+    out.append(('multi-user.target', r.stdout.strip() == 'active', r.stdout.strip()))
+    for u in conf['HEALTH_UNITS'].split():
+        r = sh('systemctl', 'is-active', u)
+        out.append((u, r.stdout.strip() == 'active', r.stdout.strip()))
+    if conf['HEALTH_NETWORK'] == '1':
+        r = sh('ip', '-j', 'addr', 'show', 'scope', 'global')
+        want = set(conf['HEALTH_NETWORK_IFACES'].split())
+        try:
+            up = [i['ifname'] for i in json.loads(r.stdout or '[]')
+                  if i.get('ifname') != 'lo' and i.get('addr_info') and (not want or i['ifname'] in want)]
+        except (ValueError, KeyError, TypeError):
+            up = []
+        out.append(('network', bool(up), ' '.join(up) or 'no interface with a global address'))
+    if conf['HEALTH_ROOT'] == 'nvme':
+        r = sh('findmnt', '-n', '-o', 'SOURCE,OPTIONS', '/')
+        f = r.stdout.split()
+        ok = len(f) == 2 and f[0].startswith('/dev/nvme') and 'rw' in f[1].split(',')
+        detail = r.stdout.strip()
+        if ok:
+            try:
+                write_atomic(STATE_DIR + '/.health-write-test', boot_id() + '\n')
+                os.unlink(STATE_DIR + '/.health-write-test')
+            except OSError as e:
+                ok, detail = False, f'write test failed: {e}'
+        out.append(('root', ok, detail))
+    if conf['HEALTH_FAILED_UNITS_OK'] != '1':
+        r = sh('systemctl', '--failed', '--no-legend', '--plain')
+        out.append(('failed-units', not r.stdout.strip(), r.stdout.strip().replace('\n', '; ')))
+    try:
+        hooks = sorted(os.listdir(HEALTH_D))
+    except FileNotFoundError:
+        hooks = []
+    for h in hooks:
+        p = os.path.join(HEALTH_D, h)
+        if os.path.isfile(p) and os.access(p, os.X_OK) and not h.startswith('.'):
+            r = sh(p)
+            out.append((f'health.d/{h}', r.returncode == 0, (r.stdout + r.stderr).strip()[-200:]))
+    return out
+
+
+def finish_trial(s, status, note):
+    t = s['trial']
+    set_status(s, t['entry'], status, note)
+    s['trial'] = None
+    s['last_result'] = {'entry': t['entry'], 'status': status, 'note': note, 'time': now()}
+    save_state(s, 'trial-' + status, t['entry'], note)
+    if os.path.exists(TRIAL):
+        os.unlink(TRIAL)
+    fsync_dir(STATE_DIR)
+
+
+def do_health(conf, timeout=None):
+    with Lock('update.lock'):
+        s = load_state()
+        t = s.get('trial')
+        if not t:
+            if os.path.exists(TRIAL):
+                os.unlink(TRIAL)
+            return 0
+        if boot_id() == t.get('requested_boot_id'):
+            print(f'trial of {t["entry"]} requested on this boot; it runs on the next one')
+            return 0
+        run = running_entry()
+        if run != t['entry']:
+            note = (f'booted {run or "a cold boot without linux_a9.entry="} instead: the trial did not reach '
+                    'its health checks (hang, reboot or cold boot); default unchanged')
+            finish_trial(s, 'failed', note)
+            log(f'trial of {t["entry"]} failed: {note}')
+            return 0
+        set_status(s, t['entry'], 'trial-checking')
+        save_state(s)
+        tid = t['id']
+    timeout = conf_int(conf, 'HEALTH_TIMEOUT') if timeout is None else timeout
+    deadline = time.monotonic() + timeout
+    while True:
+        results = health_checks(conf)
+        bad = [f'{n}: {d}' for n, ok, d in results if not ok]
+        if not bad or time.monotonic() >= deadline:
+            break
+        time.sleep(5)
+    with Lock('update.lock'):
+        s = load_state()
+        t = s.get('trial')
+        if not t or t.get('id') != tid:
+            log('trial record changed while checking (rollback?): not promoting')
+            return 0
+        if bad:
+            note = 'health checks failed: ' + '; '.join(bad)
+            finish_trial(s, 'failed', note)
+            log(f'trial of {t["entry"]} failed; default stays {t.get("default")}: {note}')
+        else:
+            # The only place an entry becomes the default automatically: inside itself, after the checks.
+            if kexec('set-default', t['entry'], check=False):
+                finish_trial(s, 'failed', 'health checks passed, but linux-a9-kexec set-default failed')
+                log(f'could not make {t["entry"]} the default')
+                return 1
+            note = 'health checks passed: ' + ', '.join(n for n, _, _ in results)
+            finish_trial(s, 'good', note)
+            log(f'{t["entry"]} is good and now the default (previous: {link_entry("previous")})')
+            return 0
+    if conf['AUTO_REBOOT_ON_FAILURE'] == '1':
+        log('AUTO_REBOOT_ON_FAILURE=1: warm reboot into the default')
+        kexec('reboot', 'default', check=False)
+    return 0
+
+
+def do_rollback(conf, reboot=False, yes=False, force=False):
+    with Lock('update.lock'):
+        s = load_state()
+        t = s.get('trial')
+        default = link_entry('default')
+        if t:
+            what = f'cancel the trial of {t["entry"]}; the default stays {default}'
+        else:
+            prev = link_entry('previous')
+            if not prev or not os.path.isdir(os.path.join(BASE, 'entries', prev)):
+                raise Fail('nothing to roll back: no pending trial and no previous entry')
+            pst = s['entries'].get(prev, {}).get('status')
+            if pst in ('failed', 'rolled-back') and not force:
+                raise Fail(f'previous entry {prev} is marked {pst}; refusing to make it the default (--force)')
+            what = f'make {prev} the default again (instead of {default})'
+        if reboot:
+            what += ', then warm reboot into it'
+        if not yes and sys.stdin.isatty():
+            if input(f'Roll back: {what}? [y/N] ').strip().lower() != 'y':
+                raise Fail('cancelled')
+        if t:
+            finish_trial(s, 'rolled-back', 'cancelled by rollback')
+        else:
+            kexec('set-default', prev)
+            if default:
+                set_status(s, default, 'rolled-back', f'replaced by {prev}')
+            save_state(s, 'rollback', prev, f'default {default} -> {prev}')
+        log(f'rollback: {what}')
+    default = link_entry('default')
+    if reboot:
+        if running_entry() == default:
+            print(f'already running the default {default}; no reboot needed')
+        else:
+            kexec('reboot', 'default')
+    else:
+        print(f'default is {default}; `systemctl reboot` (or Reboot Linux) boots it')
+
+
+def do_gc(conf, keep=None, dry=False):
+    keep = conf_int(conf, 'KEEP') if keep is None else keep
+    with Lock('install.lock'), Lock('update.lock'):
+        s = load_state()
+        t = s.get('trial') or {}
+        protect = {link_entry('default'), link_entry('previous'), running_entry(), t.get('entry'),
+                   *conf['PROTECT'].split()}
+        managed = [n for n in entries() if os.path.isfile(os.path.join(BASE, 'entries', n, 'manifest.json'))]
+        # Entries staged by other tools (stage-kernel.sh, kexec-host.sh, the cold-boot entry) are
+        # never ours to delete: linux-a9-kexec needs the cold boot's dtb for every merge.
+        def age(n):
+            return s['entries'].get(n, {}).get('installed_at') or time.strftime(
+                '%Y-%m-%dT%H:%M:%S%z', time.localtime(os.path.getmtime(os.path.join(BASE, 'entries', n))))
+        managed.sort(key=age, reverse=True)
+        # KEEP newest unprotected entries, in addition to the protected ones
+        unprotected = [n for n in managed if n not in protect]
+        kept = [n for n in managed if n in protect] + unprotected[:max(keep, 0)]
+        victims = unprotected[max(keep, 0):]
+        os.makedirs(BASE + '/entries', exist_ok=True)
+        stale = [n for n in os.listdir(BASE + '/entries') if n.startswith(('.new.', '.del.'))]
+        cached = []
+        if os.path.isdir(CACHE):
+            cached = [f for f in os.listdir(CACHE) if f.endswith('.part') or f.endswith('.part.sig')]
+            bundles = sorted((f for f in os.listdir(CACHE) if BUNDLE_RE.fullmatch(f)),
+                             key=lambda f: os.path.getmtime(os.path.join(CACHE, f)), reverse=True)
+            for f in bundles[1:]:
+                cached += [x for x in (f, f + '.sig', f + '.origin') if os.path.exists(os.path.join(CACHE, x))]
+        for n in victims:
+            print(f'{"would delete" if dry else "delete"} entry {n}')
+        for n in stale:
+            print(f'{"would delete" if dry else "delete"} leftover {n}')
+        for f in cached:
+            print(f'{"would delete" if dry else "delete"} cache {f}')
+        if dry:
+            return
+        for n in victims + stale:
+            src = os.path.join(BASE, 'entries', n)
+            if n in victims:
+                gone = tempfile.mkdtemp(prefix='.del.', dir=BASE + '/entries')
+                os.rename(src, os.path.join(gone, n))  # atomically out of entries/ first
+                src = gone
+            shutil.rmtree(src)
+            if n in victims:
+                set_status(s, n, 'deleted')
+        for f in cached:
+            os.unlink(os.path.join(CACHE, f))
+        fsync_dir(BASE + '/entries')
+        if victims:
+            save_state(s, 'gc', None, 'deleted ' + ' '.join(victims))
+        print(f'kept: {" ".join(sorted(set(kept) | (protect & set(entries())))) or "none"}')
+
+
+def du(path):
+    total = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(root, f)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def do_list():
+    s = load_state()
+    t = s.get('trial') or {}
+    marks = {'default': link_entry('default'), 'previous': link_entry('previous'),
+             'running': running_entry(), 'trial': t.get('entry')}
+    for n in entries():
+        d = os.path.join(BASE, 'entries', n)
+        tags = [k for k, v in marks.items() if v == n]
+        e = s['entries'].get(n, {})
+        try:
+            commit = open(os.path.join(d, 'COMMIT')).read().split()[0][:12]
+        except (OSError, IndexError):
+            commit = '?'
+        origin = 'bundle' if os.path.isfile(os.path.join(d, 'manifest.json')) else 'staged'
+        print(f'{n:32} {",".join(tags) or "-":24} {e.get("status", origin):14} {commit:12} {du(d) >> 20:4} MiB')
+    print(f'total {du(BASE) >> 20} MiB in {BASE}')
+
+
+def do_status(conf):
+    s = load_state()
+    print(f'running:   {running_entry() or "(cold boot without linux_a9.entry=)"}')
+    print(f'default:   {link_entry("default") or "none"}')
+    print(f'previous:  {link_entry("previous") or "none"}')
+    t = s.get('trial')
+    if t:
+        print(f'trial:     {t["entry"]} (requested {t.get("requested_at")}; '
+              f'{s["entries"].get(t["entry"], {}).get("status", "?")})')
+    else:
+        print('trial:     none')
+    lr = s.get('last_result')
+    if lr:
+        print(f'last:      {lr["entry"]} {lr["status"]} at {lr["time"]}: {lr["note"]}')
+    print(f'tools:     v{tool_version()}; signers {"installed" if os.path.isfile(SIGNERS) else "MISSING"}')
+    print(f'source:    {conf["SOURCE"]}')
+    print(f'health:    units {conf["HEALTH_UNITS"] or "-"}, network {conf["HEALTH_NETWORK"]}, '
+          f'root {conf["HEALTH_ROOT"]}, timeout {conf["HEALTH_TIMEOUT"]}s, '
+          f'auto-reboot on failure {conf["AUTO_REBOOT_ON_FAILURE"]}')
+
+
+def do_update(src, conf, yes=False, boot=False, insecure=False):
+    idx, have = do_check(src, conf, insecure)
+    if have:
+        s = load_state()
+        st = s['entries'].get(have, {}).get('status')
+        if link_entry('default') == have or st in ('failed', 'rolled-back'):
+            print('nothing to do' if st not in ('failed', 'rolled-back') else
+                  f'{have} was {st}; install it under another name to retry')
+            return
+        name = have
+    else:
+        if not yes and sys.stdin.isatty() and input(f'Download and install {idx["name"]}? [y/N] ').strip().lower() != 'y':
+            raise Fail('cancelled')
+        bundle, _ = do_fetch(src or conf['SOURCE'], conf, insecure)
+        name = do_install(bundle, conf, insecure=insecure, quiet_next=True)
+    if boot or (sys.stdin.isatty() and not yes and input(
+            f'Trial boot {name} now? Until it passes its health checks, {link_entry("default")} stays the '
+            'default. [y/N] ').strip().lower() == 'y'):
+        do_boot(name, yes=True)
+    else:
+        print(f'staged; trial it with: sudo linux-a9-update boot {name}')
+
+
+def main(argv):
+    import argparse
+    p = argparse.ArgumentParser(prog='linux-a9-update', description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest='cmd')
+    c = sub.add_parser('check'); c.add_argument('source', nargs='?'); c.add_argument('--insecure', action='store_true')
+    c = sub.add_parser('fetch'); c.add_argument('source', nargs='?'); c.add_argument('--insecure', action='store_true')
+    c = sub.add_parser('install'); c.add_argument('bundle'); c.add_argument('--name')
+    c.add_argument('--cmdline'); c.add_argument('--insecure', action='store_true')
+    c.add_argument('--no-preflight', action='store_true')
+    c = sub.add_parser('update'); c.add_argument('source', nargs='?'); c.add_argument('--yes', action='store_true')
+    c.add_argument('--boot', action='store_true'); c.add_argument('--insecure', action='store_true')
+    sub.add_parser('list')
+    sub.add_parser('status')
+    c = sub.add_parser('boot'); c.add_argument('entry'); c.add_argument('--yes', action='store_true')
+    c = sub.add_parser('rollback'); c.add_argument('--reboot', action='store_true')
+    c.add_argument('--yes', action='store_true'); c.add_argument('--force', action='store_true')
+    c = sub.add_parser('gc'); c.add_argument('--keep', type=int); c.add_argument('--dry-run', action='store_true')
+    c = sub.add_parser('health'); c.add_argument('--timeout', type=int)
+    a = p.parse_args(argv)
+    cmd = a.cmd or 'status'
+    if cmd not in ('check', 'list', 'status'):
+        need_root()
+    conf = load_conf()
+    if cmd == 'check':
+        do_check(a.source, conf, a.insecure)
+    elif cmd == 'fetch':
+        do_fetch(a.source, conf, a.insecure)
+    elif cmd == 'install':
+        do_install(a.bundle, conf, a.name, a.cmdline, a.insecure, not a.no_preflight)
+    elif cmd == 'update':
+        do_update(a.source, conf, a.yes, a.boot, a.insecure)
+    elif cmd == 'list':
+        do_list()
+    elif cmd == 'status':
+        do_status(conf)
+    elif cmd == 'boot':
+        do_boot(a.entry, a.yes)
+    elif cmd == 'rollback':
+        do_rollback(conf, a.reboot, a.yes, a.force)
+    elif cmd == 'gc':
+        do_gc(conf, a.keep, a.dry_run)
+    elif cmd == 'health':
+        return do_health(conf, a.timeout)
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except (Fail, OSError) as e:
+        log(str(e))
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
