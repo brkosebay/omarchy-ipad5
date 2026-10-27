@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Berkay=20K=C3=B6sebay?= <brkosebay@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 19:20:00 +0100
+Subject: [PATCH] shell: remap panels only when the screen origin moves
+
+ScreenMoveRemap hides a panel, deletes its native window and recreates it
+50 ms later whenever the screen moves, so the layer surface lands on the
+new position. Quickshell's ShellScreen emits one geometryChanged for x, y,
+width and height, which reaches onXChanged/onYChanged for a size-only
+change too. Rotating a tablet by 90 degrees swaps the output's logical
+width and height without moving it, and every panel guarded by
+ScreenMoveRemap (bar, background, dock) is torn down and rebuilt. On a
+software-rendered desktop that shows as one to two seconds of black
+screen after each quarter turn; a 180-degree turn keeps the size and
+never blanks.
+
+Remember the screen's origin and restart the settle timer only when x or
+y actually differs. A new screen object records its origin without
+remapping, as before. Real moves still remap.
+
+Tested on an iPad 5 (A9, Hyprland 0.56.2, Quickshell 0.3.2, llvmpipe):
+quarter turns no longer blank the whole screen; moves are unaffected.
+
+Co-Authored-By: Claude Opus 5.5 <maintainer@example.invalid>
+---
+ shell/Ui/ScreenMoveRemap.qml | 30 ++++++++++++++++++++++++++++--
+ 1 file changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/shell/Ui/ScreenMoveRemap.qml b/shell/Ui/ScreenMoveRemap.qml
+--- a/shell/Ui/ScreenMoveRemap.qml
++++ b/shell/Ui/ScreenMoveRemap.qml
+@@ -14,6 +14,32 @@ Item {
+   required property var window
+   readonly property var screen: window ? window.screen : null
+ 
++  // ShellScreen's x, y, width and height share geometryChanged. A size-only
++  // rotation therefore also invokes onXChanged/onYChanged. Compare the actual
++  // origin before remapping, or a quarter-turn destroys the native panels.
++  property var observedScreen: null
++  property int observedX: 0
++  property int observedY: 0
++
++  function checkOrigin() {
++    var current = root.screen
++    if (!current) { root.observedScreen = null; return }
++    var x = current.x
++    var y = current.y
++    if (current !== root.observedScreen) {
++      root.observedScreen = current
++      root.observedX = x
++      root.observedY = y
++      return
++    }
++    if (x === root.observedX && y === root.observedY) return
++    root.observedX = x
++    root.observedY = y
++    settleTimer.restart()
++  }
++  onScreenChanged: checkOrigin()
++  Component.onCompleted: checkOrigin()
++
+   // Fold into the window's binding: visible: <shown> && !guard.remapping
+   property bool remapping: false
+ 
+@@ -37,7 +63,7 @@ Item {
+ 
+   Connections {
+     target: root.screen
+-    function onXChanged() { settleTimer.restart() }
+-    function onYChanged() { settleTimer.restart() }
++    function onXChanged() { root.checkOrigin() }
++    function onYChanged() { root.checkOrigin() }
+   }
+ }
+--
+2.48.0

@@ -1,0 +1,19 @@
+What:		/sys/bus/i2c/devices/*-001a/lightning_state
+Date:		October 2026
+Contact:	linux-a9 maintainers
+Description:
+		source_epoch adds computer_seen: a positive USB data session
+		(connected, configured, or host-granted gadget evidence) observed
+		in this source epoch. It persists across USB suspend/reset and is
+		cleared by the same VBUS/ID/phase boundaries as other source policy.
+		A real computer supersedes prior divider/BC1.2/CC source results:
+		usb_type becomes SDP, with the charger's generic board ceiling.
+		bc_ua/bc_type remain diagnostic evidence and cannot cap that host.
+
+		bc_primary_mv and bc_secondary_mv report the most recent BC pin
+		measurements, distinct from passive dp_mv/dm_mv. Negative values
+		are errno/unavailable. They are reset on a new source epoch and
+		retained during a CC-only refresh. For ordinary USB, secondary D+
+		below 326 mV means CDP, at/above 326 mV means DCP. These are pin
+		voltages, not VBUS. A never-enumerating source keeps its proven
+		BC1.2/CC allowance, bounded by the existing charger policy.

@@ -84,6 +84,11 @@ struct s8000_spi {u8 *base;void *clk;unsigned int traced_xfers;};
 struct spi_controller {struct s8000_spi *data;};
 struct spi_device {struct device dev;u32 max_speed_hz,mode;};
 struct spi_transfer {const u8 *tx_buf;u8 *rx_buf;unsigned int len,bits_per_word,speed_hz,effective_speed_hz;int word_delay;};
+static bool phase_present;
+static u32 phase_value;
+static int phase_error;
+static bool device_property_present(struct device*d,const char*name){assert(!strcmp(name,"apple,s8000-spi-clock-phase"));return phase_present;}
+static int device_property_read_u32(struct device*d,const char*name,u32*value){assert(phase_present&&!strcmp(name,"apple,s8000-spi-clock-phase"));if(phase_error)return phase_error;*value=phase_value;return 0;}
 static u32 regs[64];static int scenario,sent,received,reads,writes,ticks,logs;
 #undef dev_info
 #define dev_info(...) (logs++)
@@ -108,6 +113,24 @@ static u32 readl(void*p){
  return regs[off/4];
 }
 '''
+        phase_header = args.source/'drivers/spi/spi-apple-s8000-phase.h'
+        phase_tests = ''
+        if phase_header.exists():
+            pre += '\n'+phase_header.read_text()
+            phase_tests = r'''
+ t.len=64;phase_present=true;phase_value=3;dev.mode=SPI_CPHA;
+ sent=received=ticks=0;assert(!s8000_spi_transfer_one(&ctlr,&dev,&t));
+ assert(sent==64&&received==64);
+ phase_error=-EIO;writes=reads=0;
+ assert(s8000_spi_transfer_one(&ctlr,&dev,&t)==-EIO&&!writes&&!reads);
+ phase_error=0;phase_value=4;
+ assert(s8000_spi_transfer_one(&ctlr,&dev,&t)==-EINVAL&&!writes&&!reads);
+ phase_value=3;dev.mode=0;
+ assert(s8000_spi_transfer_one(&ctlr,&dev,&t)==-EINVAL&&!writes&&!reads);
+ phase_present=false;sent=received=ticks=0;
+ assert(!s8000_spi_transfer_one(&ctlr,&dev,&t));
+ puts("PASS optional SPI phase property: valid phase3, property error, invalid/mismatched phase before MMIO, unchanged property-absent path");
+'''
         prod = defines(text, 'S8000_')+'\n'+function(text, 's8000_spi_transfer_one')
         run_c(pre, prod, r'''
 int main(void){
@@ -130,6 +153,7 @@ int main(void){
  assert(spi.traced_xfers==8&&logs==8); // four begin/end pairs left
  t.bits_per_word=16;writes=reads=0;assert(s8000_spi_transfer_one(&ctlr,&dev,&t)==-EINVAL&&!writes&&!reads);
  t.bits_per_word=8;t.len=65537;assert(s8000_spi_transfer_one(&ctlr,&dev,&t)==-EINVAL&&!writes&&!reads);
+''' + phase_tests + r'''
  puts("PASS PIO success, impossible/stale RX rejection, no-progress deadline, FIFO backpressure, stop on error, finite trace budget");
 }
 ''')

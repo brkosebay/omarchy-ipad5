@@ -4,7 +4,8 @@
 
 [omarchy-ipad5](https://github.com/brkosebay/omarchy-ipad5) brings Linux and
 [Omarchy](https://github.com/basecamp/omarchy) to iPad 5. The 2026-10-27
-release2 device run passed **13/13 checks**. This is evolving source and
+release2 device run passed **13/13 checks**; later release rounds remain in
+progress. This is evolving source and
 research, with your own firmware/calibration required and no kernel binaries.
 
 **Tested: only iPad6,11 j71t (S8003).** j71s/j72s/j72t are untested. Other
@@ -27,24 +28,27 @@ in the base kernel), are porting targets: see [PORTING.md](PORTING.md).
 | Microphones | ✅ | Built-in stereo capture |
 | Headphone jack | 🧪 | Unvalidated |
 | Battery gauge | ✅ | Read-only telemetry |
-| Charging from a computer | ✅ | 2.4 A input limit |
-| Wall / USB-C charging | 🧪 | Broken; detection fix in progress |
+| Charging from computers and USB-C/USB-A chargers | ✅ | Up to 2.4 A, the board maximum; 5 V only, no USB-PD |
 | Ambient light sensor | ✅ | Calibrated lux |
-| Accelerometer / auto-rotate | ✅ / 🧪 | Cold works; warm incomplete; 1–2 s blank |
+| Accelerometer / auto-rotate | ✅ / 🧪 | Cold works; warm incomplete; blank fixed by Omarchy patch 0004; brief wallpaper rescale |
 | H.264 hardware decode | ✅ | Tested profiles; GPL source cleared |
 | CPU frequency scaling | ✅ | Stock 300–1800 MHz |
 | Overclock | 🧪 | Opt-in 2.16 GHz; short trials |
 | Suspend | 🧪 | Opt-in; screen-off default |
 | USB gadget networking / serial | ✅ | USB network + console |
-| Lightning camera adapter / USB host | 🧪 | Identification works; no hub yet |
-| Touch ID | 🧪 | Sensor + Secure Enclave channel up; no enrollment/matching |
+| Lightning camera adapter / USB host | 🧪 | Host role + detach work; no hub/drive yet; round 6 in progress |
+| Touch ID | 🧪 | First valid sensor reply + SEP SBIO init; no capture/enrollment/matching |
 | Cameras | ❌ | No validated driver |
 | Cellular j72 | ❌ | No hardware tested |
 | GPU acceleration | ❌ | Software rendering; work not included. |
 
 [Detailed status](docs/release/STATUS.md) and [evidence](docs/release/EVIDENCE.md)
-record the limits. The clean OrchardLinux kernel port is **in preparation**;
-release2 results do not validate that new series or another board.
+record the limits. Charging round 10 passed on computers and USB-C chargers;
+owner tests also reached 1 A from a Samsung USB-A fast charger (BC1.2 DCP)
+and a 5 V/2 A USB-C charger advertising Default CC. An Apple USB-A brick is
+untested. The input limit is not a battery-current claim.
+The clean OrchardLinux kernel branch is published; release2 results do not
+validate that new series or another board.
 
 ## Install pointers
 
@@ -54,13 +58,16 @@ Cold boot is tethered: **palera1n → pongoOS → m1n1 → Linux**;
 `scripts/boot.sh pongo` → `scripts/boot.sh linux <payload>` sends a RAM-loaded
 payload. NVMe root does not make boot untethered.
 Kernel source: [a9/orchard-j71t](https://github.com/brkosebay/linux/tree/a9/orchard-j71t);
-`scripts/build-kernel.sh` drives Docker builds; release integration is being prepared.
+`scripts/build-kernel.sh` drives Docker builds; the Orchard installer port is under review.
 Firmware comes from a public IPSW; calibration comes from **your own iPad's
 boot device tree**. See [provenance and staging gaps](docs/release/firmware-provenance.md).
 Root options: [USB-NBD development root](docs/omarchy/README.md) or
 [NVMe installation](docs/nvme-install/) — destructive; back up first.
 **Never touch syscfg, NVRAM or boot firmware (LLB/iBoot).** DFU cannot restore factory calibration.
-The OrchardLinux installer path (`orchard install omarchy-a`) is coming; the port is in preparation.
+Orchard installer port: **under review** — [hardware#6](https://github.com/OrchardLinux/hardware/pull/6),
+[cli#2](https://github.com/OrchardLinux/cli/pull/2),
+[omarchy-a#4](https://github.com/OrchardLinux/omarchy-a/pull/4).
+The proposed installer path is `orchard install omarchy-a`.
 **Point your AI agent at [AGENTS.md](AGENTS.md) and [docs/](docs/) — the repo is written to be agent-readable.**
 
 ## Device safety

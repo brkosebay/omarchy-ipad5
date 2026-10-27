@@ -3,11 +3,14 @@
 Only **iPad6,11 / j71t / S8003**, with iPadOS 16.7.10 as the reference OS,
 has device evidence. Other A9 boards and A9X S8001 j127/j128 are untested.
 The committed release2 device run passed **13/13 checks** (two warnings,
-six skips). See [EVIDENCE.md](EVIDENCE.md) for the scope of each result.
+six skips); later release rounds are in progress. See [EVIDENCE.md](EVIDENCE.md) for the scope of each result.
 No hardware tests were run during this snapshot preparation.
 
 Public kernel source: [a9/orchard-j71t](https://github.com/brkosebay/linux/tree/a9/orchard-j71t),
-the clean OrchardLinux port on base `6831bc701a`, **in preparation**.
+the published clean OrchardLinux port on base `6831bc701a`.
+Orchard installer port: **under review** — [hardware#6](https://github.com/OrchardLinux/hardware/pull/6),
+[cli#2](https://github.com/OrchardLinux/cli/pull/2),
+[omarchy-a#4](https://github.com/OrchardLinux/omarchy-a/pull/4).
 The release2 observations below are not a device pass for that new series.
 Historical patch exports have separate bases and are not an installation stack.
 
@@ -26,13 +29,13 @@ GPU: research ongoing privately, not included; software rendering only.
 | Warm kexec / panic recovery | Works with limits | Shared-NVMe-IRQ correction passed ten gated warm boots. Earlier link-training/post-suspend hangs are not universally resolved; panic recovery cannot recover every hang. |
 | H.264 / VXD | Works | Tested High/B/weighted/scaling/multislice cases bit-exact; earlier 1080p 300/300 frames at 52.8 fps. GPL table provenance cleared; DEVA firmware remains external. No all-codec claim. |
 | Battery gauge | Works | Read-only bq27540 telemetry; gauge writes disabled. |
-| Charging | Partial | Computer SDP policy reaches 2400 mA; release2 and charge7/8 device runs verify it. USB-C wall charging remains broken: charge8 ended at 100 mA with battery discharging. Round 9 is in progress, with no passing device result recorded. |
+| Charging | Works | Charging from computers and USB-C/USB-A chargers, up to 2.4 A (board maximum); 5 V only, no USB-PD. Round 10 verifies computer USB-A/USB-C and USB-C wall paths; round 9 also passed the Mac power adapter. Owner tests: Samsung USB-A fast charger → BC1.2 DCP 1 A; 5 V/2 A USB-C charger with Default CC → 1 A. Apple USB-A brick untested. These are input limits, not battery currents. |
 | SEP / Touch ID | Partial | Eight endpoints, GenericTransfer SBIO init and GetProtectedConfig work. First valid Mesa sensor status reply on 2026-10-27. Later SBIO init again passes, but patch fetch is refused; sensor remains off. No fingerprint capture, matching or enrollment. |
 | AOP / auto-rotate | Partial | Accelerometer streaming and auto-rotate after cold boot. Warm reload still fails; wake8 was built, not device-validated. |
-| Rotation blanking | Known issue | Native display rotation can blank for 1–2 s. A proposed userspace change is not a verified fix. |
+| Rotation blanking | Fixed on device | Omarchy [patch 0004](../../patches/omarchy/README.md) removes the 1–2 s blank on quarter turns (owner A/B, four rotations each). A brief wallpaper rescale remains. This does not resolve warm AOP reload. |
 | CPU / buttons / RTC | Works | SMP, AIC, UART, GPIO, WDT, PMGR, I2C and stock 300–1800 MHz DVFS. Short optional 2.16 GHz trials on S8003 are not sustained-stability or other-board evidence. |
 | Suspend / idle | Partial | Desktop defaults to screen-off. Earlier staged s2idle/Home-wake passes do not validate all current paths; CPU idle uses WFI. |
-| Lightning camera adapter | Partial | Identification and automatic role selection work; hub enumeration and host charging are incomplete. |
+| Lightning camera adapter | Partial | Charge10 device test verifies host role and detach back to gadget/networking. Power handshake regressed (-19); no hub/drive enumeration or host charging. USB host round 6 is in progress. |
 | Cameras / cellular | Not yet | No validated camera driver; no cellular board tested. |
 
 See [PORTING.md](../../PORTING.md), [docs map](../README.md) and

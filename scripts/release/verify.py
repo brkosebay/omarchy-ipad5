@@ -2,6 +2,8 @@
 """Read-only, offline public-tree audit. Values are never printed on failure.
 
 Usage: python3 -B scripts/release/verify.py SNAPSHOT [--private-source WORKSPACE]
+Use --existing-repo for an already published clone: remotes and multiple
+commits are accepted, while reachable history is also checked offline.
 The optional private-source adds the workspace scrubber's exact denylist.
 Git metadata is checked separately: the initial commit intentionally uses the
 owner's public GitHub noreply identity. Three published VXD upstream credits
@@ -133,6 +135,37 @@ def privacy_findings(text):
     return findings
 
 
+def content_errors(rel, data, denylist=()):
+    """The same content rules apply to working files and historical blobs."""
+    errors=[]
+    if forbidden_artifact(rel):
+        errors.append((str(rel),'excluded-artifact'))
+    try: t=data.decode('utf-8')
+    except UnicodeError:
+        return errors+[(str(rel),'non-text')]
+    if '\0' in t: errors.append((str(rel),'nul-byte'))
+    for label in graphics_findings(rel,t):errors.append((str(rel),label))
+    scan=str(rel)+'\n'+t
+    if any(v.lower() in scan.lower() for v in denylist):errors.append((str(rel),'private-denylist'))
+    # Only two definition lines contain their own home/name patterns.
+    # All other checker content is scanned, including credentials/tokens.
+    is_checker=str(rel)=='scripts/release/verify.py'
+    if is_checker:
+        scan='\n'.join(line for line in scan.splitlines() if not line.lstrip().startswith(("'absolute-home': re.compile(", "'owner-username': re.compile(")))
+    for label in privacy_findings(scan):errors.append((str(rel),label))
+    for pat in (MAC,MAC_DASH):
+        for m in pat.finditer(scan):
+            if m[0].lower() not in ('00:00:00:00:00:00','00-00-00-00-00-00','ff:ff:ff:ff:ff:ff','aa:aa:aa:aa:aa:aa','43:55:c0:00:1f:ac','43:55:c1:00:76:93'):
+                errors.append((str(rel),'mac'));break
+    for m in IP.finditer(scan):
+        if is_checker and m[0] in ('10.0.0.0','192.168.0.0','169.254.0.0','172.16.0.0'):continue  # subnet definitions
+        try: ip=ipaddress.ip_address(m[0])
+        except ValueError:continue
+        if (ip in ipaddress.ip_network('10.0.0.0/8') or ip in ipaddress.ip_network('192.168.0.0/16') or ip in ipaddress.ip_network('169.254.0.0/16') or (ip in ipaddress.ip_network('172.16.0.0/12') and ip not in ipaddress.ip_network('172.16.42.0/24'))):
+            errors.append((str(rel),'lan-ip'));break
+    return errors
+
+
 def audit(root, denylist=()):
     errors=[]; n=0; size=0
     for p in sorted(root.rglob('*')):
@@ -144,31 +177,9 @@ def audit(root, denylist=()):
         if not p.is_file():
             continue
         n+=1; data=p.read_bytes(); size+=len(data)
-        if forbidden_artifact(rel):
-            errors.append((str(rel),'excluded-artifact'))
-        try: t=data.decode('utf-8')
-        except UnicodeError:
-            errors.append((str(rel),'non-text'));continue
-        if '\0' in t: errors.append((str(rel),'nul-byte'))
-        for label in graphics_findings(rel,t):errors.append((str(rel),label))
-        scan=str(rel)+'\n'+t
-        if any(v.lower() in scan.lower() for v in denylist):errors.append((str(rel),'private-denylist'))
-        # Only two definition lines contain their own home/name patterns.
-        # All other checker content is scanned, including credentials/tokens.
-        is_checker=str(rel)=='scripts/release/verify.py'
-        if is_checker:
-            scan='\n'.join(line for line in scan.splitlines() if not line.lstrip().startswith(("'absolute-home': re.compile(", "'owner-username': re.compile(")))
-        for label in privacy_findings(scan):errors.append((str(rel),label))
-        for pat in (MAC,MAC_DASH):
-            for m in pat.finditer(scan):
-                if m[0].lower() not in ('00:00:00:00:00:00','00-00-00-00-00-00','ff:ff:ff:ff:ff:ff','aa:aa:aa:aa:aa:aa','43:55:c0:00:1f:ac','43:55:c1:00:76:93'):
-                    errors.append((str(rel),'mac'));break
-        for m in IP.finditer(scan):
-            if is_checker and m[0] in ('10.0.0.0','192.168.0.0','169.254.0.0','172.16.0.0'):continue  # subnet definitions
-            try: ip=ipaddress.ip_address(m[0])
-            except ValueError:continue
-            if (ip in ipaddress.ip_network('10.0.0.0/8') or ip in ipaddress.ip_network('192.168.0.0/16') or ip in ipaddress.ip_network('169.254.0.0/16') or (ip in ipaddress.ip_network('172.16.0.0/12') and ip not in ipaddress.ip_network('172.16.42.0/24'))):
-                errors.append((str(rel),'lan-ip'));break
+        errors.extend(content_errors(rel,data,denylist))
+        try:t=data.decode('utf-8')
+        except UnicodeError:continue
         if p.suffix=='.md':
             for target in re.findall(r'\[[^\]\n]*\]\(([^)\n]+)\)',t):
                 target=target.split('#',1)[0].strip('<>')
@@ -177,26 +188,63 @@ def audit(root, denylist=()):
     return {'files':n,'bytes':size,'errors':[{'file':f,'rule':r} for f,r in sorted(set(errors))]}
 
 
+def audit_git(root, denylist=(), existing_repo=False):
+    """No remote is contacted. Existing repositories retain all content gates."""
+    errors=[]
+    def add(rule, path='.git'):errors.append({'file':path,'rule':rule})
+    def git(*a, raw=False):
+        data=subprocess.check_output(['git','--no-replace-objects','-C',str(root),*a])
+        return data if raw else data.decode().strip()
+    if not (root/'.git').exists():
+        if existing_repo:add('existing-repo-required')
+        return errors
+    if git('remote') and not existing_repo:add('remote-configured','.git/config')
+    if git('rev-parse','--is-shallow-repository')=='true':add('shallow-history')
+    if Path(git('rev-parse','--path-format=absolute','--git-path','info/grafts')).exists():add('grafted-history')
+    head=subprocess.run(['git','-C',str(root),'rev-parse','--verify','HEAD'],capture_output=True)
+    if head.returncode:
+        if existing_repo:add('existing-head-required')
+        return errors
+    if not existing_repo and git('rev-list','--count','--all','HEAD')!='1':add('not-single-initial-commit')
+    for value in git('log','--all','HEAD','--format=%ae%n%ce').splitlines():
+        if value.lower()!=PUBLIC_EMAIL:add('non-public-git-identity')
+    if any(value!=PUBLIC_NAME for value in git('log','--all','HEAD','--format=%an%n%cn').splitlines()):add('wrong-public-git-name')
+    if git('status','--porcelain','--untracked-files=all'):add('dirty-tree')
+    if existing_repo:
+        seen=set()
+        # Tree paths, modes and blobs are checked even after later deletion.
+        with subprocess.Popen(['git','--no-replace-objects','-C',str(root),'cat-file','--batch'],
+                              stdin=subprocess.PIPE,stdout=subprocess.PIPE) as blobs:
+            try:
+                for tree in sorted(set(git('log','--all','HEAD','--format=%T').splitlines())):
+                    for row in git('ls-tree','-rz',tree,raw=True).split(b'\0'):
+                        if not row:continue
+                        meta,path=row.split(b'\t',1);mode,kind,oid=meta.decode().split()
+                        rel=path.decode();entry=(rel,mode,oid)
+                        if entry in seen:continue
+                        seen.add(entry)
+                        if mode=='120000' or kind!='blob':
+                            add('history-non-regular-file','history:'+rel);continue
+                        blobs.stdin.write((oid+'\n').encode());blobs.stdin.flush()
+                        header=blobs.stdout.readline().split();data=blobs.stdout.read(int(header[2]))
+                        if blobs.stdout.read(1)!=b'\n':raise RuntimeError('invalid blob stream')
+                        errors.extend({'file':'history:'+f,'rule':r} for f,r in content_errors(rel,data,denylist))
+            finally:
+                blobs.stdin.close()
+    return [dict(file=f,rule=r) for f,r in sorted({(e['file'],e['rule']) for e in errors})]
+
+
 def main():
-    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('snapshot',type=Path);ap.add_argument('--private-source',type=Path);args=ap.parse_args()
+    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('snapshot',type=Path);ap.add_argument('--private-source',type=Path)
+    ap.add_argument('--existing-repo',action='store_true',help='accept remotes/multiple commits; audit reachable history too (offline)')
+    args=ap.parse_args()
     root=args.snapshot.resolve();deny=()
     if not root.is_dir():ap.error('snapshot directory does not exist')
     if args.private_source:
         import importlib.util
         spec=importlib.util.spec_from_file_location('private_scrub',args.private_source/'scripts/release/scrub.py');mod=importlib.util.module_from_spec(spec);spec.loader.exec_module(mod);deny=mod.private_values(args.private_source.resolve())
     result=audit(root,deny)
-    if (root/'.git').exists():
-        def git(*a):return subprocess.check_output(['git','-C',str(root),*a],text=True).strip()
-        if git('remote'):result['errors'].append({'file':'.git/config','rule':'remote-configured'})
-        # Before the initial commit, rev-list has no HEAD.
-        head=subprocess.run(['git','-C',str(root),'rev-parse','--verify','HEAD'],capture_output=True,text=True)
-        if head.returncode==0:
-            if git('rev-list','--count','--all')!='1':result['errors'].append({'file':'.git','rule':'not-single-initial-commit'})
-            for value in git('log','--all','--format=%ae%n%ce').splitlines():
-                if value.lower()!=PUBLIC_EMAIL:result['errors'].append({'file':'.git','rule':'non-public-git-identity'})
-            if any(value!=PUBLIC_NAME for value in git('log','--all','--format=%an%n%cn').splitlines()):
-                result['errors'].append({'file':'.git','rule':'wrong-public-git-name'})
-            if git('status','--porcelain'):result['errors'].append({'file':'.git','rule':'dirty-tree'})
+    result['errors'].extend(audit_git(root,deny,args.existing_repo))
     print(json.dumps(result,indent=2));return bool(result['errors'])
 
 if __name__=='__main__':sys.exit(main())

@@ -90,6 +90,20 @@ struct apple_tristar {
 	struct notifier_block usb_notifier;
 	atomic_t reset_generation;
 	int seen_generation;
+	atomic_t usb_session;
+	atomic_t computer_seen;
+	atomic_t usb_events;
+	atomic_t usb_idle_events;
+	unsigned long usb_event_source;
+	int bc_ua;
+	int bc_type;
+	int cc_first_mv;
+	int bc_primary_mv;
+	int bc_secondary_mv;
+	u8 source_id[TRISTAR_AUTO_ID_LEN];
+	bool source_id_valid;
+	bool epoch_notify;
+	const char *epoch_reason;
 	struct delayed_work work;
 	/* Serializes register reads and protects the cached source state. */
 	struct mutex lock;
@@ -252,7 +266,8 @@ static bool apple_tristar_sample_valid(struct apple_tristar *ts)
 		ts->detect_stage = "usb-budget";
 		return false;
 	}
-	if (budget.connected || budget.configured || budget.host_grant) {
+	if (budget.connected || budget.configured || budget.host_grant ||
+	    atomic_read(&ts->computer_seen)) {
 		ts->detect_stage = "usb-active";
 		return false;
 	}
@@ -392,11 +407,13 @@ static void apple_tristar_detect_failed(struct apple_tristar *ts, int ret)
 
 static void apple_tristar_classify(struct apple_tristar *ts)
 {
-	int dp, dm, ret, cc, cc_ua = 0, type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
+	int dp, dm, ret, cc, attempt, cc_ua = 0, type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
+	int bc_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
 	bool typec = apple_tristar_typec_cable(ts);
 
 	/* Caller holds the role hardware lock before ts->lock. */
-	if (ts->computer || (ts->brick_sampled && !typec) || ts->adc_poisoned ||
+	if (ts->computer || atomic_read(&ts->computer_seen) ||
+	    (ts->brick_sampled && !typec) || ts->adc_poisoned ||
 	    !ts->online || ts->error || time_before(jiffies, ts->classify_after))
 		return;
 	ts->seen_generation = atomic_read(&ts->reset_generation);
@@ -408,30 +425,38 @@ static void apple_tristar_classify(struct apple_tristar *ts)
 	ts->dm_mv = -ENODATA;
 	ts->cc_mv = -ENODATA;
 	if (typec) {
-		cc = apple_tristar_pin_mv(ts, false, false, true);
-		ts->cc_mv = cc;
-		if (cc < 0) {
-			ret = cc;
-			goto fail;
-		}
-		ts->detect_stage = "cc-range";
-		ret = apple_tristar_cc_current(cc);
-		if (ret < 0)
-			goto fail;
-		/* iOS 5e23a90: the same advertisement across at least 20 ms. */
-		msleep(20);
-		cc = apple_tristar_pin_mv(ts, false, false, true);
-		ts->cc_mv = cc;
-		if (cc < 0) {
-			ret = cc;
-			goto fail;
+		cc_ua = -1;
+		/* Ignore one unsettled first reading; require two equal advertisements. */
+		for (attempt = 0; attempt < 3; attempt++) {
+			cc = apple_tristar_pin_mv(ts, false, false, true);
+			ts->cc_mv = cc;
+			if (!attempt)
+				ts->cc_first_mv = cc;
+			if (cc < 0) {
+				ret = cc;
+				goto fail;
+			}
+			ts->detect_stage = "cc-range";
+			ret = apple_tristar_cc_current(cc);
+			if (ret < 0)
+				goto fail;
+			if (ret == cc_ua)
+				break;
+			cc_ua = ret;
+			if (attempt < 2)
+				msleep(20);
 		}
 		ts->detect_stage = "cc-debounce";
-		if (ret != apple_tristar_cc_current(cc)) {
+		if (attempt == 3) {
 			ret = -EAGAIN;
 			goto fail;
 		}
-		cc_ua = ret;
+		if (ts->bc_ua) {
+			/* CC refresh cannot erase a proven BC item from this epoch. */
+			ret = ts->bc_ua;
+			type = ts->bc_type;
+			goto combine;
+		}
 	}
 	dp = apple_tristar_pin_mv(ts, false, false, false);
 	ts->dp_mv = dp;
@@ -454,6 +479,7 @@ static void apple_tristar_classify(struct apple_tristar *ts)
 	} else {
 		/* iOS 5de33e4/5de35dc, ordinary USB source (connect type 0). */
 		dm = apple_tristar_pin_mv(ts, true, true, false);
+		ts->bc_primary_mv = dm;
 		if (dm < 0) {
 			ret = dm;
 			goto fail;
@@ -465,6 +491,7 @@ static void apple_tristar_classify(struct apple_tristar *ts)
 		}
 		if (dm >= 326 && dm <= 899) {
 			dp = apple_tristar_pin_mv(ts, false, true, false);
+			ts->bc_secondary_mv = dp;
 			if (dp < 0) {
 				ret = dp;
 				goto fail;
@@ -474,10 +501,13 @@ static void apple_tristar_classify(struct apple_tristar *ts)
 				ret = -ERANGE;
 				goto fail;
 			}
-			type = dp < 326 ? POWER_SUPPLY_USB_TYPE_DCP : POWER_SUPPLY_USB_TYPE_CDP;
+			/* iOS internal 2=CDP, 1=DCP (type names at 6de2df0). */
+			type = dp < 326 ? POWER_SUPPLY_USB_TYPE_CDP : POWER_SUPPLY_USB_TYPE_DCP;
 			ret = 1500000;
 		}
 	}
+combine:
+	bc_type = type;
 	/* iOS 5e23a90: without a charging-port type, clamp 3 A CC to 1.5 A. */
 	if (cc_ua == 3000000 && type != POWER_SUPPLY_USB_TYPE_DCP &&
 	    type != POWER_SUPPLY_USB_TYPE_CDP)
@@ -490,6 +520,10 @@ static void apple_tristar_classify(struct apple_tristar *ts)
 	if (cc) {
 		ret = cc;
 		goto fail;
+	}
+	if (bc_type == POWER_SUPPLY_USB_TYPE_DCP || bc_type == POWER_SUPPLY_USB_TYPE_CDP) {
+		ts->bc_ua = 1500000;
+		ts->bc_type = bc_type;
 	}
 	/* Refresh Type-C advertisement, including reductions, while idle. */
 	ts->classify_after = jiffies + msecs_to_jiffies(5000);
@@ -506,10 +540,10 @@ static void apple_tristar_classify(struct apple_tristar *ts)
 	ts->retry_ms = 0;
 	return;
 fail:
-	/* An uncertain refresh must not retain an old elevated CC allowance. */
+	/* Revoke uncertain CC, retaining only separately verified BC evidence. */
 	if (typec) {
-		ts->brick_ua = 0;
-		ts->analog_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
+		ts->brick_ua = ts->bc_ua;
+		ts->analog_type = ts->bc_type;
 		ts->brick_sampled = false;
 	}
 	apple_tristar_detect_failed(ts, ret);
@@ -576,6 +610,62 @@ static void apple_tristar_auto_cfg(struct tristar_auto_cfg *cfg)
 	};
 }
 
+/* Caller holds ts->lock. Poll gaps can hide VBUS loss; ID/phase are evidence too. */
+static void apple_tristar_new_source(struct apple_tristar *ts, const char *reason)
+{
+	ts->attach_id++;
+	ts->epoch_reason = reason;
+	ts->epoch_notify = true;
+	ts->source_id_valid = false;
+	ts->computer = false;
+	atomic_set(&ts->computer_seen, 0);
+	ts->brick_sampled = false;
+	ts->brick_ua = 0;
+	ts->bc_ua = 0;
+	ts->bc_primary_mv = -ENODATA;
+	ts->bc_secondary_mv = -ENODATA;
+	ts->bc_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
+	ts->analog_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
+	ts->current_ua = APPLE_TRISTAR_FLOOR_UA;
+	ts->usb_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
+	ts->classify_after = jiffies + msecs_to_jiffies(300);
+	ts->detect_attempts = 0;
+	ts->detect_logged = false;
+	ts->detect_failures = 0;
+	ts->retry_ms = 0;
+	ts->detect_error = 0;
+	ts->detect_stage = reason;
+	usb_gadget_current_source_detached(ts->usb_node);
+}
+
+/* First ID refines this source; a changed ID proves a new source epoch. */
+static void apple_tristar_source_id(struct apple_tristar *ts, const u8 *id)
+{
+	bool changed = !ts->source_id_valid || memcmp(ts->source_id, id, sizeof(ts->source_id));
+
+	if (ts->source_id_valid && changed)
+		apple_tristar_new_source(ts, "digital-id");
+	memcpy(ts->source_id, id, sizeof(ts->source_id));
+	ts->source_id_valid = true;
+	if (changed) {
+		/* Preserve this epoch's BC evidence; once after ID settle, try CC too. */
+		ts->brick_sampled = false;
+		ts->classify_after = jiffies + msecs_to_jiffies(300);
+		ts->detect_failures = 0;
+		ts->retry_ms = 0;
+	}
+}
+
+static void apple_tristar_source_phase(struct apple_tristar *ts, enum tristar_auto_phase old)
+{
+	if (old != TRISTAR_AUTO_OFF && old != TRISTAR_AUTO_EMPTY &&
+	    old != ts->autop.phase &&
+	    (ts->autop.phase == TRISTAR_AUTO_DEVICE || ts->autop.phase == TRISTAR_AUTO_EMPTY)) {
+		apple_tristar_new_source(ts, "accessory-phase");
+		tristar_auto_forget(&ts->autop);
+	}
+}
+
 static int apple_tristar_update(struct apple_tristar *ts)
 {
 	struct usb_gadget_current_budget budget;
@@ -607,24 +697,12 @@ static int apple_tristar_update(struct apple_tristar *ts)
 	/* A transport failure and USB reset/suspend are not source removal. */
 	if (!error && ts->source_present && !(value & 3)) {
 		ts->source_present = false;
-		ts->attach_id++;
-		ts->computer = false;
-		ts->brick_sampled = false;
-		ts->brick_ua = 0;
-		ts->analog_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
-		ts->classify_after = jiffies + msecs_to_jiffies(1000);
-		ts->detect_attempts = 0;
-		ts->detect_logged = false;
-		ts->detect_failures = 0;
-		ts->retry_ms = 0;
-		ts->detect_error = 0;
-		ts->detect_stage = "detached";
+		apple_tristar_new_source(ts, "vbus-detach");
 		ts->detach_role = true;
 		tristar_auto_forget(&ts->autop);
 		ts->autop.phase = TRISTAR_AUTO_EMPTY;
 		ts->autop.was_empty = true;
 		ts->autop.empty = 0;
-		usb_gadget_current_source_detached(ts->usb_node);
 	}
 	if (!error && (value & 3) == 3)
 		ts->source_present = true;
@@ -644,6 +722,11 @@ static int apple_tristar_update(struct apple_tristar *ts)
 		current_ua = auto_ua;
 		type = POWER_SUPPLY_USB_TYPE_ACA;
 	} else if (online && !error) {
+		/* Positive USB session evidence outranks every earlier analog result. */
+		if (atomic_read(&ts->computer_seen)) {
+			ts->computer = true;
+			ts->brick_ua = 0;
+		}
 		if (usb_gadget_get_current_budget(ts->usb_node, &budget)) {
 			current_ua = apple_tristar_budget(NULL, 0, &type);
 			if (ts->computer) {
@@ -654,10 +737,8 @@ static int apple_tristar_update(struct apple_tristar *ts)
 				current_ua = ts->brick_ua;
 			}
 		} else {
-			if ((budget.connected || budget.configured || budget.host_grant) &&
-			    (!ts->brick_ua ||
-			     (ts->analog_type == POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID ||
-			      ts->analog_type == POWER_SUPPLY_USB_TYPE_C))) {
+			if (budget.connected || budget.configured || budget.host_grant) {
+				atomic_set(&ts->computer_seen, 1);
 				ts->computer = true;
 				ts->brick_ua = 0;
 			}
@@ -673,7 +754,8 @@ static int apple_tristar_update(struct apple_tristar *ts)
 			}
 		}
 	}
-	changed = ts->error != error || ts->online != online;
+	changed = ts->error != error || ts->online != online || ts->epoch_notify;
+	ts->epoch_notify = false;
 	changed |= old_current != current_ua || old_type != type;
 	ts->error = error;
 	ts->online = online;
@@ -747,8 +829,20 @@ static int apple_tristar_usb_event(struct notifier_block *nb, unsigned long even
 	if (budget->of_node != ts->usb_node || READ_ONCE(ts->stopping) ||
 	    READ_ONCE(ts->sleeping))
 		return NOTIFY_DONE;
-	/* Cancel an in-flight analog sample; never revoke an attach here. */
-	atomic_inc(&ts->reset_generation);
+	/* Idle budget/disconnect notifications are not USB data sessions. */
+	WRITE_ONCE(ts->usb_event_source, event);
+	atomic_inc(&ts->usb_events);
+	if (budget->connected || budget->configured || budget->host_grant) {
+		atomic_set(&ts->usb_session, 1);
+		/* Retain a short session even if it ends before the next worker. */
+		atomic_set(&ts->computer_seen, 1);
+		atomic_inc(&ts->reset_generation);
+	} else if (atomic_xchg(&ts->usb_session, 0)) {
+		/* A short real session ending between two samples still cancels. */
+		atomic_inc(&ts->reset_generation);
+	} else {
+		atomic_inc(&ts->usb_idle_events);
+	}
 	mod_delayed_work(system_power_efficient_wq, &ts->work, 0);
 	return NOTIFY_OK;
 }
@@ -1131,6 +1225,8 @@ apple_tristar_auto_act(struct apple_tristar *ts, const struct tristar_auto_cfg *
 		old = ta->phase;
 		had = ta->id_valid;
 		same = had && !ret && !memcmp(ta->id, id, sizeof(id));
+		if (!ret)
+			apple_tristar_source_id(ts, id);
 		action = tristar_auto_probed(ta, cfg, ktime_to_ms(ktime_get_boottime()), ret, id);
 		if (!ret && !same)
 			apple_tristar_auto_note(ts, old, "digital ID %*ph%s", (int)sizeof(id), id,
@@ -1214,6 +1310,7 @@ static void apple_tristar_auto_run(struct apple_tristar *ts)
 	in.status = ts->status;
 	old = ts->autop.phase;
 	action = tristar_auto_step(&ts->autop, &cfg, &in);
+	apple_tristar_source_phase(ts, old);
 	apple_tristar_auto_note(ts, old, NULL);
 	mutex_unlock(&ts->lock);
 	/* A probe can lead to the handshake and then the role switch. */
@@ -1577,6 +1674,13 @@ static ssize_t lightning_state_show(struct device *dev, struct device_attribute 
 			     ts->route_before, ts->adc_status, ts->dp_mv, ts->dm_mv,
 			     ts->cc_mv, ts->brick_sampled, ts->adc_fault_stage ?: "none",
 			     ts->adc_fault_attach);
+	len += sysfs_emit_at(buf, len,
+			     "source_epoch: id=%u reason=%s bc_ua=%d bc_type=%d cc_first_mv=%d usb_events=%d usb_idle_events=%d usb_generation=%d usb_event_source=%lu computer_seen=%d bc_primary_mv=%d bc_secondary_mv=%d\n",
+			     ts->attach_id, ts->epoch_reason ?: "boot", ts->bc_ua, ts->bc_type,
+			     ts->cc_first_mv, atomic_read(&ts->usb_events),
+			     atomic_read(&ts->usb_idle_events), atomic_read(&ts->reset_generation),
+			     READ_ONCE(ts->usb_event_source), atomic_read(&ts->computer_seen),
+			     ts->bc_primary_mv, ts->bc_secondary_mv);
 	mutex_unlock(&ts->lock);
 
 	len += sysfs_emit_at(buf, len, "auto_host: %d\nphase: %s\nrole: %s%s\n",
@@ -1752,6 +1856,8 @@ static int apple_tristar_probe(struct i2c_client *client)
 	ts->dp_mv = -ENODATA;
 	ts->dm_mv = -ENODATA;
 	ts->cc_mv = -ENODATA;
+	ts->bc_primary_mv = -ENODATA;
+	ts->bc_secondary_mv = -ENODATA;
 	ts->detect_stage = "initial";
 	tristar_auto_init(&ts->autop);
 	i2c_set_clientdata(client, ts);
@@ -1796,6 +1902,10 @@ static int apple_tristar_probe(struct i2c_client *client)
 	if (ret)
 		return ret;
 	atomic_set(&ts->reset_generation, 0);
+	atomic_set(&ts->usb_session, 0);
+	atomic_set(&ts->computer_seen, 0);
+	atomic_set(&ts->usb_events, 0);
+	atomic_set(&ts->usb_idle_events, 0);
 	/* Allow old iOS work to quiesce; no first-boot ADC idle bit is known. */
 	ts->classify_after = jiffies + msecs_to_jiffies(2000);
 	ret = devm_mutex_init(&client->dev, &ts->lock);

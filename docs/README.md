@@ -2,7 +2,7 @@
 
 Start with [current status](release/STATUS.md), [evidence](release/EVIDENCE.md)
 and [PORTING.md](../PORTING.md). Only iPad6,11 / j71t / S8003 was tested.
-The clean OrchardLinux port is in preparation on
+The clean OrchardLinux kernel port is published on
 [a9/orchard-j71t](https://github.com/brkosebay/linux/tree/a9/orchard-j71t).
 
 Subsystem sources and notes live under `boot/`, `pcie/`, `touch/`, `audio/`,

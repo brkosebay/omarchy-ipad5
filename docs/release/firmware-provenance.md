@@ -29,7 +29,7 @@ obtained iOS text `ioreg` dump. Wi-Fi calibration/MAC fixups already pass
 through m1n1, but a general first-boot ADT-to-firmware generator is not wired
 up. Public IPSW plus your boot ADT is the intended installer path; do not
 assume every extraction/staging step is automated today. The OrchardLinux
-port is in preparation.
+installer port is under review.
 
 Use the matching IPSW/build and subsystem staging tools under
 [scripts/periph](../../scripts/periph/), [scripts/touch](../../scripts/touch/)

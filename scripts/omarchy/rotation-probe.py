@@ -21,6 +21,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seconds", type=float, default=7)
     parser.add_argument("--screenshots", type=Path, help="new directory for PPMs; adds render load")
+    parser.add_argument("--layers", action="store_true", help="also sample layer geometry/PIDs/alpha (extra IPC)")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
@@ -34,7 +35,8 @@ def main():
     if args.screenshots:
         args.screenshots.mkdir(parents=True, exist_ok=False)
 
-    start = time.monotonic()
+    start_ns = time.monotonic_ns()
+    start = start_ns / 1e9
     lock = threading.Lock()
 
     def emit(kind, **fields):
@@ -94,9 +96,16 @@ def main():
         except ValueError:
             value = None
         emit("monitors", ipc_ms=round((time.monotonic() - then) * 1000, 3), rc=rc, monitors=value, error=err)
+        if args.layers:
+            rc, out, err = run(["hyprctl", "-j", "layers"])
+            try:
+                layers = json.loads(out) if rc == 0 else None
+            except ValueError:
+                layers = None
+            emit("layers", rc=rc, layers=layers, error=err)
         return value
 
-    emit("start", wall_ns=time.time_ns(), clock_ticks=os.sysconf("SC_CLK_TCK"), command=command, cpu=cpu(), screenshots=bool(args.screenshots))
+    emit("start", wall_ns=time.time_ns(), start_monotonic_ns=start_ns, clock_ticks=os.sysconf("SC_CLK_TCK"), command=command, cpu=cpu(), screenshots=bool(args.screenshots))
     initial = monitors()
     if not isinstance(initial, list) or len(initial) != 1:
         raise SystemExit("probe requires exactly one enabled monitor")
@@ -130,7 +139,10 @@ def main():
                 if len(pixels) == width * height * 3:
                     file = args.screenshots / f"{index:03d}.ppm"
                     file.write_bytes(out)
-                    fields.update(file=str(file), mean_rgb=sum(pixels) / len(pixels), width=width, height=height)
+                    center = ((height // 2) * width + width // 2) * 3
+                    black = sum(max(pixels[i:i + 3]) <= 8 for i in range(0, len(pixels), 3))
+                    fields.update(file=str(file), mean_rgb=sum(pixels) / len(pixels), width=width, height=height,
+                                  center_rgb=list(pixels[center:center + 3]), black_fraction=black / (width * height))
             emit("screenshot", **fields)
         index += 1
         time.sleep(0.2)

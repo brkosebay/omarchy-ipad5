@@ -1,0 +1,174 @@
+--- a/include/linux/usb/gadget.h
++++ b/include/linux/usb/gadget.h
+@@ -362,6 +362,17 @@
+ 
+ struct device_node;
+ struct notifier_block;
++
++/* Origin of an opted-in current-budget notification; no hardware operation. */
++enum usb_gadget_current_event {
++	USB_GADGET_CURRENT_DETACH = 1,
++	USB_GADGET_CURRENT_BASE,
++	USB_GADGET_CURRENT_REVOKE,
++	USB_GADGET_CURRENT_SUSPEND,
++	USB_GADGET_CURRENT_SETUP,
++	USB_GADGET_CURRENT_GRANT,
++	USB_GADGET_CURRENT_STATE,
++};
+ 
+ /**
+  * struct usb_gadget_current_budget - instantaneous USB power authorization
+--- a/drivers/usb/gadget/udc/core.c
++++ b/drivers/usb/gadget/udc/core.c
+@@ -96,7 +96,7 @@
+ 	budget->current_ma = budget->connected && !budget->suspended ? budget_ma : 0;
+ }
+ 
+-static void gadget_current_notify(struct usb_gadget *gadget)
++static void gadget_current_notify(struct usb_gadget *gadget, unsigned long event)
+ {
+ 	struct usb_gadget_current_budget budget;
+ 	unsigned long flags;
+@@ -106,7 +106,7 @@
+ 	spin_lock_irqsave(&gadget->state_lock, flags);
+ 	gadget_current_snapshot(gadget, &budget);
+ 	spin_unlock_irqrestore(&gadget->state_lock, flags);
+-	atomic_notifier_call_chain(&gadget_current_notifier, 0, &budget);
++	atomic_notifier_call_chain(&gadget_current_notifier, event, &budget);
+ }
+ 
+ /**
+@@ -191,7 +191,7 @@
+ 		gadget->current_bus_connected = false;
+ 		gadget->current_suspended = false;
+ 		spin_unlock_irqrestore(&gadget->state_lock, flags);
+-		gadget_current_notify(gadget);
++		gadget_current_notify(gadget, USB_GADGET_CURRENT_DETACH);
+ 	}
+ 	mutex_unlock(&udc_lock);
+ }
+@@ -210,7 +210,7 @@
+ 		gadget->current_host_grant = false;
+ 	}
+ 	spin_unlock_irqrestore(&gadget->state_lock, flags);
+-	gadget_current_notify(gadget);
++	gadget_current_notify(gadget, USB_GADGET_CURRENT_BASE);
+ }
+ 
+ /* Also used to revoke a grant when its ep0 status transfer fails. */
+@@ -224,7 +224,7 @@
+ 	gadget->current_extra_ma = 0;
+ 	gadget->current_host_grant = false;
+ 	spin_unlock_irqrestore(&gadget->state_lock, flags);
+-	gadget_current_notify(gadget);
++	gadget_current_notify(gadget, USB_GADGET_CURRENT_REVOKE);
+ }
+ EXPORT_SYMBOL_GPL(usb_gadget_revoke_current_grant);
+ 
+@@ -240,7 +240,7 @@
+ 	gadget->current_extra_ma = 0;
+ 	gadget->current_host_grant = false;
+ 	spin_unlock_irqrestore(&gadget->state_lock, flags);
+-	gadget_current_notify(gadget);
++	gadget_current_notify(gadget, USB_GADGET_CURRENT_SUSPEND);
+ }
+ EXPORT_SYMBOL_GPL(usb_gadget_current_budget_suspend);
+ 
+@@ -264,7 +264,7 @@
+ 	}
+ 	spin_unlock_irqrestore(&gadget->state_lock, flags);
+ 	if (newly_connected)
+-		gadget_current_notify(gadget);
++		gadget_current_notify(gadget, USB_GADGET_CURRENT_SETUP);
+ 	if (ctrl->bRequest != 0x40 ||
+ 	    (ctrl->bRequestType != 0x40 && ctrl->bRequestType != 0xc0))
+ 		return -EOPNOTSUPP;
+@@ -286,7 +286,7 @@
+ 	dev_info_ratelimited(&gadget->dev,
+ 			     "Apple host current grant: extra %d mA, suspend %d mA\n",
+ 			     extra, suspend);
+-	gadget_current_notify(gadget);
++	gadget_current_notify(gadget, USB_GADGET_CURRENT_GRANT);
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(usb_gadget_handle_current_grant);
+@@ -1381,7 +1381,7 @@
+ 		schedule_work(&gadget->work);
+ 	spin_unlock_irqrestore(&gadget->state_lock, flags);
+ 	trace_usb_gadget_set_state(gadget, 0);
+-	gadget_current_notify(gadget);
++	gadget_current_notify(gadget, USB_GADGET_CURRENT_STATE);
+ }
+ EXPORT_SYMBOL_GPL(usb_gadget_set_state);
+ 
+--- a/drivers/power/supply/bq27xxx_battery.c
++++ b/drivers/power/supply/bq27xxx_battery.c
+@@ -2404,11 +2404,50 @@
+ 	return bq27xxx_cached_value(cached, val) ? -ENODATA : 0;
+ }
+ 
++/* A full flag describes capacity, not whether this pack is supplying power. */
++static int bq27xxx_j71t_status(int current_ua, int online, int status)
++{
++	if (current_ua < 0)
++		return POWER_SUPPLY_STATUS_DISCHARGING;
++	if (online < 0)
++		return online;
++	if (!online)
++		return POWER_SUPPLY_STATUS_NOT_CHARGING;
++	if (status == POWER_SUPPLY_STATUS_FULL)
++		return status;
++	return current_ua > 0 ? POWER_SUPPLY_STATUS_CHARGING : POWER_SUPPLY_STATUS_NOT_CHARGING;
++}
++
++/* Never query another supply while holding the gauge mutex. No gauge writes. */
++static int bq27xxx_battery_j71t_status(int current_ua, union power_supply_propval *val)
++{
++	struct power_supply *source;
++	union power_supply_propval online;
++	int ret = -ENODEV;
++
++	if (current_ua < 0) {
++		val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
++		return 0;
++	}
++	source = power_supply_get_by_name("usb");
++	if (source) {
++		ret = power_supply_get_property(source, POWER_SUPPLY_PROP_ONLINE, &online);
++		power_supply_put(source);
++	}
++	ret = bq27xxx_j71t_status(current_ua, ret ? ret : online.intval, val->intval);
++	if (ret < 0)
++		return ret;
++	val->intval = ret;
++	return 0;
++}
++
+ static int bq27xxx_battery_get_cached_property(struct power_supply *psy,
+ 					       struct bq27xxx_device_info *di,
+ 					       enum power_supply_property psp,
+ 					       union power_supply_propval *val)
+ {
++	union power_supply_propval battery_current;
++	bool j71t = of_device_is_compatible(di->dev->of_node, "apple,j71t-bq27540");
+ 	int ret;
+ 
+ 	mutex_lock(&di->lock);
+@@ -2425,6 +2464,8 @@
+ 	switch (psp) {
+ 	case POWER_SUPPLY_PROP_STATUS:
+ 		ret = bq27xxx_cached_value(&di->cache.status, val);
++		if (!ret && j71t)
++			ret = bq27xxx_cached_value(&di->cache.current_now, &battery_current);
+ 		break;
+ 	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+ 		ret = bq27xxx_cached_value(&di->cache.voltage, val);
+@@ -2485,6 +2526,8 @@
+ 
+ out_unlock:
+ 	mutex_unlock(&di->lock);
++	if (!ret && j71t && psp == POWER_SUPPLY_PROP_STATUS)
++		ret = bq27xxx_battery_j71t_status(battery_current.intval, val);
+ 	return ret;
+ }
+ 

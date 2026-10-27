@@ -47,6 +47,8 @@
 /* One budget reassert per window before a register change counts as a fault. */
 #define J71T_REASSERT_WINDOW_MS 10000
 #define J71T_BACKOFF_HOLD_MS 60000
+#define J71T_ATTACH_RESET_MS 15000
+#define J71T_ATTACH_INPUT_DEFAULT 0x02
 
 static const int j71t_budgets_ua[] = { 500000, 1000000, 2100000, 2400000 };
 
@@ -69,6 +71,8 @@ struct j71t_charger {
 	int adaptive_ua;
 	unsigned int attach_id;
 	unsigned int backoffs;
+	unsigned int attach_resets;
+	unsigned long attach_until;
 	unsigned long adaptive_after;
 	const char *backoff_cause;
 	bool thermal_limited;
@@ -304,6 +308,8 @@ static void j71t_new_attach(struct j71t_charger *charger, unsigned int id)
 	charger->ceiling_ua = 0;
 	charger->source_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
 	charger->attach_id = id;
+	charger->attach_resets = 0;
+	charger->attach_until = jiffies + msecs_to_jiffies(J71T_ATTACH_RESET_MS);
 }
 
 static int j71t_battery_safe(struct j71t_charger *charger)
@@ -431,6 +437,7 @@ static int j71t_enable(struct j71t_charger *charger)
 		if (ret)
 			return ret;
 		charger->saved = true;
+		charger->attach_until = jiffies + msecs_to_jiffies(J71T_ATTACH_RESET_MS);
 	}
 	ret = j71t_apply(charger, charger->charge_code, charger->input_code);
 	if (!ret) {
@@ -524,7 +531,8 @@ static int j71t_reassert(struct j71t_charger *charger, u8 input, u8 control, u8 
 }
 
 /*
- * Do not fight a lower PMU input setting. Its electrical cause is unknown:
+ * Reduce the policy step after a non-default lower PMU setting; then assert
+ * the calibrated code for that step. Its electrical cause is unknown:
  * D2365's iOS isInputLimited callback (6bc038c) is constant false. This is
  * an observed setpoint reduction, not a fabricated VBUS/droop measurement.
  */
@@ -542,7 +550,7 @@ static int j71t_input_reduced(struct j71t_charger *charger, u8 input)
 	charger->backoff_cause = "pmic-input-reduced";
 	charger->backoffs++;
 	charger->budget_ua = charger->adaptive_ua;
-	charger->input_code = min(charger->input_codes[index], input);
+	charger->input_code = charger->input_codes[index];
 	charger->charge_code = j71t_charge_code(charger->budget_ua);
 	ret = j71t_enable(charger);
 	dev_warn_ratelimited(charger->dev,
@@ -578,6 +586,7 @@ static void j71t_policy_work(struct work_struct *work)
 							  struct j71t_charger, work);
 	int ret = 0, target, index, online, previous;
 	unsigned int id;
+	bool attach_reset = false;
 
 	mutex_lock(&charger->lock);
 	if (charger->stopping)
@@ -614,6 +623,13 @@ static void j71t_policy_work(struct work_struct *work)
 		u8 input = 0, control = 0, charge = 0;
 
 		ret = j71t_check_owned(charger, &input, &control, &charge);
+		if (j71t_is_fault(ret) && input == J71T_ATTACH_INPUT_DEFAULT &&
+		    time_before(jiffies, charger->attach_until) &&
+		    !(control & J71T_INPUT_SUSPEND) && charge == charger->charge_code) {
+			/* D2365 attach reset, observed 26 ms after applying the floor. */
+			attach_reset = true;
+			ret = 0;
+		}
 		if (j71t_is_fault(ret) && input < charger->input_code &&
 		    !(control & J71T_INPUT_SUSPEND) && charge == charger->charge_code) {
 			ret = j71t_input_reduced(charger, input);
@@ -670,17 +686,27 @@ static void j71t_policy_work(struct work_struct *work)
 	if (index >= 0 && target > previous) {
 		int next = previous ? j71t_choose_budget(previous) + 1 : 0;
 
-		if (previous && time_before(jiffies, charger->ramp_after))
-			goto report;
+		if (previous && time_before(jiffies, charger->ramp_after)) {
+			if (!attach_reset)
+				goto report;
+			next = j71t_choose_budget(previous);
+		}
 		index = min(index, next);
 	}
-	if (index >= 0 && (!charger->active || j71t_budgets_ua[index] != previous)) {
+	if (index >= 0 &&
+	    (!charger->active || j71t_budgets_ua[index] != previous || attach_reset)) {
 		charger->budget_ua = j71t_budgets_ua[index];
 		charger->input_code = charger->input_codes[index];
 		charger->charge_code = j71t_charge_code(charger->budget_ua);
 		ret = j71t_enable(charger);
 		if (ret)
 			goto restore;
+		if (attach_reset) {
+			charger->attach_resets++;
+			dev_info_ratelimited(charger->dev,
+					     "attach default 0x02: restored policy input 0x%02x\n",
+					     charger->input_code);
+		}
 		charger->ramp_after = jiffies + msecs_to_jiffies(1000);
 	}
 	goto report;
@@ -857,12 +883,13 @@ static ssize_t charge7_state_show(struct device *dev, struct device_attribute *a
 	mutex_lock(&charger->lock);
 	ret = j71t_read(charger, J71T_INPUT_LIMIT, &input);
 	len = sysfs_emit(buf,
-			 "attach=%u source_type=%d ceiling_ua=%d step_ua=%d live_ua=%d override_ua=%d adaptive_ua=%d backoffs=%u last_backoff=%s vbus_mv=unavailable policy_error=%d active=%d\n",
+			 "attach=%u source_type=%d ceiling_ua=%d step_ua=%d live_ua=%d override_ua=%d adaptive_ua=%d backoffs=%u last_backoff=%s vbus_mv=unavailable policy_error=%d active=%d attach_resets=%u\n",
 			 charger->attach_id, charger->source_type, charger->ceiling_ua,
 			 charger->active ? charger->budget_ua : 0,
 			 ret ? ret : 75000 + input * 12500, charger->user_limit_ua,
 			 charger->adaptive_ua, charger->backoffs,
-			 charger->backoff_cause ?: "none", charger->policy_error, charger->active);
+			 charger->backoff_cause ?: "none", charger->policy_error, charger->active,
+			 charger->attach_resets);
 	mutex_unlock(&charger->lock);
 	return len;
 }

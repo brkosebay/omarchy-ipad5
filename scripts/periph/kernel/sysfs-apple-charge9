@@ -1,0 +1,27 @@
+What:		/sys/class/power_supply/charger/charge7_state
+Date:		October 2026
+Contact:	linux-a9 maintainers
+Description:
+		The attach_resets field counts successfully repaired D2365 0xa03
+		attach-default resets (0x02) in the first fifteen seconds of ownership
+		or a new source epoch. These do not create adaptive backoffs. A
+		policy step always uses its calibrated register code, including the
+		floor after other unexplained PMIC input reductions. Transport and
+		battery safety failures can defer a repair; live_ua remains readback,
+		not an assertion that nominal and actual currents are identical.
+
+What:		/sys/bus/i2c/devices/*-001a/lightning_state
+Date:		October 2026
+Contact:	linux-a9 maintainers
+Description:
+		source_epoch records id, reason (boot, vbus-detach, digital-id or
+		accessory-phase), retained bc_ua/bc_type, cc_first_mv, lifetime
+		usb_events/usb_idle_events, data-session usb_generation and last
+		usb_event_source. Origin codes: 1 source forget, 2 base budget,
+		3 grant revoke, 4 suspend, 5 SETUP, 6 grant, 7 gadget state.
+		Idle notifications do not invalidate conversions; actual USB session
+		activity still does. A first ID refines the current epoch, preserving
+		verified BC evidence and scheduling one settled reclassification.
+		Changed IDs and phase drops to device/empty revoke the source even
+		when polling missed the VBUS-low interval. No poll-based guarantee
+		exists for an otherwise unobserved same-ID swap.

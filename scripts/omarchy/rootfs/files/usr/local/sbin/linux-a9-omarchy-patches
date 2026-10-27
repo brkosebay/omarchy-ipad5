@@ -2,12 +2,12 @@
 # Apply linux-a9's local Omarchy patches to the installed runtime, idempotently.
 # The patches are upstream-format (Omarchy repo paths). On an installed system
 # bin/ lives under /usr and the rest Omarchy ships (install/, default/) under
-# /usr/share/omarchy; test/ isn't installed and is skipped. Run by the pacman
+# /usr/share/omarchy (shell/ too); test/ isn't installed and is skipped. Run by the pacman
 # hook 90-linux-a9-omarchy-patches.hook and once by the image build.
 set -uo pipefail
 
 dir=/usr/local/share/linux-a9/omarchy-patches
-parts=("/usr bin/*" "/usr/share/omarchy install/*" "/usr/share/omarchy default/*")
+parts=("/usr bin/*" "/usr/share/omarchy install/*" "/usr/share/omarchy default/*" "/usr/share/omarchy shell/*")
 status=0
 
 for patch in "$dir"/*.patch; do

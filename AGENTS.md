@@ -21,7 +21,7 @@ Only j71t / S8003 has device evidence. Another board is a port.
 - `build/`, `third_party/`, `docs/adt/`: local generated/private inputs,
   ignored. Firmware and live calibration must come from the user's device.
 - Public kernel source: https://github.com/brkosebay/linux/tree/a9/orchard-j71t.
-  This is the sole kernel entry point. The port is in preparation; historical
+  This is the sole kernel entry point. The installer port is under review; historical
   exports are separate experiments, not a combined stack.
 - Private graphics research and its dependencies are excluded. Do not restore
   them. Mesa in `docs/sep/`, `drivers/mesa/` or `mesa-a9` names the Touch ID
@@ -71,7 +71,7 @@ Short interface constants and our register/protocol descriptions are useful.
   QEMU processes by name. Keep disk use bounded; avoid copying build images.
 - Overclock defaults remain stock. Respect thermal/voltage/revert guards;
   measurements on one S8003 are not safe settings for another device.
-- Before sharing, run `python3 -B scripts/release/verify.py .` and manually
+- Before sharing, run `python3 -B scripts/release/verify.py . --existing-repo` and manually
   review identifiers and provenance. Do not add private values to test data.
 
 Original work is GPL-2.0-or-later (`LICENSE`); kernel changes are GPL-2.0.

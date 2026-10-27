@@ -28,7 +28,7 @@ this repository does not claim a working boot on it.
 
 Kernel source lives in the public [brkosebay/linux](https://github.com/brkosebay/linux)
 `a9/orchard-j71t` branch, the clean OrchardLinux series on base
-`6831bc701a`. This port is in preparation and is the sole public kernel
+`6831bc701a`. This published port is the sole public kernel
 entry point. Its exact series needs device validation. Historical patch
 exports carry their own BASE/HEAD/series and are not a combined stack.
 No kernel binaries or kernel source tree are bundled here.
