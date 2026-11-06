@@ -1,5 +1,11 @@
 # omarchy-ipad5
 
+> **Archived (2026-11-06): this snapshot is no longer maintained. iPad 5 work continues in
+> [OrchardLinux](https://github.com/OrchardLinux/orchard).** The iPad 5 (J71t) port was upstreamed there
+> (OrchardLinux/orchard#28), and new iPad 5 support (USB, AOP sensors, GPU) goes to Orchard as pull requests.
+> To install Linux on an iPad 5, use Orchard's installer. This repository stays as a read-only record of the
+> 2026-10-27 snapshot.
+
 ## Status: early and experimental
 
 [omarchy-ipad5](https://github.com/brkosebay/omarchy-ipad5) brings Linux and
